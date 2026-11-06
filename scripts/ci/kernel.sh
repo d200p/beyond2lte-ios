@@ -86,3 +86,4 @@ cp "$kernel" out/ci-kernel/mach.development.b2l
 scripts/inspect-kernel.sh out/ci-kernel/mach.development.b2l > out/ci-kernel/inspection.txt
 shasum -a 256 out/ci-kernel/mach.development.b2l > out/ci-kernel/SHA256SUMS
 git rev-parse HEAD > out/ci-kernel/source-revision.txt
+printf '%s\n' "${B2L_BOOT_PROFILE:-diagnostic}" > out/ci-kernel/boot-profile.txt

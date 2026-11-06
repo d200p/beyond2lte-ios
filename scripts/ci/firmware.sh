@@ -39,3 +39,4 @@ cp "$WORKSPACE/BootShim/BootShim.S" out/ci-firmware/mu/BootShim/
 cp "$WORKSPACE/Resources/DTBs/beyond2lte.dtb" out/ci-firmware/mu/Resources/DTBs/
 cp "$WORKSPACE/Resources/Scripts/mkbootimg.py" out/ci-firmware/mu/Resources/Scripts/
 git rev-parse HEAD > out/ci-firmware/source-revision.txt
+printf '%s\n' "${B2L_BOOT_PROFILE:-diagnostic}" > out/ci-firmware/boot-profile.txt

@@ -19,6 +19,7 @@
 #include "BootPayload.h"
 #include "Progress.h"
 #include "Arena.h"
+#include "BuildProfile.h"
 #include "b2l_secondary.h"
 extern const UINT8 B2LSecondaryTemplate[], B2LSecondaryTemplateEnd[];
 #include "b2l_cache_core.h"
@@ -376,7 +377,14 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     Args->video.base |= 1;
     AsciiStrCpyS(Args->command_line, sizeof(Args->command_line),
                 "-v debug=0x14e serial=3 cpus=8 keepsyms=1 -enable_kprintf_spam "
+#if B2L_USERSPACE_BOOT
+                "rd=b2l-userdata b2l_root_rw=1 b2l_unsealed_root=1 "
+                "b2l_arm64e_compat=1 b2l_pacga_siphash=1 b2l_pacga_pair=1 "
+                "cs_enforcement_disable=1 launchd_unsecure_cache=1 "
+                "b2l_system_log=1 b2l_native_cache=1 "
+#else
                 "rd=b2l-diagnostic b2l_root_rw=0 b2l_system_log=0 b2l_native_cache=0 "
+#endif
                 "b2l_diag=1 b2l_userspace_bootstrap=0 exception_log_max_pid=4096");
     Entry = Base + Mach.entry - Mach.virtual_base;
     if(Kernel){FreePool(Kernel); Kernel = NULL;}

@@ -1,8 +1,13 @@
-name: S10+ kernel diagnostic build
+name: S10+ XNU build
 
 on:
   workflow_dispatch:
     inputs:
+      boot_profile:
+        description: Storage policy and loader root selection
+        type: choice
+        options: [diagnostic, userspace]
+        default: diagnostic
       component:
         description: Components to build
         type: choice
@@ -21,8 +26,11 @@ permissions:
   contents: read
   actions: read
 
+env:
+  B2L_BOOT_PROFILE: ${{ inputs.boot_profile || 'diagnostic' }}
+
 concurrency:
-  group: b2l-kernel-diagnostic-${{ inputs.component || 'all' }}
+  group: b2l-xnu-${{ inputs.boot_profile || 'diagnostic' }}-${{ inputs.component || 'all' }}
   cancel-in-progress: false
 
 jobs:
@@ -64,10 +72,12 @@ jobs:
             out/ci-env/kdk/System/Library/Frameworks
             out/ci-env/kdk/System/Library/KernelSupport
             out/ci-env/kdk/usr
-      - name: Build diagnostic kernel
+      - name: Validate storage boundaries and build XNU
         shell: bash
         run: |
           set -o pipefail
+          python3 tests/test_ufs_disk.py xnu --overlay
+          bash scripts/test-ufs-transport.sh
           bash scripts/ci/kernel.sh build 2>&1 | tee -a out/ci-logs/kernel.log
       - name: Upload diagnostic reports
         if: always()
@@ -95,7 +105,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y clang-18 llvm-18 lld-18 build-essential uuid-dev nasm acpica-tools python3-venv
-      - name: Build diagnostic firmware
+      - name: Build firmware for selected profile
         shell: bash
         run: |
           mkdir -p out/ci-logs
@@ -140,6 +150,8 @@ jobs:
       - name: Check component source compatibility
         shell: bash
         run: |
+          [[ "$(cat out/ci-kernel/boot-profile.txt)" == "$B2L_BOOT_PROFILE" ]]
+          [[ "$(cat out/ci-firmware/boot-profile.txt)" == "$B2L_BOOT_PROFILE" ]]
           kernel_revision="$(cat out/ci-kernel/source-revision.txt)"
           firmware_revision="$(cat out/ci-firmware/source-revision.txt)"
           [[ "$kernel_revision" =~ ^[0-9a-f]{40}$ && "$firmware_revision" =~ ^[0-9a-f]{40}$ ]]
@@ -157,12 +169,14 @@ jobs:
             --output-dir out/diagnostic-boot --max-image-bytes 57671680
           python3 scripts/package-boot.py --verify out/diagnostic-boot/boot.img
           sha256sum out/diagnostic-boot/boot.img > out/diagnostic-boot/SHA256SUMS
+          printf '%s\n' "$B2L_BOOT_PROFILE" > out/diagnostic-boot/boot-profile.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: s10plus-diagnostic-boot
+          name: s10plus-${{ inputs.boot_profile || 'diagnostic' }}-boot
           path: |
             out/diagnostic-boot/boot.img
             out/diagnostic-boot/manifest.json
             out/diagnostic-boot/SHA256SUMS
+            out/diagnostic-boot/boot-profile.txt
           if-no-files-found: error
           retention-days: 7

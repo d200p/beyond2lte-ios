@@ -2,6 +2,11 @@
 # Build standalone applications; the firmware platform is an external dependency.
 set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+case "${B2L_BOOT_PROFILE:-diagnostic}" in
+  diagnostic) userspace_boot=0 ;;
+  userspace) userspace_boot=1 ;;
+  *) echo 'B2L_BOOT_PROFILE must be diagnostic or userspace' >&2; exit 1 ;;
+esac
 : "${WORKSPACE:?Set WORKSPACE to the prepared Mu/EDK II workspace}"
 export WORKSPACE
 export EDK_TOOLS_PATH="${EDK_TOOLS_PATH:-$WORKSPACE/Mu_Basecore/BaseTools}"
@@ -17,6 +22,7 @@ done
 [[ -x "$EDK_TOOLS_BIN/GenFw" ]] || { echo 'Build native BaseTools first.' >&2; exit 1; }
 mkdir -p "$WORKSPACE/B2LXnuPkg"
 rsync -a "$repo_root/uefi/" "$WORKSPACE/B2LXnuPkg/"
+printf '#define B2L_USERSPACE_BOOT %s\n' "$userspace_boot" > "$WORKSPACE/B2LXnuPkg/XnuLoader/BuildProfile.h"
 rsync -a "$repo_root/common/cache/" "$WORKSPACE/B2LXnuPkg/XnuLoader/"
 rsync -a "$repo_root/common/smp/" "$WORKSPACE/B2LXnuPkg/XnuLoader/"
 rsync -a "$repo_root/common/memory/" "$WORKSPACE/B2LXnuPkg/XnuLoader/"
