@@ -4,6 +4,14 @@
  */
 #include <pexpert/pexpert.h>
 #include "b2l_userspace_payload.h"
+#if defined(B2L_HAS_USERSPACE_PAYLOAD) && !B2L_HAS_USERSPACE_PAYLOAD
+/* Kernel/console trials contain no iOS cache or migration executable. */
+int b2l_apps_cache_is_ready(void) { return 0; }
+static void b2l_userspace_before_init(void)
+{
+    printf("B2L: kernel-only build; userspace bootstrap unavailable\n");
+}
+#else
 #include "b2l_apps_payload_compare.h"
 static int b2l_apps_cache_ready;
 int b2l_apps_cache_is_ready(void){return b2l_apps_cache_ready;}
@@ -96,3 +104,4 @@ static void b2l_userspace_before_init(void)
     if(!error)b2l_apps_cache_ready=1;
 out:printf("B2L APPS: native migration bootstrap publication error=%d\n",error);
 }
+#endif

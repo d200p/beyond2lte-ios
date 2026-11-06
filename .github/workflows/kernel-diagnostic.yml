@@ -1,0 +1,44 @@
+name: S10+ kernel diagnostic build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: b2l-kernel-diagnostic
+  cancel-in-progress: false
+
+jobs:
+  kernel:
+    runs-on: xcode-27
+    timeout-minutes: 90
+    env:
+      B2L_KERNEL_ONLY: '1'
+      BUILD_JOBS: '2'
+      BUILD_MEMORY_BYTES: '6442450944'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Build diagnostic kernel
+        shell: bash
+        run: |
+          mkdir -p out/ci-logs
+          set -o pipefail
+          bash scripts/ci/kernel.sh 2>&1 | tee out/ci-logs/kernel.log
+      - name: Upload diagnostic reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: kernel-diagnostics
+          path: out/ci-logs/
+          retention-days: 7
+      - name: Upload standalone kernel
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: b2l-kernel
+          path: out/ci-kernel/
+          if-no-files-found: error
+          retention-days: 7
