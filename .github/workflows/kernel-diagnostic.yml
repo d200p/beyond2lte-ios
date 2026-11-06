@@ -2,16 +2,23 @@ name: S10+ kernel diagnostic build
 
 on:
   workflow_dispatch:
+    inputs:
+      component:
+        description: Components to build
+        type: choice
+        options: [all, kernel, firmware]
+        default: all
 
 permissions:
   contents: read
 
 concurrency:
-  group: b2l-kernel-diagnostic
+  group: b2l-kernel-diagnostic-${{ inputs.component || 'all' }}
   cancel-in-progress: false
 
 jobs:
   kernel:
+    if: inputs.component == 'all' || inputs.component == 'kernel'
     runs-on: xcode-27
     timeout-minutes: 90
     env:
@@ -43,6 +50,7 @@ jobs:
           if-no-files-found: error
           retention-days: 7
   firmware:
+    if: inputs.component == 'all' || inputs.component == 'firmware'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -75,6 +83,7 @@ jobs:
           retention-days: 7
 
   package:
+    if: inputs.component == 'all'
     needs: [kernel, firmware]
     runs-on: ubuntu-24.04
     timeout-minutes: 10

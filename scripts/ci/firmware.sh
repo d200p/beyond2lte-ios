@@ -23,6 +23,10 @@ python3 -m venv out/firmware-venv
 "$PYTHON_COMMAND" -m pip install 'edk2-pytool-library~=0.23.17' 'edk2-pytool-extensions~=0.31.2' 'antlr4-python3-runtime==4.13.2' regex pefile coloredlogs
 export PYTHONPATH="$WORKSPACE/Mu_Basecore/BaseTools/Source/Python${PYTHONPATH:+:$PYTHONPATH}"
 make -C "$WORKSPACE/Mu_Basecore/BaseTools" -j2
+mkdir -p "$WORKSPACE/Conf"
+for name in target tools_def build_rule; do
+  cp "$WORKSPACE/Mu_Basecore/BaseTools/Conf/${name}.template" "$WORKSPACE/Conf/${name}.txt"
+done
 scripts/build-boot-firmware.sh
 mkdir -p out/ci-firmware
 firmware="$(find "$WORKSPACE/Build" -name '*.fd' -type f -print -quit)"
