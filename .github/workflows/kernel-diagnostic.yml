@@ -42,3 +42,71 @@ jobs:
           path: out/ci-kernel/
           if-no-files-found: error
           retention-days: 7
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Install firmware build tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang-18 llvm-18 lld-18 build-essential uuid-dev nasm acpica-tools python3-venv
+      - name: Build diagnostic firmware
+        shell: bash
+        run: |
+          mkdir -p out/ci-logs
+          set -o pipefail
+          bash scripts/ci/firmware.sh 2>&1 | tee out/ci-logs/firmware.log
+      - name: Upload firmware reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: firmware-diagnostics
+          path: out/ci-logs/
+          retention-days: 7
+      - name: Upload firmware components
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: b2l-firmware
+          path: out/ci-firmware/
+          if-no-files-found: error
+          retention-days: 7
+
+  package:
+    needs: [kernel, firmware]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: b2l-kernel
+          path: out/ci-kernel
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: b2l-firmware
+          path: out/ci-firmware
+      - name: Validate and package BOOT image
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y clang-18 llvm-18
+          python3 scripts/package-boot.py \
+            --mu out/ci-firmware/mu --firmware out/ci-firmware/firmware.fd \
+            --kernel out/ci-kernel/mach.development.b2l --loader out/ci-firmware/XnuLoader.efi \
+            --clang /usr/bin/clang-18 --objcopy /usr/bin/llvm-objcopy-18 \
+            --output-dir out/diagnostic-boot --max-image-bytes 67108864
+          python3 scripts/package-boot.py --verify out/diagnostic-boot/boot.img
+          sha256sum out/diagnostic-boot/boot.img > out/diagnostic-boot/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: s10plus-diagnostic-boot
+          path: |
+            out/diagnostic-boot/boot.img
+            out/diagnostic-boot/manifest.json
+            out/diagnostic-boot/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7

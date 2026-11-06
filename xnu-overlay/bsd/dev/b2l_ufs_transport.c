@@ -16,6 +16,7 @@
 #include <pexpert/arm64/b2l_ram.h>
 #include <libkern/libkern.h>
 #include "b2l_ufs_protocol.h"
+#include "b2l_build_profile.h"
 
 extern vm_offset_t ml_io_map(vm_offset_t,vm_size_t);
 extern ppnum_t pmap_find_phys(pmap_t,addr64_t);
@@ -226,6 +227,10 @@ static int sync_locked(void)
 }
 int b2l_ufs_transport_write(uint64_t lba,uint32_t blocks,const void *in)
 {
+#if B2L_DIAGNOSTIC_READ_ONLY
+    (void)lba; (void)blocks; (void)in;
+    return EROFS;
+#else
     uint8_t cdb[16];
     int error;
     lck_mtx_lock(&b2l_ufs_mutex);
@@ -243,6 +248,7 @@ int b2l_ufs_transport_write(uint64_t lba,uint32_t blocks,const void *in)
     }
 done:
     lck_mtx_unlock(&b2l_ufs_mutex);return error;
+#endif
 }
 int b2l_ufs_transport_sync(void)
 {

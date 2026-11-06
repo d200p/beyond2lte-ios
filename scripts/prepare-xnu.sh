@@ -79,7 +79,9 @@ done < <(find "$repo_root/xnu-overlay" -type f -print0)
 rsync -a "$repo_root/xnu-overlay/" "$xnu_path/"
 if [[ "${B2L_KERNEL_ONLY:-0}" == 1 ]]; then
   printf '#define B2L_HAS_USERSPACE_PAYLOAD 0\n' > "$xnu_path/bsd/kern/b2l_userspace_payload.h"
+  printf '#define B2L_DIAGNOSTIC_READ_ONLY 1\n' > "$xnu_path/bsd/dev/b2l_build_profile.h"
 else
+  printf '#define B2L_DIAGNOSTIC_READ_ONLY 0\n' > "$xnu_path/bsd/dev/b2l_build_profile.h"
   python3 "$repo_root/scripts/build-userspace-bootstrap.py" --output "$xnu_path/bsd/kern/b2l_userspace_payload.h"
 fi
 for source_file in "$repo_root/common/cache/"*; do

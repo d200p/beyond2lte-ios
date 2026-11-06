@@ -22,6 +22,7 @@
 #include "b2l_ufs_aux.h"
 #include <arm64/b2l_persistent_log.h>
 #include "../kern/b2l_native_cache.h"
+#include "b2l_build_profile.h"
 #include "../kern/b2l_cache_core.h"
 
 struct b2l_ufs_view {
@@ -462,7 +463,11 @@ b2l_ufs_disk_init(void)
 	b2l_reader.block_size = geometry.block_size;
 	b2l_reader.read = b2l_ufs_transport_read;
 	b2l_reader.scratch = b2l_read_scratch;
+#if B2L_DIAGNOSTIC_READ_ONLY
+	b2l_reader.write = NULL;
+#else
 	b2l_reader.write = b2l_ufs_transport_write;
+#endif
 	uint64_t capacity;
 	if ((error = b2l_ufs_capacity(&b2l_reader, &capacity))) {
 		printf("B2L UFS: invalid geometry error=%d\n", error); return;
