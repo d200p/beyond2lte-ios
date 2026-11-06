@@ -58,6 +58,9 @@ make -C xnu SDKROOT=macosx KDKROOT="$KDKROOT" \
   MEMORY_SIZE=6442450944 SYSCTL_HW_PHYSICALCPU=2 SYSCTL_HW_LOGICALCPU=2 \
   OBJROOT="$repo_root/out/xnu/obj" SYMROOT="$repo_root/out/xnu/sym" \
   DSTROOT="$B2L_DEPSROOT" installhdrs
+# libfirehose builds with -nostdinc; supply the public SDK's platform header.
+cp "$(xcrun --sdk macosx --show-sdk-path)/usr/include/TargetConditionals.h" \
+  "$B2L_DEPSROOT/usr/local/include/kernel/TargetConditionals.h"
 cat > "$base/env.sh" <<'ENV'
 export KDKROOT B2L_DEPSROOT
 ENV
