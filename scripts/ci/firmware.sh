@@ -8,7 +8,7 @@ export CLANG_BIN=/usr/lib/llvm-18/bin
 export PYTHON_COMMAND="$repo_root/out/firmware-venv/bin/python"
 mkdir -p out
 git clone --no-checkout --filter=blob:none https://github.com/Project-Silicium/Mu-Silicium.git "$WORKSPACE"
-git -C "$WORKSPACE" fetch --depth 1 origin 8471e47f5248ebbffc2e6196b683204163efe155
+git -C "$WORKSPACE" fetch --depth 1 origin fa64a442a9c98fdad6bd773b2d7e661afef3bb35
 git -C "$WORKSPACE" checkout --detach FETCH_HEAD
 git -C "$WORKSPACE" submodule update --init --depth 1 Mu_Basecore Common/Mu Common/Mu_OEM_Sample Silicium-ACPI
 # Use the exact Basecore revision documented by the device port.
