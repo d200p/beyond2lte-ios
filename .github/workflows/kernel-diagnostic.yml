@@ -6,11 +6,20 @@ on:
       component:
         description: Components to build
         type: choice
-        options: [all, kernel, firmware]
+        options: [all, kernel, firmware, package]
         default: all
+      kernel_run:
+        description: Successful kernel run ID (package mode only)
+        type: string
+        default: ''
+      firmware_run:
+        description: Successful firmware run ID (package mode only)
+        type: string
+        default: ''
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: b2l-kernel-diagnostic-${{ inputs.component || 'all' }}
@@ -83,7 +92,7 @@ jobs:
           retention-days: 7
 
   package:
-    if: inputs.component == 'all'
+    if: always() && ((inputs.component == 'all' && needs.kernel.result == 'success' && needs.firmware.result == 'success') || inputs.component == 'package')
     needs: [kernel, firmware]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -95,10 +104,23 @@ jobs:
         with:
           name: b2l-kernel
           path: out/ci-kernel
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.kernel_run || github.run_id }}
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: b2l-firmware
           path: out/ci-firmware
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ inputs.firmware_run || github.run_id }}
+      - name: Check component source compatibility
+        shell: bash
+        run: |
+          kernel_revision="$(cat out/ci-kernel/source-revision.txt)"
+          firmware_revision="$(cat out/ci-firmware/source-revision.txt)"
+          [[ "$kernel_revision" =~ ^[0-9a-f]{40}$ && "$firmware_revision" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags origin "$kernel_revision" "$firmware_revision"
+          git diff --exit-code "$kernel_revision" "$firmware_revision" -- uefi common scripts/package-boot.py
+          git diff --exit-code "$kernel_revision" HEAD -- scripts/package-boot.py
       - name: Validate and package BOOT image
         run: |
           sudo apt-get update -qq
@@ -107,7 +129,7 @@ jobs:
             --mu out/ci-firmware/mu --firmware out/ci-firmware/firmware.fd \
             --kernel out/ci-kernel/mach.development.b2l --loader out/ci-firmware/XnuLoader.efi \
             --clang /usr/bin/clang-18 --objcopy /usr/bin/llvm-objcopy-18 \
-            --output-dir out/diagnostic-boot --max-image-bytes 67108864
+            --output-dir out/diagnostic-boot --max-image-bytes 57671680
           python3 scripts/package-boot.py --verify out/diagnostic-boot/boot.img
           sha256sum out/diagnostic-boot/boot.img > out/diagnostic-boot/SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
