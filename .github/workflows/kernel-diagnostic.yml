@@ -38,12 +38,37 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-      - name: Build diagnostic kernel
+      - name: Restore pinned build headers
+        id: headers
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: b2l-xcode27-kdk25F71-xnuac9718fb-headers-v1
+          path: |
+            out/ci-env/deps
+            out/ci-env/kdk/System/Library/Frameworks
+            out/ci-env/kdk/System/Library/KernelSupport
+            out/ci-env/kdk/usr
+      - name: Prepare pinned kernel dependencies
         shell: bash
         run: |
           mkdir -p out/ci-logs
           set -o pipefail
-          bash scripts/ci/kernel.sh 2>&1 | tee out/ci-logs/kernel.log
+          bash scripts/ci/kernel.sh prepare 2>&1 | tee out/ci-logs/kernel.log
+      - name: Cache verified build headers
+        if: steps.headers.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: b2l-xcode27-kdk25F71-xnuac9718fb-headers-v1
+          path: |
+            out/ci-env/deps
+            out/ci-env/kdk/System/Library/Frameworks
+            out/ci-env/kdk/System/Library/KernelSupport
+            out/ci-env/kdk/usr
+      - name: Build diagnostic kernel
+        shell: bash
+        run: |
+          set -o pipefail
+          bash scripts/ci/kernel.sh build 2>&1 | tee -a out/ci-logs/kernel.log
       - name: Upload diagnostic reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
