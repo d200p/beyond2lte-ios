@@ -19,6 +19,7 @@ git clone --no-checkout --filter=blob:none https://github.com/orhunnx/beyond2lte
 git -C out/uefi-reference fetch --depth 1 origin c7846ec9257c322eca6eae4cac7d1801786c95f5
 git -C out/uefi-reference checkout --detach FETCH_HEAD
 rsync -a out/uefi-reference/mu-silicium-overlay/ "$WORKSPACE/"
+rsync -a out/uefi-reference/silicium-acpi-overlay/SoCs/ "$WORKSPACE/Silicium-ACPI/SoCs/"
 python3 -m venv out/firmware-venv
 "$PYTHON_COMMAND" -m pip install 'edk2-pytool-library~=0.23.17' 'edk2-pytool-extensions~=0.31.2' 'antlr4-python3-runtime==4.13.2' regex pefile coloredlogs
 export PYTHONPATH="$WORKSPACE/Mu_Basecore/BaseTools/Source/Python${PYTHONPATH:+:$PYTHONPATH}"

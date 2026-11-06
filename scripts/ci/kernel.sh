@@ -61,7 +61,7 @@ make -C xnu SDKROOT=macosx KDKROOT="$KDKROOT" \
 cat > "$base/env.sh" <<'ENV'
 export KDKROOT B2L_DEPSROOT
 ENV
-scripts/build-firehose.sh
+bash scripts/build-firehose.sh
 scripts/build-kernel.sh CWARNFLAGS=-w CXXWARNFLAGS=-w
 mkdir -p out/ci-kernel
 kernel="$(find out/xnu -name mach.development.b2l -type f -print -quit)"
