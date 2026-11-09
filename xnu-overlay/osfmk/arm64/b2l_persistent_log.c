@@ -6,8 +6,35 @@
 #include <kern/thread.h>
 #include <kern/sched_prim.h>
 #include <kern/clock.h>
+#include <kern/cpu_number.h>
+#include <kern/cpu_data.h>
 #include <mach/mach_time.h>
 static struct b2l_log_ring console_ring;
+/* Estimate the current CPU's core clock from a dependent add chain of
+ * 1,048,576 single-cycle instructions timed by the generic timer. No PMU or
+ * clock-management register is touched. The value is the clock of whichever
+ * CPU runs the reporter at that moment; successive lines sample others. */
+static uint64_t b2l_cpu_mhz_sample(unsigned*cpu)
+{
+    uint64_t x=0,ns=0;
+    disable_preemption();
+    *cpu=(unsigned)cpu_number();
+    uint64_t began=mach_absolute_time();
+#if defined(__arm64__)
+    for(unsigned i=0;i<65536;i++){
+        __asm__ volatile(
+            "add %0,%0,#1\n\tadd %0,%0,#1\n\tadd %0,%0,#1\n\tadd %0,%0,#1\n\t"
+            "add %0,%0,#1\n\tadd %0,%0,#1\n\tadd %0,%0,#1\n\tadd %0,%0,#1\n\t"
+            "add %0,%0,#1\n\tadd %0,%0,#1\n\tadd %0,%0,#1\n\tadd %0,%0,#1\n\t"
+            "add %0,%0,#1\n\tadd %0,%0,#1\n\tadd %0,%0,#1\n\tadd %0,%0,#1"
+            :"+r"(x));
+    }
+#endif
+    uint64_t elapsed=mach_absolute_time()-began;
+    enable_preemption();
+    absolutetime_to_nanoseconds(elapsed,&ns);
+    return ns&&x==65536ull*16?(65536ull*16*1000)/ns:0;
+}
 static struct b2l_log_writer disk_writer;
 static uint32_t start_state;
 static uint64_t flush_failures;
@@ -29,8 +56,9 @@ static void b2l_log_worker(void*argument __unused,wait_result_t result __unused)
                 perf[0],perf[1],perf[2],perf[3],perf[4],perf[5]);
             b2l_diag_progress();
             uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
-            b2l_early_trace("B2L LIVE: traps=%llu done=%llu pid=%llu pc=0x%llx flush_errors=%llu last_error=%d sec=%llu pacga=%s\n",
-                v[0],v[1],v[2],v[3],__atomic_load_n(&flush_failures,__ATOMIC_RELAXED),__atomic_load_n(&last_error,__ATOMIC_RELAXED),ns/1000000000,b2l_arm64e_pacga_name());
+            unsigned cpu=0;uint64_t mhz=b2l_cpu_mhz_sample(&cpu);
+            b2l_early_trace("B2L LIVE: traps=%llu done=%llu pid=%llu pc=0x%llx flush_errors=%llu last_error=%d sec=%llu pacga=%s cpu=%u mhz=%llu\n",
+                v[0],v[1],v[2],v[3],__atomic_load_n(&flush_failures,__ATOMIC_RELAXED),__atomic_load_n(&last_error,__ATOMIC_RELAXED),ns/1000000000,b2l_arm64e_pacga_name(),cpu,mhz);
         }
         assert_wait_timeout((event_t)&disk_writer,THREAD_UNINT,5,NSEC_PER_SEC);
         thread_block(THREAD_CONTINUE_NULL);

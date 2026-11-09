@@ -13,7 +13,11 @@ int main(void){
  assert(b2l_nc_native(0xd71f0a11,&native)&&native==0xd61f0200);
  assert(b2l_nc_native(0xd73f0a11,&native)&&native==0xd63f0200);
  assert(b2l_nc_native(0xf8bfc020,&native)&&native==0xc8dffc20);
- assert(!b2l_nc_native(0x9ac03000,&native));assert(b2l_nc_native(0xf8200400,&native)&&native==0xf9400000u);
+ assert(!b2l_nc_native(0x9ac03000,&native));b2l_nc_pacga_mask=1;
+ assert(b2l_nc_native(0x9ac03000,&native)&&native==0x92607c00u);/* PACGA x0,x0,x0 -> AND x0,x0,#0xffffffff00000000 */
+ assert(b2l_nc_native(0x9ac3305fu,&native)&&native==0xd503201fu);/* PACGA xzr,x2,x3 -> NOP */
+ b2l_nc_pacga_mask=0;assert(!b2l_nc_native(0x9ac3305fu,&native));
+ assert(b2l_nc_native(0xf8200400,&native)&&native==0xf9400000u);
  assert(!b2l_nc_native(0xf8600400,&native));assert(!b2l_nc_native(0xdeadbeef,&native));
  memcpy(r,"B2LNCREC",8);b2l_nc_p64(r+8,1);b2l_nc_p64(r+16,42);b2l_nc_p64(r+24,8192);r[40]=7;b2l_nc_p32(r+56,1);b2l_nc_p32(r+60,4096);
  b2l_nc_p32(r+B2L_NC_DATA,0xd65f0fff);b2l_nc_p32(r+B2L_NC_DATA+4096,0xd65f03c0);b2l_nc_seal(r);assert(!b2l_nc_record(r));assert(!b2l_nc_select(c,&out)&&out==r);

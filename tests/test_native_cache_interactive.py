@@ -43,7 +43,7 @@ post = r'''
 int main(void){
  reset();ready=0;b2l_native_cache_observe(0x1000,0xd65f0fff);
  assert(!clock_reads&&!disabled&&!references&&!wakeups);
- reset();b2l_native_cache_observe(0x1000,0x9ac03000); // PACGA is not persisted.
+ reset();b2l_native_cache_observe(0x1000,0x9ac03000); // PACGA is not persisted without the mask ABI.
  assert(!clock_reads&&!disabled&&!references&&!wakeups);
  reset();head=2;pending=2;references=2;
  queue[0]=(struct request){&map_token,0x1000,0xd65f0fff};queue[1]=(struct request){&map_token,0x2000,0xd65f0fff};

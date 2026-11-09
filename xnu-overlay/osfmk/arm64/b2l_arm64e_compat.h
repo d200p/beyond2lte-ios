@@ -10,6 +10,10 @@ extern "C" {
 bool b2l_arm64e_compat_enabled(void);
 /* Boot-stable algorithm label; contains no key or operand data. */
 const char *b2l_arm64e_pacga_name(void);
+/* True when PACGA yields Xn & 0xffffffff00000000 (cache-rewritable ABI). */
+bool b2l_arm64e_pacga_mask(void);
+/* Pre-userspace only: adopt the mask ABI because root sites are rewritten. */
+void b2l_arm64e_force_pacga_mask(void);
 /* Best-effort relaxed telemetry: traps, completed, last pid and last PC. */
 void b2l_arm64e_compat_snapshot(uint64_t values[4]);
 /* samples, successful wrapper/VM/hash nanoseconds, paired extras, fallbacks */

@@ -16,6 +16,8 @@ fi
 "$cc" "${flags[@]}" -I"$repo/xnu-overlay/bsd/kern" "$repo/tests/native_cache_exclusion_test.c" "$repo/common/cache/b2l_cache_core.c" "$repo/common/cache/CacheSha.c" -o "$tmp/exclusion"
 "$tmp/exclusion"
 
+"$cc" "${flags[@]}" -I"$repo/xnu-overlay/osfmk/arm64" "$repo/tests/native_cache_pacga_test.c" "$repo/common/cache/b2l_cache_core.c" "$repo/common/cache/CacheSha.c" "$repo/xnu-overlay/osfmk/arm64/b2l_compat.c" -o "$tmp/pacga"
+"$tmp/pacga"
 "$cc" "${flags[@]}" "$repo/tests/native_cache_store_test.c" "$repo/common/cache/b2l_cache_core.c" "$repo/common/cache/CacheSha.c" -o "$tmp/store"
 "$tmp/store"
 "$cc" "${flags[@]}" "$repo/tests/native_cache_undo_test.c" "$repo/common/cache/b2l_cache_core.c" "$repo/common/cache/CacheSha.c" -o "$tmp/undo"

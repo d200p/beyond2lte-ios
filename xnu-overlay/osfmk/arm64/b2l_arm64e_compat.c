@@ -37,8 +37,14 @@ extern uint64_t b2l_pacga_siphash(uint64_t, uint64_t, const uint64_t[2]);
 static bool b2l_compat_requested;
 /* Written only at TUNABLES, before any userspace object can be signed. */
 static bool b2l_compat_siphash;
+/* Mask result ABI: PACGA Xd = Xn & 0xffffffff00000000, no key or hash. It is
+ * the only PACGA result the native cache may rewrite into one instruction.
+ * Written at TUNABLES, or forced by the cache before load_init_program when
+ * the installed root already carries rewritten PACGA sites. */
+static bool b2l_compat_mask;
 static bool b2l_compat_pair;
-/* Samples cover successful wrapper work only, not exception entry/return. */
+/* Samples cover successful wrapper work only, not exception entry/return.
+ * perf[2] now times the cheap PC alignment/range check, not a VM lookup. */
 static uint64_t b2l_compat_perf[6];
 struct b2l_compat_measurement { bool sample; uint64_t vm_ticks, hash_ticks; };
 static uint64_t b2l_compat_telemetry[4];
@@ -70,6 +76,9 @@ b2l_compat_init(void)
     int siphash = 0;
     b2l_compat_siphash = b2l_compat_requested &&
         PE_parse_boot_argn("b2l_pacga_siphash", &siphash, sizeof(siphash)) && siphash == 1;
+    int mask = 0;
+    b2l_compat_mask = b2l_compat_requested &&
+        PE_parse_boot_argn("b2l_pacga_mask", &mask, sizeof(mask)) && mask == 1;
     int pair = 0;
     b2l_compat_pair = b2l_compat_requested &&
         PE_parse_boot_argn("b2l_pacga_pair", &pair, sizeof(pair)) && pair == 1;
@@ -78,7 +87,9 @@ b2l_compat_init(void)
          * already mapped, lock-free early framebuffer sink here. */
         const char *message = "B2L ARM64e: development stripped-pointer runtime enabled; hardware PAC unchanged\n";
         while (*message) b2l_early_putc(*message++);
-        message = b2l_compat_siphash ?
+        message = b2l_compat_mask ?
+            "B2L PACGA: mask result ABI (Xn & 0xffffffff00000000); cache may rewrite PACGA\n" :
+            b2l_compat_siphash ?
             "B2L PACGA: SipHash-2-4 experimental boot ABI; immutable boot key\n" :
             "B2L PACGA: QARMA5; immutable boot key\n";
         while (*message) b2l_early_putc(*message++);
@@ -100,7 +111,25 @@ const char *
 b2l_arm64e_pacga_name(void)
 {
     if (!b2l_compat_requested) return "disabled";
+    if (b2l_compat_mask) return "mask";
     return b2l_compat_siphash ? "siphash24" : "qarma5";
+}
+
+bool
+b2l_arm64e_pacga_mask(void)
+{
+    return b2l_compat_requested && b2l_compat_mask;
+}
+
+/* Called only before the first userspace instruction, when durable cache
+ * records show that root PACGA sites were already rewritten to the mask
+ * result. Trapped and rewritten sites must agree for the whole boot. */
+void
+b2l_arm64e_force_pacga_mask(void)
+{
+    if (!b2l_compat_requested || b2l_compat_mask) return;
+    b2l_compat_mask = true;
+    printf("B2L PACGA: mask result ABI forced by existing native cache records\n");
 }
 
 LCK_GRP_DECLARE(b2l_compat_lck_grp, "b2l_arm64e_compat");
@@ -157,41 +186,18 @@ b2l_compat_read_acquire(uint64_t address, unsigned width, uint64_t *out, void *o
 static int
 b2l_compat_validate_pc(uint64_t address, void *opaque)
 {
-    uint32_t instruction;
-    static unsigned check_samples;
-    bool trace = check_samples < 2;
-    if (trace) { ++check_samples; b2l_early_trace("B2L COMPAT: execute-map check begin pc=0x%llx\n", address); }
-    if ((address & 3u) || !b2l_user_range(address, sizeof(instruction))) return -1;
-    /* Inspect only the exact instruction range under shared entry locks.
-     * Constant/transparent submaps must resolve to the executable leaf, with
-     * bounds translated/clamped back into the caller's parent address space.
-     * The region-info API also gathers object/share/refcount metadata, taking
-     * exclusive VM object locks even for SHORT_INFO. None of that metadata is
-     * needed for this permission check. Never cache an unlocked permission. */
+    /* Only alignment and EL0 range are checked here. Executability is not
+     * looked up: the trapped PC was fetched by the CPU, and a branch target
+     * is handed back in ELR exactly as hardware would do for a native BLR/RET.
+     * A non-executable or unmapped target then takes the ordinary EL0
+     * instruction-fetch fault at that PC. Nothing is dereferenced, no map
+     * lock is taken and no permission is cached. Earlier builds spent most of
+     * every trap in this lookup (sampled vm_ns about 6 us per trap). */
     struct b2l_compat_measurement *measurement=opaque;
     uint64_t began=measurement && measurement->sample ? mach_absolute_time() : 0;
-    VM_MAP_LOCK_CTX_DECLARE(ctx);
-    vm_map_t map=current_map();
-    kern_return_t kr=vm_map_range_sh_lock(ctx,&map,address,address+sizeof(instruction),
-        VMRL_SH_STREAM_NO_HOLES | VMRL_SH_DESCEND_INTO_CONSTANT);
-    bool executable=false;
-    if (kr==KERN_SUCCESS) {
-        vm_map_entry_t entry=vm_map_range_stream_next_with_error(ctx,&kr);
-        if (kr==KERN_SUCCESS && entry && !entry->is_sub_map &&
-            (entry->protection & VM_PROT_EXECUTE)) {
-            vm_map_address_t start=0,end=0;
-            vm_map_lock_ctx_bounds_in_parent(ctx,&start,&end,NULL);
-            executable=start<=address && end>=address+sizeof(instruction);
-        }
-        vm_map_range_sh_unlock(ctx,&map);
-    }
+    int result = ((address & 3u) || !b2l_user_range(address, 4u)) ? -1 : 0;
     if (measurement && measurement->sample) measurement->vm_ticks += mach_absolute_time()-began;
-    if (!executable) return -1;
-    /* Release all map locks BEFORE faultable instruction copyin. */
-    if (trace) b2l_early_trace("B2L COMPAT: execute-map check passed; copyin begin\n");
-    int error = copyin_atomic32(address, &instruction);
-    if (trace) b2l_early_trace("B2L COMPAT: execute-PC copyin result=%d\n", error);
-    return error ? -1 : 0;
+    return result;
 }
 
 static int
@@ -200,6 +206,12 @@ b2l_compat_pacga(uint64_t a, uint64_t b, uint64_t *out, void *opaque)
     if (!out || !b2l_compat_requested) return -1;
     struct b2l_compat_measurement *measurement=opaque;
     uint64_t began=measurement && measurement->sample ? mach_absolute_time() : 0;
+    if (b2l_compat_mask) {
+        /* Same function as the cache's AND-immediate rewrite; no key. */
+        *out = a & UINT64_C(0xffffffff00000000);
+        if (measurement && measurement->sample) measurement->hash_ticks += mach_absolute_time()-began;
+        return 0;
+    }
     /* First invocation is an EL0 trap after BSD startup and PRNG registration.
      * One key and one algorithm cover every task and CPU for the entire boot.
      * Release publishes the completed key; acquire readers never need a mutex.
@@ -239,7 +251,7 @@ b2l_arm64e_compat_emulate(arm_saved_state_t *state, uint32_t instruction)
     if (!b2l_compat_requested || !state || !is_saved_state64(state) ||
         !PSR64_IS_USER64(get_saved_state_cpsr(state)) ||
         !b2l_arm64e_current_task()) return false;
-    if (trace) b2l_early_trace("B2L COMPAT: process and EL0 gates passed\n");
+    if (trace) b2l_early_trace("B2L COMPAT: process and EL0 gates passed; pc checks are range-only\n");
     uint64_t ticket=__atomic_fetch_add(&b2l_compat_telemetry[0],1,__ATOMIC_RELAXED);
     struct b2l_compat_measurement measurement={.sample=(ticket & 1023u)==0};
     uint64_t began=measurement.sample ? mach_absolute_time() : 0;
@@ -271,8 +283,7 @@ b2l_arm64e_compat_emulate(arm_saved_state_t *state, uint32_t instruction)
     }
     if (b2l_compat_pair && !(context.cpsr & PSR64_SS) &&
         current_thread()->machine.DebugData == NULL && b2l_compat_is_pacga(instruction)) {
-        /* The first decoder has already validated its next PC as executable.
-         * Fetch only one following instruction through recoverable EL0 copyin.
+        /* Fetch only one following instruction through recoverable EL0 copyin.
          * Reuse the actual decoder for all operand/ZR/SP and next-PC checks.
          * Failure to consume the second instruction commits ONLY the first;
          * the next EL0 instruction then executes/traps normally. No loop,

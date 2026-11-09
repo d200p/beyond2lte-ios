@@ -1,5 +1,7 @@
-/* Actual runtime TU with mock VM/copyin/lock/entropy boundary; decoder and
- * QARMA are the shipped sources, not duplicate test implementations. */
+/* Actual runtime TU with mock copyin/lock/entropy boundary; decoder and
+ * QARMA are the shipped sources, not duplicate test implementations. The
+ * wrapper takes no VM map lock: committed PCs are only range/alignment
+ * checked and left to the hardware instruction fetch, so no VM mock exists. */
 #define B2L_COMPAT_HOST_TEST 1
 #include <assert.h>
 #include <stdbool.h>
@@ -17,19 +19,6 @@
 static struct host_thread {struct {void *DebugData;} machine;} host_thread;
 static struct host_thread *current_thread(void){return &host_thread;}
 #define MACH_VM_MAX_ADDRESS UINT64_C(0x1000000000)
-#define VM_PROT_EXECUTE 4
-#define VM_SANITIZE_CALLER_USERACC 1
-#define KERN_SUCCESS 0
-typedef int kern_return_t;
-typedef uint64_t vm_map_address_t;
-typedef void *vm_map_t;
-struct mock_entry {int protection;bool is_sub_map;uint64_t vme_start,vme_end;};
-typedef struct mock_entry *vm_map_entry_t;
-struct mock_lock_ctx {uint64_t start,end,parent_start,parent_end;};
-typedef struct mock_lock_ctx *vm_map_lock_ctx_t;
-#define VM_MAP_LOCK_CTX_DECLARE(name) struct mock_lock_ctx name##_storage={0};vm_map_lock_ctx_t name=&name##_storage
-#define VMRL_SH_STREAM_NO_HOLES 1u
-#define VMRL_SH_DESCEND_INTO_CONSTANT 2u
 #define LCK_GRP_DECLARE(a,b) static int a __unused
 #define LCK_MTX_DECLARE(a,b) static pthread_mutex_t a=PTHREAD_MUTEX_INITIALIZER
 static unsigned lock_calls;
@@ -38,20 +27,14 @@ static int test_mtx_lock(pthread_mutex_t *p){__atomic_fetch_add(&lock_calls,1,__
 #define lck_mtx_unlock pthread_mutex_unlock
 struct arm_saved_state {uint64_t x[29],fp,lr,sp,pc;uint32_t cpsr;bool user64;};
 typedef struct arm_saved_state arm_saved_state_t;
-static bool task_compat=true, executable=true, copy_fault=false;
+static bool task_compat=true, copy_fault=false;
 static unsigned entropy_calls, atomic32_calls, atomic32_fail_at;
 static uint64_t host_ticks;
 static uint64_t mach_absolute_time(void){return __atomic_add_fetch(&host_ticks,1,__ATOMIC_RELAXED);}
-static unsigned region_queries;
-static int region_error;
-static bool leaf_is_submap, lookup_entry_missing;
-static int iterator_error;
-static unsigned map_locked, map_locks, map_unlocks;
-static uint64_t child_shift;
-static uint64_t leaf_start=0x1000, leaf_size=0x3000;
 static uint8_t memory[0x4000];
-static int boot_flag, siphash_flag = -1, pair_flag = -1;
-static bool PE_parse_boot_argn(const char *n,void *p,size_t z){assert(z==sizeof(int));if(!strcmp(n,"b2l_arm64e_compat")){memcpy(p,&boot_flag,z);return true;}if(!strcmp(n,"b2l_pacga_siphash")){if(siphash_flag<0)return false;memcpy(p,&siphash_flag,z);return true;}assert(!strcmp(n,"b2l_pacga_pair"));if(pair_flag<0)return false;memcpy(p,&pair_flag,z);return true;}
+static int boot_flag, siphash_flag = -1, pair_flag = -1, mask_flag = -1;
+static bool PE_parse_boot_argn(const char *n,void *p,size_t z){assert(z==sizeof(int));if(!strcmp(n,"b2l_arm64e_compat")){memcpy(p,&boot_flag,z);return true;}if(!strcmp(n,"b2l_pacga_siphash")){if(siphash_flag<0)return false;memcpy(p,&siphash_flag,z);return true;}if(!strcmp(n,"b2l_pacga_mask")){if(mask_flag<0)return false;memcpy(p,&mask_flag,z);return true;}assert(!strcmp(n,"b2l_pacga_pair"));if(pair_flag<0)return false;memcpy(p,&pair_flag,z);return true;}
+static unsigned forced_lines;
 static bool b2l_arm64e_current_task(void){return task_compat;}
 static bool is_saved_state64(arm_saved_state_t*s){return s->user64;}
 #define PSR64_IS_USER64(c) (((c)&15)==0)
@@ -66,30 +49,7 @@ static void set_saved_state_fp(arm_saved_state_t*s,uint64_t v){s->fp=v;}
 static void set_user_saved_state_lr(arm_saved_state_t*s,uint64_t v){s->lr=v;}
 static void set_saved_state_sp(arm_saved_state_t*s,uint64_t v){s->sp=v;}
 static void set_user_saved_state_pc(arm_saved_state_t*s,uint64_t v){s->pc=v;}
-static void*current_map(void){return memory;}
-/* VM boundary mocks: actual range-lock/bounds API contract, including the
- * map-pointer invalidation and child-to-parent bounds translation. The parent
- * can be read-only while its constant-submap leaf is executable. */
-static kern_return_t vm_map_range_sh_lock(vm_map_lock_ctx_t ctx,vm_map_t *map,
- uint64_t start,uint64_t end,unsigned flags){
- assert(*map==memory&&end==start+4&&flags==(VMRL_SH_STREAM_NO_HOLES|VMRL_SH_DESCEND_INTO_CONSTANT));
- assert(!map_locked);++region_queries;if(region_error)return region_error;
- ctx->start=start;ctx->end=end;ctx->parent_start=leaf_start;ctx->parent_end=leaf_start+leaf_size;
- *map=NULL;map_locked=1;++map_locks;return KERN_SUCCESS;
-}
-static vm_map_entry_t vm_map_range_stream_next_with_error(vm_map_lock_ctx_t ctx,kern_return_t *kr){
- static struct mock_entry entry;assert(map_locked&&ctx->end==ctx->start+4);
- *kr=iterator_error;if(iterator_error||lookup_entry_missing)return NULL;
- entry=(struct mock_entry){executable?VM_PROT_EXECUTE:1,leaf_is_submap,leaf_start+child_shift,leaf_start+leaf_size+child_shift};return &entry;
-}
-static void vm_map_lock_ctx_bounds_in_parent(vm_map_lock_ctx_t ctx,uint64_t *start,uint64_t *end,void *size){
- assert(map_locked&&!size);*start=ctx->parent_start>ctx->start?ctx->parent_start:ctx->start;
- *end=ctx->parent_end<ctx->end?ctx->parent_end:ctx->end;
-}
-static void vm_map_range_sh_unlock(vm_map_lock_ctx_t ctx,vm_map_t *map){
- assert(map_locked&&!*map&&ctx);map_locked=0;*map=memory;++map_unlocks;
-}
-static int copyin(uint64_t a,void*out,unsigned n){assert(!map_locked);if(copy_fault||a<0x1000||a>0x4000||n>0x4000-a)return -1;memcpy(out,memory+a,n);return 0;}
+static int copyin(uint64_t a,void*out,unsigned n){if(copy_fault||a<0x1000||a>0x4000||n>0x4000-a)return -1;memcpy(out,memory+a,n);return 0;}
 static int copyin_atomic32(uint64_t a,uint32_t*out){assert(!(a&3));++atomic32_calls;if(atomic32_calls==atomic32_fail_at)return -1;return copyin(a,out,4);}
 static int copyin_atomic64(uint64_t a,uint64_t*out){assert(!(a&7));return copyin(a,out,8);}
 static void read_frandom(void*out,unsigned n){assert(n==16);++entropy_calls;for(unsigned i=0;i<n;i++)((uint8_t*)out)[i]=(uint8_t)(i+71);}
@@ -98,7 +58,8 @@ uint64_t b2l_pacga_qarma5_asm(uint64_t a,uint64_t b,uint64_t c,uint64_t d){retur
 static unsigned early_log_bytes;
 static void b2l_early_trace(const char *fmt, ...){assert(fmt);}
 static void b2l_early_putc(char c){assert(c);++early_log_bytes;}
-#define printf(...) do { assert(!"normal printf forbidden during TUNABLES"); } while(0)
+static bool tunables_phase=true;
+#define printf(...) do { assert(!tunables_phase); ++forced_lines; } while(0)
 #include "b2l_arm64e_compat.c"
 #undef printf
 
@@ -111,6 +72,7 @@ static void rejected_unchanged(arm_saved_state_t s,uint32_t op){arm_saved_state_
 static unsigned race_ready, race_go;
 static uint64_t expected_hash(uint64_t a,uint64_t b){
  uint64_t key[2];for(unsigned i=0;i<16;i++)((uint8_t*)key)[i]=(uint8_t)(i+71);
+ if(b2l_compat_mask)return a&UINT64_C(0xffffffff00000000);
  if(b2l_compat_siphash){SIPHASH_CTX ctx;uint64_t msg[2]={a,b};return SipHashX(&ctx,2,4,(uint8_t*)key,msg,16)&UINT64_C(0xffffffff00000000);}
  return b2l_pacga_qarma5(a,b,key[0],key[1]);
 }
@@ -129,7 +91,7 @@ static void key_race_test(void){
  while(__atomic_load_n(&race_ready,__ATOMIC_ACQUIRE)!=8)sched_yield();
  __atomic_store_n(&race_go,1,__ATOMIC_RELEASE);
  for(unsigned i=0;i<8;i++)assert(!pthread_join(workers[i],NULL));
- assert(entropy_calls==1);unsigned before=lock_calls;
+ assert(entropy_calls==(b2l_compat_mask?0u:1u));unsigned before=lock_calls;
  for(unsigned i=0;i<1000;i++){uint64_t v;assert(!b2l_compat_pacga(i,0x82c,&v,NULL));assert(v==expected_hash(i,0x82c));}
  assert(lock_calls==before);assert(b2l_compat_pacga(1,2,NULL,NULL)==-1);
 }
@@ -152,9 +114,9 @@ static void pair_tests(void){
  for(int flag=-1;flag<=2;flag++)if(flag!=1){pair_flag=flag;b2l_compat_init();assert(!b2l_compat_pair);}
  pair_flag=1;b2l_compat_init();assert(b2l_compat_pair);
  arm_saved_state_t s=initial(),want=s;expected_step(&want,first);expected_step(&want,second);
- unsigned queries=region_queries;uint64_t before=b2l_compat_perf[4];
+ uint64_t before=b2l_compat_perf[4];
  assert(b2l_arm64e_compat_emulate(&s,first));assert(!memcmp(&s,&want,sizeof(s)));
- assert(s.pc==0x1008&&region_queries==queries+3&&b2l_compat_perf[4]==before+1);
+ assert(s.pc==0x1008&&b2l_compat_perf[4]==before+1);
  /* Never consume a third instruction, even another PACGA. */
  assert(s.x[1]==want.x[1]);
  /* Debug state and single-step must keep the one-instruction boundary. */
@@ -166,11 +128,9 @@ static void pair_tests(void){
  pair_flag=0;b2l_compat_init();s=initial();want=s;expected_step(&want,first);
  assert(b2l_arm64e_compat_emulate(&s,first)&&!memcmp(&s,&want,sizeof(s)));
  pair_flag=1;b2l_compat_init();
- /* A second instruction's future execute failure preserves the first commit. */
- leaf_size=8;s=initial();want=s;expected_step(&want,first);
- assert(b2l_arm64e_compat_emulate(&s,first)&&!memcmp(&s,&want,sizeof(s)));leaf_size=0x3000;
- /* An opportunistic fetch fault also preserves exactly the first commit. */
- s=initial();want=s;expected_step(&want,first);atomic32_fail_at=atomic32_calls+3;
+ /* An opportunistic fetch fault preserves exactly the first commit. The pair
+  * fetch is the only instruction read the wrapper itself performs. */
+ s=initial();want=s;expected_step(&want,first);atomic32_fail_at=atomic32_calls+1;
  assert(b2l_arm64e_compat_emulate(&s,first)&&!memcmp(&s,&want,sizeof(s)));atomic32_fail_at=0;
  /* A branch/non-PACGA following instruction must execute later in EL0. */
  uint32_t other=0xd65f0bff;memcpy(memory+0x1004,&other,4);s=initial();want=s;expected_step(&want,first);
@@ -192,10 +152,10 @@ static void pair_tests(void){
  b2l_arm64e_perf_snapshot(perf_after);assert(perf_after[0]>perf_before[0]);
  assert(perf_after[1]>perf_before[1]&&perf_after[2]>perf_before[2]&&perf_after[3]>perf_before[3]);
  assert(perf_after[1]>=perf_after[2]+perf_after[3]);
- puts("Bounded PACGA pair: CF chain, 2048 aliases, SP/XZR, FP/LR, two-instruction cap, faults, execute denial, disabled mode and sampled timing PASS");
+ puts("Bounded PACGA pair: CF chain, 2048 aliases, SP/XZR, FP/LR, two-instruction cap, fetch faults, disabled mode and sampled timing PASS");
 }
 int main(int argc,char **argv){
- assert(argc==2);bool use_siphash=!strcmp(argv[1],"siphash");assert(use_siphash||!strcmp(argv[1],"qarma"));
+ assert(argc==2);bool use_siphash=!strcmp(argv[1],"siphash"),use_mask=!strcmp(argv[1],"mask");assert(use_siphash||use_mask||!strcmp(argv[1],"qarma"));
  /* Standard SipHash-2-4 known answer: key and 16-byte input 00..0f. */
  uint8_t kat[16];for(unsigned i=0;i<16;i++)kat[i]=i;SIPHASH_CTX katctx;
  assert(SipHashX(&katctx,2,4,kat,kat,16)==UINT64_C(0x3f2acc7f57c29bdb));
@@ -211,46 +171,45 @@ int main(int argc,char **argv){
  boot_flag=1;siphash_flag=-1;b2l_compat_init();assert(!b2l_compat_siphash);
  siphash_flag=0;b2l_compat_init();assert(!b2l_compat_siphash);
  siphash_flag=2;b2l_compat_init();assert(!b2l_compat_siphash);
- siphash_flag=use_siphash?1:0;b2l_compat_init();
- assert(b2l_arm64e_compat_enabled()&&early_log_bytes&&b2l_compat_siphash==use_siphash);
- assert(!strcmp(b2l_arm64e_pacga_name(),use_siphash?"siphash24":"qarma5"));
+ /* Mask opt-in: exact value only, overrides SipHash, never without the runtime. */
+ boot_flag=0;mask_flag=1;b2l_compat_init();assert(!b2l_compat_mask&&!b2l_arm64e_pacga_mask());
+ boot_flag=1;mask_flag=2;b2l_compat_init();assert(!b2l_compat_mask);
+ mask_flag=0;b2l_compat_init();assert(!b2l_compat_mask);
+ siphash_flag=use_siphash?1:0;mask_flag=use_mask?1:0;b2l_compat_init();
+ assert(b2l_arm64e_compat_enabled()&&early_log_bytes&&b2l_compat_siphash==use_siphash&&b2l_compat_mask==use_mask);
+ assert(!strcmp(b2l_arm64e_pacga_name(),use_mask?"mask":use_siphash?"siphash24":"qarma5"));
+ assert(b2l_arm64e_pacga_mask()==use_mask);
+ tunables_phase=false;
  key_race_test();
 
  task_compat=false;rejected_unchanged(s,0xd65f0bff);task_compat=true;
  s.user64=false;rejected_unchanged(s,0xd65f0bff);s=initial();
  s.cpsr|=4;rejected_unchanged(s,0xd65f0bff);s=initial();
- executable=false;rejected_unchanged(s,0xd65f0bff);executable=true;
- copy_fault=true;rejected_unchanged(s,0xd65f0bff);copy_fault=false;
+ /* The return target is never read: a fetch fault there belongs to EL0. */
+ copy_fault=true;s=initial();assert(b2l_arm64e_compat_emulate(&s,0xd65f0bff)&&s.pc==0x1800);copy_fault=false;s=initial();
  rejected_unchanged(s,0xffffffff);
  s.lr=UINT64_C(0xfffffff007000000);rejected_unchanged(s,0xd65f0bff);
  s=initial();s.lr=0x1802;rejected_unchanged(s,0xd65f0bff);
  s=initial();assert(b2l_arm64e_compat_emulate(&s,0xd65f0bff));assert(s.pc==0x1800&&s.cpsr==0xa0000000&&s.fp==300&&s.sp==0x2000&&s.x[28]==128);
- s=initial();unsigned before_atomic32=atomic32_calls;assert(b2l_arm64e_compat_emulate(&s,0xd65f0fff));assert(s.pc==0x1800&&atomic32_calls==before_atomic32+2);
+ s=initial();unsigned before_atomic32=atomic32_calls;assert(b2l_arm64e_compat_emulate(&s,0xd65f0fff));assert(s.pc==0x1800&&atomic32_calls==before_atomic32);
  /* BLRAA x3,x4 updates LR once without touching FP/SP/flags. */
  s=initial();s.x[3]=0x1800;assert(b2l_arm64e_compat_emulate(&s,0xd73f0864));assert(s.pc==0x1800&&s.lr==0x1004&&s.cpsr==0xa0000000);
- /* Exact physical failure: BLRAA x8,x16 into an executable shared-cache leaf. */
+ /* BLRAA x8,x16 with a signed-looking modifier: raw target, LR, modifier kept. */
  s=initial();s.x[8]=0x1800;s.x[16]=UINT64_C(0x81c7000000002000);
- unsigned before_queries=region_queries;
+ unsigned before_reads=atomic32_calls;
  assert(b2l_arm64e_compat_emulate(&s,0xd73f0910));
- assert(s.pc==0x1800&&s.lr==0x1004&&s.x[16]==UINT64_C(0x81c7000000002000));
- assert(region_queries==before_queries+2);
- s=initial();s.x[8]=0x1800;
- executable=false;rejected_unchanged(s,0xd73f0910);executable=true;
- region_error=1;rejected_unchanged(s,0xd73f0910);region_error=0;
- leaf_is_submap=true;rejected_unchanged(s,0xd73f0910);leaf_is_submap=false;
- lookup_entry_missing=true;rejected_unchanged(s,0xd73f0910);lookup_entry_missing=false;
- iterator_error=5;rejected_unchanged(s,0xd73f0910);iterator_error=0;
- /* Child map has a different virtual base; use only parent-clipped bounds. */
- child_shift=0x400000;s=initial();s.x[8]=0x1800;
- assert(b2l_arm64e_compat_emulate(&s,0xd73f0910)&&s.pc==0x1800);child_shift=0;
- s=initial();s.x[8]=0x1800;
-
- leaf_start=0x1004;rejected_unchanged(s,0xd73f0910);leaf_start=0x1000;
- leaf_size=3;rejected_unchanged(s,0xd73f0910);leaf_size=0x3000;
- s.x[8]=0x3000;leaf_size=0x2000;rejected_unchanged(s,0xd73f0910);leaf_size=0x3000;
- s.x[8]=UINT64_C(0xfffffff007000000);rejected_unchanged(s,0xd73f0910);
+ assert(s.pc==0x1800&&s.lr==0x1004&&s.x[16]==UINT64_C(0x81c7000000002000)&&atomic32_calls==before_reads);
+ /* A target beyond the mocked memory is still committed untouched: the
+  * hardware fetch at that PC decides, exactly as for a native BLR. */
+ s=initial();s.x[8]=0xffff000;assert(b2l_arm64e_compat_emulate(&s,0xd73f0910)&&s.pc==0xffff000&&s.lr==0x1004);
+ s=initial();s.x[8]=0x1802;rejected_unchanged(s,0xd73f0910);
+ s=initial();s.x[8]=0;rejected_unchanged(s,0xd73f0910);
+ s=initial();s.x[8]=MACH_VM_MAX_ADDRESS;rejected_unchanged(s,0xd73f0910);
+ s=initial();s.x[8]=MACH_VM_MAX_ADDRESS-4;assert(b2l_arm64e_compat_emulate(&s,0xd73f0910)&&s.pc==MACH_VM_MAX_ADDRESS-4);
+ s=initial();s.x[8]=UINT64_C(0xfffffff007000000);rejected_unchanged(s,0xd73f0910);
  /* PACGA x0,x1,x2: persistent random software key, exact full result. */
- uint32_t pacga=0x9ac03000|(2u<<16)|(1u<<5);s=initial();assert(b2l_arm64e_compat_emulate(&s,pacga));uint64_t hash=s.x[0];assert(hash==expected_hash(s.x[1],s.x[2]));assert(!(hash&UINT32_MAX)&&entropy_calls==1);s=initial();assert(b2l_arm64e_compat_emulate(&s,pacga)&&s.x[0]==hash&&entropy_calls==1);
+ uint32_t pacga=0x9ac03000|(2u<<16)|(1u<<5);s=initial();assert(b2l_arm64e_compat_emulate(&s,pacga));uint64_t hash=s.x[0];assert(hash==expected_hash(s.x[1],s.x[2]));assert(!(hash&UINT32_MAX)&&entropy_calls==(use_mask?0u:1u));s=initial();assert(b2l_arm64e_compat_emulate(&s,pacga)&&s.x[0]==hash&&entropy_calls==(use_mask?0u:1u));
+ if(use_mask){s=initial();s.x[1]=UINT64_C(0x00000001c0ffee00);assert(b2l_arm64e_compat_emulate(&s,pacga)&&s.x[0]==UINT64_C(0x0000000100000000));}
  uint64_t out=0;uint64_t value=UINT64_C(0x8877665544332211);memcpy(memory+0x2000,&value,8);
  assert(!b2l_compat_read_acquire(0x2000,8,&out,NULL)&&out==value);
  assert(!b2l_compat_read_acquire(0x2000,4,&out,NULL)&&out==0x44332211);
@@ -260,7 +219,14 @@ int main(int argc,char **argv){
  assert(!b2l_user_range(0,4)&&!b2l_user_range(UINT64_MAX-1,8)&&!b2l_user_range(MACH_VM_MAX_ADDRESS,4));
  copy_fault=true;assert(b2l_compat_read_acquire(0x2000,8,&out,NULL));copy_fault=false;
  pair_tests();
- assert(!map_locked&&map_locks==map_unlocks);
- puts("Direct execute lookup: exact4-byte locks, constant-submap descent, parent bounds, holes/errors, unlock-before-copyin and no stale permission reuse PASS");
+ /* Forced adoption: only a keyed boot can switch, exactly once, with a line. */
+ if(!use_mask){
+  assert(!forced_lines);b2l_arm64e_force_pacga_mask();assert(forced_lines==1&&b2l_arm64e_pacga_mask()&&!strcmp(b2l_arm64e_pacga_name(),"mask"));
+  b2l_arm64e_force_pacga_mask();assert(forced_lines==1);
+  s=initial();assert(b2l_arm64e_compat_emulate(&s,pacga)&&s.x[0]==(s.x[1]&UINT64_C(0xffffffff00000000)));
+  b2l_compat_mask=false;
+ }else{b2l_arm64e_force_pacga_mask();assert(!forced_lines);}
+ b2l_compat_requested=false;b2l_compat_mask=false;b2l_arm64e_force_pacga_mask();assert(!b2l_compat_mask);b2l_compat_requested=true;b2l_compat_mask=use_mask;
+ puts("Range-only PC checks: no map lock, no target fetch, user bounds and alignment retained PASS");
  printf("B2L runtime %s: boundary, boot gate, 8-thread first-key race and mutex-free steady state PASS\n",b2l_arm64e_pacga_name());return 0;
 }

@@ -69,10 +69,39 @@ def main():
                 out = ctypes.c_uint32()
                 assert m.b2l_nc_native(original, ctypes.byref(out)) == 1 and out.value == expected
             print(f'Actual LDRA conversion agrees with LLVM on {len(pairs)} assembled instruction pairs', flush=True)
+            # PACGA mask ABI: every register alias assembles to the same AND immediate
+            # (or NOP for a discarded XZR result). Off by default, on by explicit opt-in.
+            pacga_pairs = []
+            for rd in (0, 8, 29, 30, 31):
+                for rn in (0, 8, 21, 30, 31):
+                    for rm in (0, 8, 10, 30, 31):
+                        source_n = 'xzr' if rn == 31 else f'x{rn}'
+                        modifier = 'sp' if rm == 31 else f'x{rm}'
+                        if rd == 31:
+                            pacga_pairs.append((f'pacga xzr,{source_n},{modifier}', 'nop'))
+                        else:
+                            pacga_pairs.append((f'pacga x{rd},{source_n},{modifier}',
+                                                f'and x{rd},{source_n},#0xffffffff00000000'))
+            result = subprocess.run([llvm, '-triple=aarch64', '-mattr=+pauth', '-show-encoding'],
+                                    input='\n'.join(word for pair in pacga_pairs for word in pair),
+                                    capture_output=True, text=True, check=True)
+            words = [int.from_bytes(bytes(int(value.strip(), 16) for value in match.split(',')), 'little')
+                     for match in re.findall(r'encoding: \[([^]]+)\]', result.stdout)]
+            assert len(words) == len(pacga_pairs) * 2
+            gate = ctypes.c_int.in_dll(m, 'b2l_nc_pacga_mask')
+            for original, expected in zip(words[::2], words[1::2]):
+                out = ctypes.c_uint32()
+                gate.value = 0
+                assert m.b2l_nc_native(original, ctypes.byref(out)) == 0
+                gate.value = 1
+                assert m.b2l_nc_native(original, ctypes.byref(out)) == 1 and out.value == expected
+            gate.value = 0
+            print(f'Actual PACGA mask conversion agrees with LLVM on {len(pacga_pairs)} assembled instruction pairs', flush=True)
         else:
             print('LLVM encoding audit skipped locally; required in firmware CI', flush=True)
 
         for name, extra in [('native_cache_ldra_test', [str(arm / 'b2l_compat.c')]),
+                            ('native_cache_pacga_test', [str(arm / 'b2l_compat.c')]),
                             ('native_cache_activity_test', ['-pthread'])]:
             exe = root / name
             subprocess.run(cc + flags + ['-fsanitize=address,undefined', str(repo / 'tests' / (name + '.c'))] +

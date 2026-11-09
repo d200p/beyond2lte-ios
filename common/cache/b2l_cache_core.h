@@ -15,7 +15,10 @@ uint64_t b2l_nc_u64(const uint8_t*);
 void b2l_nc_p32(uint8_t*,uint32_t);
 void b2l_nc_p64(uint8_t*,uint64_t);
 uint32_t b2l_nc_crc(const void*,size_t);
+/* Nonzero enables PACGA -> AND-immediate/NOP conversion (mask result ABI). */
+extern int b2l_nc_pacga_mask;
 int b2l_nc_native(uint32_t,uint32_t*);
+unsigned b2l_nc_record_pacga(const uint8_t*);
 int b2l_nc_header(const uint8_t*,const uint8_t root_id[12]);
 /* V2 separates uint64_t disk capacity from RAM; v1 remains readable. */
 uint64_t b2l_nc_header_bytes(const uint8_t*);

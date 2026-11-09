@@ -171,6 +171,49 @@ owning-subcache and saved-native-cache paths as its three arguments. It verifies
 that every restored byte equals the pristine measured code, while every byte
 outside that range retains its cached native value.
 
+## PACGA mask result ABI (2026-11-09)
+
+Every CoreFoundation object creation and check executes two `PACGA`
+instructions. With keyed emulation (QARMA5 or SipHash), each of them traps, and
+the 0088 sample set showed four CoreFoundation sites producing 87.86% of the
+sampled trap PCs. Those sites could not be converted because a keyed result has
+no single-instruction native equivalent.
+
+`b2l_pacga_mask=1` selects a result ABI with no key: `PACGA Xd, Xn, Xm`
+yields `Xn & 0xffffffff00000000`, the same function on every CPU and in every
+task. It is still a deterministic 64-bit value with a zero low half, so signing
+and checking agree as before. It provides no authentication, which the
+stripped-pointer development ABI never claimed. Under this ABI the converter
+rewrites `PACGA Xd, Xn, Xm` to `AND Xd, Xn, #0xffffffff00000000`
+(`0x92607c00 | Rn << 5 | Rd`) and `PACGA XZR, Xn, Xm` to `NOP`. The `Rd = 31`
+case must never become an AND immediate because that encoding writes SP.
+
+Consistency rules:
+
+- Trapped and rewritten sites must compute the same result for the entire
+  boot. The kernel therefore sets `b2l_nc_pacga_mask` only from the selected
+  ABI, before the first root-file write, and the trap emulator uses the same
+  function.
+- Records that already contain PACGA rewrites prove that the root carries AND
+  sites. If such records exist and the kernel was booted without
+  `b2l_pacga_mask=1`, the cache adopts the mask ABI before `load_init_program`
+  and logs `B2L PACGA: mask result ABI forced by existing native cache records`.
+  Without the gate those records would otherwise be rejected as corruption.
+- An older BOOT image that predates this ABI cannot read those records and
+  would run keyed PACGA against rewritten sites. **Before booting such an
+  image after PACGA rewrites were applied, run a maintenance boot with
+  `b2l_cache_restore=1` on a current kernel**, which restores every original
+  page from the SYSTEM records and the USERDATA undo archive.
+- Host tools default to `b2l_nc_pacga_mask = 0`; validation of a cache that
+  contains PACGA rewrites must set the exported gate to 1.
+
+`tests/native_cache_pacga_test.c` compares every one of the 32,768 register
+aliases against the reference emulator with an independent logical-immediate
+decoder, and `tests/test_cache_fastpaths.py` assembles 125 PACGA/AND/NOP
+pairs with LLVM in CI. The runtime line
+`B2L NCACHE: PACGA result ABI=... records with PACGA rewrites=...` reports the
+decision at each boot.
+
 ## Expanding an existing cache (0049)
 
 Read and retain the entire unmounted SYSTEM partition first, including the log

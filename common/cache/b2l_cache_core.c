@@ -11,8 +11,22 @@ uint64_t b2l_nc_u64(const uint8_t*p){return b2l_nc_u32(p)|(uint64_t)b2l_nc_u32(p
 void b2l_nc_p32(uint8_t*p,uint32_t v){for(unsigned i=0;i<4;i++)p[i]=(uint8_t)(v>>(8*i));}
 void b2l_nc_p64(uint8_t*p,uint64_t v){for(unsigned i=0;i<8;i++)p[i]=(uint8_t)(v>>(8*i));}
 uint32_t b2l_nc_crc(const void*v,size_t n){const uint8_t*p=v;uint32_t c=~0u;while(n--)c=b2l_nc_crc_byte(c,*p++);return ~c;}
+/* Generation gate for the PACGA mask result ABI (Xd = Xn & 0xffffffff00000000).
+ * Zero keeps PACGA on the keyed trap emulator and rejects any record that
+ * already carries a PACGA conversion. The kernel sets it before the first
+ * cache read; host tools leave it at zero unless they opt in explicitly. */
+int b2l_nc_pacga_mask;
 int b2l_nc_native(uint32_t i,uint32_t*out){
  if(!out)return 0;
+ if((i&0xffe0fc00u)==0x9ac03000u){
+  if(!b2l_nc_pacga_mask)return 0;
+  unsigned rn=(i>>5)&31u,rd=i&31u;
+  /* PACGA Rd=31 is XZR: the result is discarded and no flag changes, so the
+   * instruction is a NOP under every result ABI. AND (immediate) Rd=31 would
+   * write SP, so that encoding is never produced. Rn=31 is XZR in both. */
+  if(rd==31u){*out=0xd503201fu;return 1;}
+  *out=0x92607c00u|(rn<<5)|rd;return 1; /* AND Xd,Xn,#0xffffffff00000000 */
+ }
  if((i&0xffffe000u)==0xdac10000u||(i&0xffffe3e0u)==0xdac123e0u||
     (i&0xffffffe0u)==0xdac143e0u||(i&0xffffffe0u)==0xdac147e0u){*out=0xd503201fu;return 1;}
  switch(i){
@@ -101,6 +115,13 @@ int b2l_nc_record(const uint8_t*r){
  /* CRC covers every byte, with the CRC field represented as zero. */
  uint32_t crc=~0u;for(unsigned i=0;i<B2L_NC_COPY;i++)crc=b2l_nc_crc_byte(crc,(i>=128&&i<132)?0:r[i]);
  return ~crc==b2l_nc_u32(r+128)?0:-1;
+}
+/* Count PACGA words translated by a record that b2l_nc_record already accepted. */
+unsigned b2l_nc_record_pacga(const uint8_t*r){
+ unsigned n=0;const uint8_t*a=r+B2L_NC_DATA,*b=a+4096;
+ for(unsigned i=0;i<4096;i+=4){uint32_t x=b2l_nc_u32(a+i);
+  if((x&0xffe0fc00u)==0x9ac03000u&&x!=b2l_nc_u32(b+i))n++;}
+ return n;
 }
 int b2l_nc_select(const uint8_t*c,const uint8_t**out){
  *out=0;int a=b2l_nc_record(c)==0,b=b2l_nc_record(c+B2L_NC_COPY)==0;

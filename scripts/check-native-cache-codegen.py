@@ -20,8 +20,11 @@ for obj in objects:
  if obj.name=="b2l_arm64e_compat.o":
   refs=subprocess.check_output([a.objdump,'-r',str(obj)],text=True)
   if '_vm_map_region_recurse_64' in refs:raise SystemExit("Slow region-info call still present in ARM64e object")
-  for symbol in ['_vm_map_range_sh_lock','_vm_map_range_stream_next_with_error','_vm_map_range_sh_unlock']:
-   if symbol not in refs:raise SystemExit("Missing direct permission lookup boundary: "+symbol)
+  # The background resolver keeps its exact-range lock; the trap wrapper must
+  # not look up permissions per trap any more (range-only PC checks).
+  for symbol in ['_vm_map_range_sh_lock','_vm_map_range_sh_unlock']:
+   if symbol not in refs:raise SystemExit("Missing resolver range-lock boundary: "+symbol)
+  if '_vm_map_range_stream_next_with_error' in refs:raise SystemExit("Per-trap execute lookup still present in ARM64e object")
  for line in text.splitlines():
   if not re.match(r'\s*[a-f0-9]+:\s+[a-f0-9]+\s+',line):continue
   instruction=line.split('\t')[-1].split(';')[0]

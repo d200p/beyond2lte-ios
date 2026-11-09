@@ -43,4 +43,4 @@ static inline void le64enc(void*p,uint64_t v){memcpy(p,&v,8);}
  flags=['-isysroot',sdk,'-O2','-g','-Wall','-Wextra','-Werror','-Wno-unused-parameter','-pthread','-I'+str(d),'-I'+str(s)]
  flags+=['-fsanitize=thread'] if a.tsan else ['-fsanitize=address,undefined','-fno-omit-frame-pointer']
  subprocess.run([cc,*flags,str(r/'tests/test_arm64e_runtime.c'),str(s/'b2l_compat.c'),str(s/'b2l_pacga_qarma5.c'),str(r/'xnu-overlay/bsd/kern/b2l_pacga_siphash.c'),str(d/'siphash.c'),'-o',str(d/'test')],check=True)
- for mode in ['qarma','siphash']:subprocess.run([str(d/'test'),mode],check=True)
+ for mode in ['qarma','siphash','mask']:subprocess.run([str(d/'test'),mode],check=True)

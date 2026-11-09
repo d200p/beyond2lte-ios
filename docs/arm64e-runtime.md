@@ -22,9 +22,14 @@ The undefined-instruction hook reads the trapped instruction through XNU's
 existing fault-aware COPYIN path. The wrapper snapshots x0-x28, FP, LR, SP, PC,
 and CPSR. The decoder produces a separate candidate; state is committed only
 on successful emulation. Unhandled instructions and callback faults retain the
-original exception path and saved state. Next PCs require an aligned, canonical
-nonzero EL0 address, VM execute permission, and successful instruction copyin.
-No pointer address bits are guessed, masked, or canonicalized.
+original exception path and saved state. Next PCs require an aligned, nonzero
+EL0-range address. Executability is not looked up and the target is not read:
+the committed PC is fetched by the CPU after ERET, and an unmapped or
+non-executable target takes the ordinary EL0 instruction-fetch fault exactly as
+after a native `BLR`/`RET`. Until 2026-11-09 the wrapper also took the VM map
+lock twice per trap (current and next PC); sampled telemetry on the S10+ put
+that at about 6 of the 9 microseconds of every successful trap. No pointer
+address bits are guessed, masked, or canonicalized.
 
 The native scalar assembly decoder computes PAC/AUT/XPAC and authenticated
 branch/return candidates. C performs bounded memory callbacks and validates all
@@ -46,8 +51,12 @@ The kernel supplies dyld's `ptrauth_disabled=1` apple string for opted-in ARM64e
 images. This handoff does not alone establish compatibility with every dyld or
 per-image chained-fixup implementation.
 
-PACGA is a software QARMA5 hash computed by the scalar AArch64 helper, not an
-identity or constant result. A 128-bit key is generated lazily from XNU's
+PACGA has three boot-selected result ABIs. `b2l_pacga_mask=1` returns
+`Xn & 0xffffffff00000000` without any key; it is the only ABI the native cache
+can rewrite into one instruction, and the cache forces it when the root already
+carries such rewrites (see [native cache](native-cache.md)). `b2l_pacga_siphash=1`
+selects SipHash-2-4. Otherwise PACGA is a software QARMA5 hash computed by the
+scalar AArch64 helper, not an identity or constant result. A 128-bit key is generated lazily from XNU's
 boot-seeded PRNG under an initialized mutex on the first EL0 PACGA operation.
 The key is shared across processes for the lifetime of one boot; it is neither
 persisted nor logged. Per-process PAC key changes are not emulated. Portable C

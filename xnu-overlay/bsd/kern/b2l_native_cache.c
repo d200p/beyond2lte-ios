@@ -317,6 +317,10 @@ static void worker(void*arg,wait_result_t why __unused){
 }
 void b2l_native_cache_before_init(void){
  if(!enabled()||!storage_ready){printf("B2L NCACHE: unavailable; emulation retained\n");return;}
+ /* Index with the widest accepted conversion set so durable PACGA rewrites
+  * are recognized rather than treated as corruption. Generation follows the
+  * selected result ABI, decided below before any root-file write. */
+ b2l_nc_pacga_mask=1;uint64_t pacga_records=0;
  DTEntry dt;const void*prop;unsigned n;uint64_t range[2];
  if(SecureDTLookupEntry(NULL,"/chosen",&dt)!=kSuccess||SecureDTGetProperty(dt,"b2l,native-cache",&prop,&n)!=kSuccess||n!=16)return;
  memcpy(range,prop,16);boot_args*args=(boot_args*)PE_state.bootArgs;
@@ -342,7 +346,15 @@ void b2l_native_cache_before_init(void){
    printf("B2L NCACHE: invalid/duplicate disk record; emulation retained\n");
    kfree_data(store.keys,key_bytes);kfree_data(store.buckets,bucket_bytes);return;
   }
+  if(r&&b2l_nc_record_pacga(r))pacga_records++;
  }
+ /* Rewritten root PACGA sites and trapped ones must compute the same result
+  * for the entire boot. Records prove the root already carries AND rewrites,
+  * so a kernel booted without the mask argument adopts it now, before EL0. */
+ if(pacga_records&&!b2l_arm64e_pacga_mask())b2l_arm64e_force_pacga_mask();
+ b2l_nc_pacga_mask=b2l_arm64e_pacga_mask()?1:0;
+ printf("B2L NCACHE: PACGA result ABI=%s; records with PACGA rewrites=%llu; PACGA conversion %s\n",
+  b2l_arm64e_pacga_name(),pacga_records,b2l_nc_pacga_mask?"enabled":"disabled");
  printf("B2L NCACHE: disk=%llu MiB slots=%u used=%u hot=%u KiB index=%llu KiB; disk-backed records\n",
   cache_io.bytes/(1024*1024),store.slots,store.used,(unsigned)(sizeof(hot_cells)/1024),(uint64_t)(key_bytes+bucket_bytes)/1024);
  /* Resolve the measured module before applying any native bytes. Failure is

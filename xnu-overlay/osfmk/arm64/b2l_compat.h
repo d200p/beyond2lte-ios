@@ -28,7 +28,9 @@ struct b2l_compat_ctx {
  * bounded EL0 access, support faults, and never access device/kernel mappings.
  * read_acquire must provide at least an architectural full acquire load, even
  * when destination is WZR/XZR. read is an ordinary data read.
- * validate_pc must reject unaligned/out-of-user-bounds/non-executable targets.
+ * validate_pc must reject unaligned/out-of-user-bounds targets. It need not
+ * prove executability: the committed PC is fetched by hardware afterwards and
+ * faults there exactly as a native branch would.
  * pacga returns a full64-bit architectural PACGA result (upper32 bits signature,
  * lower32 zero); it is required even for discarded XZR results.
  * Callbacks must not mutate ctx; callback-owned statistics may change on fault.

@@ -98,6 +98,16 @@ mismatch; the0101 fix is compiled and tested but **not installed**. Native
 migration still needs [HFS staging compatibility](docs/hfs-apfs-installation.md),
 and the failed one-attempt receipt is preserved.
 
+**2026-11-09 responsiveness work (S10+, Home reached, touch works but slow):**
+the trap wrapper no longer takes VM map locks for the current and next PC
+(sampled cost was about 6 of 9 microseconds per trap), and the loader selects
+the PACGA mask result ABI (`b2l_pacga_mask=1`) so the native cache can rewrite
+CoreFoundation's PACGA sites to `AND` instead of trapping on every object
+creation and check. The `B2L LIVE` line now also reports a measured core clock
+for the reporting CPU. See [native cache](docs/native-cache.md) and
+[ARM64e runtime](docs/arm64e-runtime.md). The physical result of this change
+is pending device verification.
+
 | Component | Device status | How it works / current limits |
 | --- | --- | --- |
 | Boot chain and XNU startup | Verified | S-Boot loads the packaged UEFI firmware. The embedded EFI loader reads XNU from the BOOT trailer, builds Apple `boot_args`/device tree and hands control to XNU. |
