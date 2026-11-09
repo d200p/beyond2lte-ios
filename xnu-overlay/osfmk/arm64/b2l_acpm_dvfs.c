@@ -17,7 +17,8 @@
  * (measured with the dependent-add clock estimate of the LIVE reporter).
  *
  * Boot args:
- *   b2l_dvfs=1      read only: framework, FVMAP tables, temperatures, measured core clocks
+ *   b2l_dvfs=0      disabled (loader default during panic diagnosis)
+ *   b2l_dvfs=1      SRAM tables and measured core clocks only; no mailbox access
  *   b2l_dvfs=2      ... and set the clusters to their FVMAP tops (or the caps below)
  *   b2l_dvfs_cl0/cl1/cl2=kHz   cap for a cluster (0: FVMAP top); a value not in the table is
  *                   rounded down to the nearest table rate
@@ -40,16 +41,15 @@
 #include <kern/misc_protos.h>
 #include <pexpert/pexpert.h>
 #include <string.h>
+#include <arm64/b2l_acpm_layout.h>
 
 extern unsigned int real_ncpus;
 extern kern_return_t processor_info(processor_t, processor_flavor_t, host_t *, processor_info_t, mach_msg_type_number_t *);
 
 #define ACPM_INTR_PHYS   0x15900000UL
 #define ACPM_SRAM_PHYS   0x02039000UL
-#define ACPM_SRAM_SIZE   0x30000u
-#define ACPM_INITDATA    0x7000u
-#define ACPM_FVMAP       0xa400u
-#define FVMAP_SIZE       0x2000u
+#define ACPM_SRAM_SIZE   B2L_ACPM_SRAM_BYTES
+#define ACPM_INITDATA    B2L_ACPM_INITDATA
 
 #define INTGR0           0x08  /* AP -> APM: bit 16 + channel id */
 #define INTCR1           0x20  /* APM -> AP: clear */
@@ -67,7 +67,7 @@ extern kern_return_t processor_info(processor_t, processor_flavor_t, host_t *, p
 
 enum { D_CL0 = 2, D_CL1 = 3, D_CL2 = 4 };
 #define NCLUSTERS 3
-#define MAX_RATES 24
+#define MAX_RATES B2L_ACPM_MAX_RATES
 #define GOV_RUNGS 6
 
 struct cluster {
@@ -81,9 +81,9 @@ struct cluster {
     uint64_t mhz_before, mhz_after;
 };
 static struct cluster clusters[NCLUSTERS] = {
-    { D_CL0, 0, 4, 2, "cl0 (A55)", "b2l_dvfs_cl0" },
-    { D_CL1, 4, 2, 1, "cl1 (A75)", "b2l_dvfs_cl1" },
-    { D_CL2, 6, 2, 0, "cl2 (M4)",  "b2l_dvfs_cl2" },
+    { .domain = D_CL0, .first_cpu = 0, .ncpus = 4, .zone = 2, .name = "cl0 (A55)", .arg = "b2l_dvfs_cl0" },
+    { .domain = D_CL1, .first_cpu = 4, .ncpus = 2, .zone = 1, .name = "cl1 (A75)", .arg = "b2l_dvfs_cl1" },
+    { .domain = D_CL2, .first_cpu = 6, .ncpus = 2, .zone = 0, .name = "cl2 (M4)", .arg = "b2l_dvfs_cl2" },
 };
 static const char *const zones[] = { "big", "mid", "little", "g3d" };
 
@@ -118,7 +118,8 @@ find_channel(uint32_t want, struct channel *c)
 {
     uint32_t channels = rd(sram + ACPM_INITDATA + 8);
     uint32_t count = rd(sram + ACPM_INITDATA + 24);   /* ipc_ap_max */
-    if (channels == 0 || channels >= ACPM_SRAM_SIZE - 32 * 72 || count == 0 || count > 32 || want >= count) {
+    if (channels == 0 || (channels & 3) || count == 0 || count > 32 || want >= count ||
+        !b2l_acpm_range(channels, count * 72)) {
         dlog("framework at SRAM+%#x names %u AP channels at %#x: not usable\n", ACPM_INITDATA, count, channels);
         return -1;
     }
@@ -126,9 +127,11 @@ find_channel(uint32_t want, struct channel *c)
     uint32_t rx_rear = rd(d + 16), rx_front = rd(d + 20), rx_base = rd(d + 24);
     uint32_t tx_rear = rd(d + 40), tx_front = rd(d + 44), tx_base = rd(d + 48);
     c->id = rd(d); c->type = rd(d + 12); c->len = rd(d + 52); c->elem = rd(d + 56); c->polling = rd(d + 68);
-    if (c->len == 0 || c->len > 64 || c->elem < 16 || c->elem > 64 ||
-        rx_base >= ACPM_SRAM_SIZE || tx_base >= ACPM_SRAM_SIZE || rx_front >= ACPM_SRAM_SIZE ||
-        tx_front >= ACPM_SRAM_SIZE || rx_rear >= ACPM_SRAM_SIZE || tx_rear >= ACPM_SRAM_SIZE ||
+    if (c->id >= 16 || (c->type != 1 && c->type != TYPE_BUFFER) ||
+        c->len == 0 || c->len > 64 || c->elem < 16 || c->elem > 64 || (c->elem & 3) ||
+        ((rx_base | tx_base | rx_front | tx_front | rx_rear | tx_rear) & 3) ||
+        !b2l_acpm_range(rx_front, 4) || !b2l_acpm_range(tx_front, 4) ||
+        !b2l_acpm_range(rx_rear, 4) || !b2l_acpm_range(tx_rear, 4) ||
         rx_base + (uint64_t)c->len * c->elem > ACPM_SRAM_SIZE || tx_base + (uint64_t)c->len * c->elem > ACPM_SRAM_SIZE) {
         dlog("channel %u: queue %u x %u, rx %#x/%#x/%#x tx %#x/%#x/%#x: out of range\n", want, c->len, c->elem,
             rx_rear, rx_front, rx_base, tx_rear, tx_front, tx_base);
@@ -137,6 +140,11 @@ find_channel(uint32_t want, struct channel *c)
     c->tx_rear = sram + rx_rear; c->tx_front = sram + rx_front; c->tx_base = sram + rx_base;
     c->rx_rear = sram + tx_rear; c->rx_front = sram + tx_front; c->rx_base = sram + tx_base;
     c->seq = 0;
+    if (rd(c->tx_front) >= c->len || rd(c->tx_rear) >= c->len ||
+        rd(c->rx_front) >= c->len || rd(c->rx_rear) >= c->len) {
+        dlog("channel %u: queue indices outside %u entries\n", want, c->len);
+        return -1;
+    }
     dlog("channel %u (id %u): %s, %u x %u bytes, %s; to ACPM front %u rear %u, from ACPM front %u rear %u\n",
         want, c->id, c->type == TYPE_BUFFER ? "buffer" : "queue", c->len, c->elem,
         c->polling ? "polled" : "interrupt-driven", rd(c->tx_front), rd(c->tx_rear), rd(c->rx_front), rd(c->rx_rear));
@@ -147,11 +155,13 @@ find_channel(uint32_t want, struct channel *c)
 static int
 ipc(struct channel *c, uint32_t cmd[4])
 {
-    uint32_t front = rd(c->tx_front), next = front + 1 == c->len ? 0 : front + 1, seq, i;
+    uint32_t front = rd(c->tx_front), rear = rd(c->tx_rear), seq, i;
+    if (front >= c->len || rear >= c->len) return -1;
+    uint32_t next = front + 1 == c->len ? 0 : front + 1;
     uint64_t deadline;
     if (c->type == TYPE_BUFFER) {
         front = 0; next = 0;
-    } else if (next == rd(c->tx_rear)) {
+    } else if (next == rear) {
         dlog("channel %u: queue to ACPM full (front %u rear %u)\n", c->id, front, rd(c->tx_rear));
         return -1;
     }
@@ -171,6 +181,7 @@ ipc(struct channel *c, uint32_t cmd[4])
                 return 0;
             }
             uint32_t rear = rd(c->rx_rear), last = rd(c->rx_front);
+            if (rear >= c->len || last >= c->len) return -1;
             for (i = rear; i != last; i = i + 1 == c->len ? 0 : i + 1) {
                 volatile uint8_t *e = c->rx_base + c->elem * i;
                 if (((rd(e) & SEQ_MASK) >> SEQ_SHIFT) != seq) continue;
@@ -244,68 +255,43 @@ mhz_on_cpu(unsigned cpu)
     return actual == cpu && ns && x == 65536ull * 16 ? (65536ull * 16 * 1000) / ns : 0;
 }
 
-/* FVMAP (fvmap.h): 24-byte headers { dvfs_type, num_of_lv, num_of_members, num_of_pll, num_of_mux,
- * num_of_div, u16 gearratio, init_lv, num_of_gate, reserved[2], u16 block_addr[3], u16 o_members,
- * u16 o_ratevolt, u16 o_tables }; rate/volt pairs { u32 rate_kHz, u32 volt_uV } at o_ratevolt. */
-/* The FVMAP sits at fvmap_offset (0xa400) from the DVFS plugin's base in SRAM
- * (acpm.c: fvmap_init(fw_base_addr + offset)), not from the SRAM start; the
- * first boot read nothing at SRAM+0xa400. Scan the SRAM for the header array
- * instead of trusting the plugin descriptor layout: headers 0..4 must carry
- * dvfs_type 0..4 (MIF, INT, CL0, CL1, CL2), 1..24 levels and a descending
- * kHz table inside the 8 KiB map. */
-static volatile uint8_t *
-find_fvmap(void)
+/* The parser validates alignment and bounds before each SRAM word read. */
+static int
+sram_word(void *context, uint32_t offset, uint32_t *word)
 {
-    for (uint32_t base = 0; base + FVMAP_SIZE <= ACPM_SRAM_SIZE; base += 4) {
-        volatile uint8_t *map = sram + base;
-        unsigned ok = 0;
-        for (unsigned i = 0; i < 5; i++) {
-            volatile uint8_t *h = map + i * 24;
-            unsigned type = h[0], levels = h[1];
-            uint32_t o_ratevolt = (uint32_t)h[18] | ((uint32_t)h[19] << 8);
-            if (type != i || levels == 0 || levels > MAX_RATES || o_ratevolt < 5 * 24 || o_ratevolt + (uint32_t)levels * 8 > FVMAP_SIZE) break;
-            uint32_t last = 0xffffffffu; unsigned sane = 1;
-            for (unsigned l = 0; l < levels; l++) {
-                uint32_t rate = rd(map + o_ratevolt + l * 8);
-                if (rate == 0 || rate > 4000000 || rate >= last || (rate % 1000)) { sane = 0; break; }
-                last = rate;
-            }
-            if (!sane) break;
-            ok++;
-        }
-        if (ok == 5) { dlog("fvmap found at SRAM+%#x\n", base); return map; }
-    }
-    dlog("no fvmap header array found in SRAM (also not at +%#x)\n", ACPM_FVMAP);
-    return NULL;
+    (void)context;
+    *word = rd(sram + offset);
+    return 0;
 }
 
-static void
+static int
 read_fvmap(void)
 {
-    volatile uint8_t *map = find_fvmap();
-    if (!map) return;
-    for (unsigned i = 0; i < 16; i++) {
-        volatile uint8_t *h = map + i * 24;
-        unsigned type = h[0], levels = h[1], members = h[2];
-        uint32_t o_ratevolt = (uint32_t)h[18] | ((uint32_t)h[19] << 8);
-        if (levels == 0 || levels > MAX_RATES || o_ratevolt + (uint32_t)levels * 8 > FVMAP_SIZE) continue;
-        struct cluster *k = NULL;
-        for (unsigned c = 0; c < NCLUSTERS; c++) if (clusters[c].domain == type) k = &clusters[c];
-        char line[200]; size_t at = 0;
-        at += (size_t)snprintf(line + at, sizeof(line) - at, "fvmap[%u] type %u levels %u members %u init_lv %u:", i, type, levels, members, (unsigned)h[8]);
-        uint32_t last = 0xffffffffu; int sane = 1;
-        for (unsigned l = 0; l < levels; l++) {
-            uint32_t rate = rd(map + o_ratevolt + l * 8);
-            if (at < sizeof(line) - 12) at += (size_t)snprintf(line + at, sizeof(line) - at, " %u", rate / 1000);
-            if (rate == 0 || rate > 4000000 || rate >= last) sane = 0;   /* FVMAP lists descending rates */
-            last = rate;
-        }
-        dlog("%s MHz%s\n", line, sane ? "" : " (NOT a descending kHz table; ignored)");
-        if (k && sane) {
-            k->nrates = levels;
-            for (unsigned l = 0; l < levels; l++) k->rates[l] = rd(map + o_ratevolt + (levels - 1 - l) * 8);  /* ascending */
-        }
+    const struct b2l_acpm_reader reader = { NULL, sram_word };
+    struct b2l_acpm_cpu_rates tables;
+    uint32_t base;
+    dlog("reading attached DVFS plugin descriptors (no SRAM scan)\n");
+    if (b2l_acpm_find_fvmap(&reader, &base)) {
+        dlog("no unique, bounded DVFS plugin: FVMAP unavailable\n");
+        return -1;
     }
+    dlog("DVFS plugin names FVMAP at SRAM+%#x; validating CPU tables\n", base);
+    if (b2l_acpm_read_cpu_rates(&reader, base, &tables)) {
+        dlog("CPU FVMAP headers or rates invalid: no tables accepted\n");
+        return -1;
+    }
+    for (unsigned c = 0; c < NCLUSTERS; c++) {
+        struct cluster *k = &clusters[c];
+        k->nrates = tables.count[c];
+        char line[200]; size_t at = 0;
+        for (unsigned l = 0; l < k->nrates; l++) {
+            k->rates[l] = tables.khz[c][l];
+            if (at < sizeof(line) - 12)
+                at += (size_t)snprintf(line + at, sizeof(line) - at, " %u", k->rates[l] / 1000);
+        }
+        dlog("%s: %u validated rates, MHz%s\n", k->name, k->nrates, line);
+    }
+    return 0;
 }
 
 static uint32_t
@@ -392,23 +378,26 @@ dvfs_thread(void *arg __unused, wait_result_t wr_unused __unused)
     for (unsigned waited = 0; !all_cores_up() && waited < 120; waited++) delay_for_interval(1, NSEC_PER_SEC);
     if (!all_cores_up()) { dlog("only %u of %u cores up: clocks left alone\n", processor_avail_count, real_ncpus); mode = 1; }
 
-    intr = (volatile uint8_t *)ml_io_map(ACPM_INTR_PHYS, 0x1000);
+    dlog("mode %u: mapping SRAM for descriptor-based FVMAP reads\n", mode);
     sram = (volatile uint8_t *)ml_io_map(ACPM_SRAM_PHYS, ACPM_SRAM_SIZE);
-    if (!intr || !sram) { dlog("mailbox or SRAM not mappable\n"); return; }
+    if (!sram) { dlog("SRAM not mappable\n"); return; }
     dlog("mode %u: framework at SRAM+%#x: %u plugins, %u channels (%u for the AP)\n", mode, ACPM_INITDATA,
         rd(sram + ACPM_INITDATA + 4), rd(sram + ACPM_INITDATA + 12), rd(sram + ACPM_INITDATA + 24));
-    if (find_channel(CH_DVFS, &ch_dvfs)) return;
-    if (find_channel(CH_TMU, &ch_tmu)) ch_tmu.len = 0;
-    wr(intr + INTMR1, rd(intr + INTMR1) | (1u << CH_DVFS) | (ch_tmu.len ? 1u << CH_TMU : 0));
-    if (ch_tmu.len) { uint32_t cmd[4] = { 0, TMU_IPC_INIT, 0, 0 }; if (ipc(&ch_tmu, cmd)) ch_tmu.len = 0; }
-    read_fvmap();
-    int temp[4]; int worst = read_all_temps(temp);
-    dlog("temperatures as S-Boot left them: big %d mid %d little %d g3d %d\n", temp[0], temp[1], temp[2], temp[3]);
+    int tables_valid = read_fvmap() == 0;
     for (unsigned c = 0; c < NCLUSTERS; c++) {
         clusters[c].mhz_before = mhz_on_cpu(clusters[c].first_cpu);
         dlog("%s: measured %llu MHz before any request\n", clusters[c].name, clusters[c].mhz_before);
     }
-    if (mode < 2) return;
+    if (mode < 2) { dlog("SRAM-only diagnosis complete; mailbox untouched\n"); return; }
+    if (!tables_valid) { dlog("no validated CPU tables: mailbox untouched\n"); return; }
+    intr = (volatile uint8_t *)ml_io_map(ACPM_INTR_PHYS, 0x1000);
+    if (!intr) { dlog("mailbox not mappable\n"); return; }
+    if (find_channel(CH_DVFS, &ch_dvfs)) return;
+    if (find_channel(CH_TMU, &ch_tmu)) ch_tmu.len = 0;
+    wr(intr + INTMR1, rd(intr + INTMR1) | (1u << CH_DVFS) | (ch_tmu.len ? 1u << CH_TMU : 0));
+    if (ch_tmu.len) { uint32_t cmd[4] = { 0, TMU_IPC_INIT, 0, 0 }; if (ipc(&ch_tmu, cmd)) ch_tmu.len = 0; }
+    int temp[4]; int worst = read_all_temps(temp);
+    dlog("temperatures as S-Boot left them: big %d mid %d little %d g3d %d\n", temp[0], temp[1], temp[2], temp[3]);
     if (ch_tmu.len == 0 || worst < 0) { dlog("no temperatures from ACPM: clocks are not raised without thermal readings\n"); mode = 1; return; }
     for (unsigned c = 0; c < NCLUSTERS; c++) {
         if (clusters[c].nrates == 0) { dlog("%s: no FVMAP table: clocks are not raised\n", clusters[c].name); mode = 1; return; }

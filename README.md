@@ -114,13 +114,15 @@ aborted twice in QuartzCore's software renderer during glass/blur transitions
 reduce-transparency accessibility defaults (`b2l_ax_seed=1`, managed layer plus
 missing user domain file) before launchd, and the pre-userspace apply syncs the
 root once instead of per page (76 s saved per boot at current record counts).
-`b2l_dvfs=2` then raises the CPU clusters through Samsung's ACPM firmware
-(mailbox 0x15900000, SRAM 0x02039000, DVFS channel 5, TMU channel 9, domains
-2/3/4 from this phone's device tree; FVMAP tables read from SRAM), with a load
-governor, a touch floor and thermal steps at 85/95 C, adapted from the y2sios
-Exynos 990 driver (MIT). Every request is proven by a dependent-add clock
-measurement on the cluster and by ACPM still answering temperature reads. The
-`B2L FRAMES` line reports compositor swaps and the longest gap between swaps.
+The loader now selects `b2l_dvfs=0` after a kernel panic on the experimental
+FVMAP SRAM-scanning build; rollback to the preceding BOOT reached Home.
+The revised decoder follows the attached DVFS plugin, uses the correct
+rate-table offset, and accepts only aligned, bounded CPU tables. A separate
+`b2l_dvfs=1` mode reads SRAM and measures clocks without mailbox access.
+Clock control remains experimental and is disabled in this diagnostic BOOT.
+See [ACPM diagnosis](docs/acpm-diagnostics.md) for the firmware ABI, tests and
+runtime limitations. The `B2L FRAMES` line reports compositor swaps and the
+longest gap between swaps.
 
 | Component | Device status | How it works / current limits |
 | --- | --- | --- |

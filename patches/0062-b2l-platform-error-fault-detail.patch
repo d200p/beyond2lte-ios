@@ -1,0 +1,41 @@
+Subject: [PATCH] Preserve B2L platform-error registers before native panic
+
+Capture typed fault fields even when the debugger has not initialized. Mark
+asynchronous errors explicitly because their saved PC may follow the access.
+The native fatal handling and non-B2L behavior remain unchanged.
+
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -552,9 +552,20 @@
+ 
+ __dead2 __unused
+ static void
+-arm64_implementation_specific_error(arm_saved_state_t *state, uint64_t esr, vm_offset_t far)
+-{
+-#pragma unused (state, esr, far)
++arm64_implementation_specific_error(arm_saved_state_t *state, uint64_t esr, vm_offset_t far,
++    platform_error_source_t source)
++{
++#if defined(B2L)
++    extern void b2l_early_fault(const char *, uint64_t, uint64_t, uint64_t, uint64_t);
++    const char *message = source == PLAT_ERR_SRC_ASYNC ?
++        "B2L asynchronous platform error (PC may be imprecise)" :
++        "B2L synchronous platform error";
++    boolean_t valid = state != NULL && is_saved_state64(state);
++    b2l_early_fault(message, valid ? get_saved_state_pc(state) : 0,
++        valid ? get_saved_state_lr(state) : 0, esr, far);
++#else
++#pragma unused (state, esr, far, source)
++#endif
+ 	panic_plain("Unhandled implementation specific error\n");
+ }
+ 
+@@ -616,7 +627,7 @@
+ 	} else if (cdp->platform_error_handler != NULL) {
+ 		cdp->platform_error_handler(cdp->cpu_id, far);
+ 	} else {
+-		arm64_implementation_specific_error(state, esr, far);
++		arm64_implementation_specific_error(state, esr, far, source);
+ 	}
+ }
+ 

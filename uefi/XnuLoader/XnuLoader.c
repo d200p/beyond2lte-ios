@@ -383,7 +383,7 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 "cs_enforcement_disable=1 launchd_unsecure_cache=1 "
                 "b2l_system_log=1 b2l_native_cache=1 "
                 "b2l_rtc_wait=0 b2l_boot_timing=1 b2l_console_quiet=1 "
-                "b2l_cache_interactive=1 b2l_ax_seed=1 b2l_dvfs=2 "
+                "b2l_cache_interactive=1 b2l_ax_seed=1 b2l_dvfs=0 "
 #else
                 "rd=b2l-diagnostic b2l_root_rw=0 b2l_system_log=0 b2l_native_cache=0 "
 #endif

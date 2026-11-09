@@ -79,6 +79,8 @@ jobs:
           python3 tests/test_ufs_disk.py xnu --overlay
           python3 tests/test_boot_policy.py xnu
           python3 tests/test_early_console.py xnu
+          python3 tests/test_platform_error.py xnu
+          python3 tests/test_acpm_diagnostics.py
           python3 tests/test-input-poll.py
           bash scripts/test-native-cache.sh
           python3 tests/test-native-cache-workers.py
