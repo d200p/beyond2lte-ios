@@ -37,7 +37,9 @@ pre = r'''
 #include <string.h>
 #include <stdarg.h>
 #include "b2l_acpm_layout.h"
+#ifndef __unused
 #define __unused __attribute__((unused))
+#endif
 #define NSEC_PER_MSEC 1000000ull
 #define NSEC_PER_SEC 1000000000ull
 #define KERN_SUCCESS 0
