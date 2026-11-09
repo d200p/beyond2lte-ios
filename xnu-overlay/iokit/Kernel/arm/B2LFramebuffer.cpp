@@ -213,13 +213,26 @@ static uint32_t b2l_fb_swaps_logged;
 /* Presentation telemetry for the LIVE reporter: swaps, the longest gap between
  * two swaps since the last snapshot and how many gaps exceeded two seconds. */
 static uint64_t b2l_fb_swap_count, b2l_fb_swap_last_abs, b2l_fb_swap_max_gap_abs, b2l_fb_swap_long_gaps;
+static uint64_t b2l_fb_copy_count, b2l_fb_copy_total_abs, b2l_fb_copy_max_abs;
 extern "C" void
-b2l_fb_swap_snapshot(uint64_t out[4])
+b2l_fb_swap_snapshot(uint64_t out[7])
 {
 	out[0] = __atomic_load_n(&b2l_fb_swap_count, __ATOMIC_RELAXED);
 	out[1] = __atomic_exchange_n(&b2l_fb_swap_max_gap_abs, 0, __ATOMIC_RELAXED);
 	out[2] = __atomic_load_n(&b2l_fb_swap_long_gaps, __ATOMIC_RELAXED);
 	out[3] = __atomic_load_n(&b2l_fb_swap_last_abs, __ATOMIC_RELAXED);
+	out[4] = __atomic_load_n(&b2l_fb_copy_count, __ATOMIC_RELAXED);
+	out[5] = __atomic_load_n(&b2l_fb_copy_total_abs, __ATOMIC_RELAXED);
+	out[6] = __atomic_exchange_n(&b2l_fb_copy_max_abs, 0, __ATOMIC_RELAXED);
+}
+static void
+b2l_fb_copy_note(uint64_t elapsed)
+{
+    __atomic_fetch_add(&b2l_fb_copy_count, 1, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&b2l_fb_copy_total_abs, elapsed, __ATOMIC_RELAXED);
+    uint64_t maximum = __atomic_load_n(&b2l_fb_copy_max_abs, __ATOMIC_RELAXED);
+    while (elapsed > maximum && !__atomic_compare_exchange_n(&b2l_fb_copy_max_abs,
+        &maximum, elapsed, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
 }
 static void
 b2l_fb_swap_note(void)
@@ -278,6 +291,7 @@ AppleCLCD::swap(const uint8_t *rec)
         if(src && s->memory && s->bytesPerElement==4 && s->elementWidth==1 && s->elementHeight==1 &&
             s->pixelFormat==B2L_FB_FORMAT_BGRA) {
             if(w<=0||h<=0){w=(int32_t)s->width;h=(int32_t)s->height;}
+            uint64_t copy_began = mach_absolute_time();
             IOLockLock(fLock);
             int shown=b2l_blit((void*)fPixels,(uint64_t)fRowBytes*fHeight,fWidth,fHeight,fRowBytes,
                 (const void*)src,s->memory->getLength(),s->width,s->height,s->bytesPerRow,s->offset,
@@ -285,6 +299,7 @@ AppleCLCD::swap(const uint8_t *rec)
             if(shown&&!fConsolePaused){b2l_early_gui_present();fConsolePaused=true;IOLog("B2L FB: first IOSurface frame copied to physical scanout\n");}
             __asm__ volatile("dsb sy":::"memory");
             IOLockUnlock(fLock);
+            if (shown) b2l_fb_copy_note(mach_absolute_time() - copy_began);
         }
 
 		s->release();

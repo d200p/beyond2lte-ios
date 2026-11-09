@@ -18,9 +18,9 @@
  *
  * Boot args:
  *   b2l_dvfs=0      disabled; confirmed reaching Home during panic diagnosis
- *   b2l_dvfs=1      SRAM tables and measured core clocks only; no mailbox access (loader default)
- *   b2l_dvfs=2      ... and set the clusters to their FVMAP tops (or the caps below)
- *   b2l_dvfs_cl0/cl1/cl2=kHz   cap for a cluster (0: FVMAP top); a value not in the table is
+ *   b2l_dvfs=1      SRAM tables and measured core clocks only; no mailbox access
+ *   b2l_dvfs=2      bounded CPU requests through ACPM, checked by measurement
+ *   b2l_dvfs_cl0/cl1/cl2=kHz   lower cap for a cluster (0: board ceiling); a value not in the table is
  *                   rounded down to the nearest table rate
  *   b2l_dvfs_gov=0  pin the clocks instead of governing them by load (default 1: governed)
  *   b2l_dvfs_wait=S seconds after this thread starts before ACPM is touched (default 10)
@@ -74,16 +74,16 @@ struct cluster {
     unsigned domain, first_cpu, ncpus, zone;
     const char *name, *arg;
     uint32_t rates[MAX_RATES]; unsigned nrates;   /* FVMAP, ascending kHz */
-    uint32_t cap, target, mid, safe;              /* kHz */
+    uint32_t ceiling, baseline, cap, target, mid, safe; /* kHz */
     uint32_t rung[GOV_RUNGS]; unsigned nrungs;
     unsigned level;                               /* thermal step 0..2 */
-    unsigned gov_rung, gov_low; uint32_t sent;
+    unsigned gov_rung, gov_low, attempted; uint32_t sent;
     uint64_t mhz_before, mhz_after;
 };
 static struct cluster clusters[NCLUSTERS] = {
-    { .domain = D_CL0, .first_cpu = 0, .ncpus = 4, .zone = 2, .name = "cl0 (A55)", .arg = "b2l_dvfs_cl0" },
-    { .domain = D_CL1, .first_cpu = 4, .ncpus = 2, .zone = 1, .name = "cl1 (A75)", .arg = "b2l_dvfs_cl1" },
-    { .domain = D_CL2, .first_cpu = 6, .ncpus = 2, .zone = 0, .name = "cl2 (M4)", .arg = "b2l_dvfs_cl2" },
+    { .domain = D_CL0, .first_cpu = 0, .ncpus = 4, .zone = 2, .name = "cl0 (A55)", .arg = "b2l_dvfs_cl0", .ceiling = 1950000 },
+    { .domain = D_CL1, .first_cpu = 4, .ncpus = 2, .zone = 1, .name = "cl1 (A75)", .arg = "b2l_dvfs_cl1", .ceiling = 2002000 },
+    { .domain = D_CL2, .first_cpu = 6, .ncpus = 2, .zone = 0, .name = "cl2 (M4)", .arg = "b2l_dvfs_cl2", .ceiling = 2080000 },
 };
 static const char *const zones[] = { "big", "mid", "little", "g3d" };
 
@@ -205,9 +205,24 @@ static int
 set_rate(struct cluster *k, uint32_t khz)
 {
     uint32_t cmd[4] = { k->domain, khz, FREQ_REQ, 0 };
+    k->attempted = 1;
     int ret = ipc(&ch_dvfs, cmd);
     if (ret < 0) dlog("%s: %u kHz NOT sent\n", k->name, khz);
+    else __atomic_store_n(&k->sent, khz, __ATOMIC_RELAXED);
     return ret < 0 ? -1 : 0;
+}
+
+/* Restore only clusters this driver attempted, using the observed boot rate
+ * or a lower explicit cap, including an attempt whose response was lost. */
+static void
+restore_baselines(void)
+{
+    for (unsigned n = NCLUSTERS; n > 0; n--) {
+        unsigned c = n - 1;
+        struct cluster *k = &clusters[c];
+        if (k->attempted && k->sent != k->safe)
+            dlog("%s: restore %u MHz, result %d\n", k->name, k->safe / 1000, set_rate(k, k->safe));
+    }
 }
 
 /* degrees C, or -1 (exynos_acpm_tmu.c: type | tzid << 16; answer's temperature in byte 3 of word 1) */
@@ -217,16 +232,20 @@ read_temp(unsigned zone)
     uint32_t cmd[4] = { 0, TMU_IPC_READ_TEMP | (zone << 16), 0, 0 };
     if (ch_tmu.len == 0 || ipc(&ch_tmu, cmd) != 0 || (int8_t)(cmd[1] >> 8) != 0) return -1;
     int t = (int)((cmd[1] >> 24) & 0xff);
-    if (zone < 4) b2l_dvfs_last_temp[zone] = t;
     return t;
 }
 
 static int
 read_all_temps(int temp[4])
 {
-    int worst = -1;
-    for (unsigned z = 0; z < 4; z++) { temp[z] = read_temp(z); worst = temp[z] > worst ? temp[z] : worst; }
-    return worst;
+    int worst = -1, valid = 1;
+    for (unsigned z = 0; z < 4; z++) {
+        temp[z] = read_temp(z);
+        if (temp[z] < 0 || temp[z] > 125) { temp[z] = -1; valid = 0; }
+        __atomic_store_n(&b2l_dvfs_last_temp[z], temp[z], __ATOMIC_RELAXED);
+        worst = temp[z] > worst ? temp[z] : worst;
+    }
+    return valid ? worst : -1;
 }
 
 /* Dependent single-cycle adds on one CPU, timed by the generic timer. */
@@ -308,25 +327,54 @@ all_cores_up(void)
     return processor_avail_count >= real_ncpus;
 }
 
-static void
+static int
 plan(struct cluster *k)
 {
-    uint32_t top = k->rates[k->nrates - 1];
+    if (!k->nrates || !k->mhz_before || k->mhz_before > 4000) return -1;
+    uint32_t measured = (uint32_t)k->mhz_before * 1000, difference = UINT32_MAX;
+    for (unsigned l = 0; l < k->nrates; l++) {
+        uint32_t rate = k->rates[l], d = rate > measured ? rate - measured : measured - rate;
+        if (d < difference) { difference = d; k->baseline = rate; }
+    }
+    if (difference > measured / 20 || k->baseline > k->ceiling) return -1;
     k->cap = 0;
     (void)PE_parse_boot_argn(k->arg, &k->cap, sizeof(k->cap));
-    k->target = k->cap ? table_floor(k, k->cap) : top;
-    k->mid = table_floor(k, (uint32_t)((uint64_t)k->target * 3 / 4));
-    k->safe = table_floor(k, (uint32_t)((uint64_t)k->target / 2));
+    uint32_t limit = k->cap && k->cap < k->ceiling ? k->cap : k->ceiling;
+    if (limit < k->rates[0]) return -1;
+    k->target = table_floor(k, limit);
+    k->safe = k->baseline < k->target ? k->baseline : k->target;
+    k->mid = table_floor(k, (k->target + k->safe) / 2);
     /* up to six rungs, the target last, evenly spread over the table below it */
-    unsigned usable = 0;
+    unsigned usable = 0, first = 0;
     while (usable < k->nrates && k->rates[usable] <= k->target) usable++;
-    k->nrungs = usable < GOV_RUNGS ? usable : GOV_RUNGS;
-    for (unsigned r = 0; r < k->nrungs; r++) k->rung[r] = k->rates[(usable - 1) * r / (k->nrungs - 1 ? k->nrungs - 1 : 1)];
+    while (first < usable && k->rates[first] < k->safe) first++;
+    unsigned span = usable - first;
+    if (!span) return -1;
+    k->nrungs = span < GOV_RUNGS ? span : GOV_RUNGS;
+    for (unsigned r = 0; r < k->nrungs; r++) k->rung[r] = k->rates[first + (span - 1) * r / (k->nrungs - 1 ? k->nrungs - 1 : 1)];
     k->rung[k->nrungs - 1] = k->target;
-    k->gov_rung = k->nrungs - 1; k->gov_low = 0; k->sent = 0; k->level = 0;
+    k->gov_rung = k->nrungs - 1; k->gov_low = 0; k->sent = 0; k->level = 0; k->attempted = 0;
     char line[160]; size_t at = 0;
     for (unsigned r = 0; r < k->nrungs && at < sizeof(line) - 10; r++) at += (size_t)snprintf(line + at, sizeof(line) - at, " %u", k->rung[r] / 1000);
     dlog("%s: target %u MHz (cap %u) mid %u safe %u rungs%s\n", k->name, k->target / 1000, k->cap / 1000, k->mid / 1000, k->safe / 1000, line);
+    return 0;
+}
+
+static int
+rate_matches(uint32_t khz, uint64_t mhz)
+{
+    if (!mhz || mhz > 4000) return 0;
+    uint64_t measured = mhz * 1000;
+    return measured >= (uint64_t)khz * 9 / 10 && measured <= (uint64_t)khz * 11 / 10;
+}
+
+static unsigned
+thermal_level(int temperature, unsigned previous)
+{
+    if (temperature >= 90) return 2;
+    if (previous == 2 && temperature >= 84) return 2;
+    if (temperature >= 80 || (previous && temperature >= 74)) return 1;
+    return 0;
 }
 
 static uint32_t gov_ticks[8][2];
@@ -345,7 +393,7 @@ cluster_busy(const struct cluster *k)
         uint32_t all = busy + load.cpu_ticks[CPU_STATE_IDLE];
         uint32_t db = busy - gov_ticks[c][0], da = all - gov_ticks[c][1];
         gov_ticks[c][0] = busy; gov_ticks[c][1] = all;
-        if (da) { int pct = (int)(db * 100 / da); worst = pct > worst ? pct : worst; }
+        if (da) { int pct = (int)((uint64_t)db * 100 / da); if (pct > 100) pct = 100; worst = pct > worst ? pct : worst; }
     }
     return worst;
 }
@@ -372,6 +420,7 @@ static void
 dvfs_thread(void *arg __unused, wait_result_t wr_unused __unused)
 {
     uint32_t wait = 10, govern = 1, tick = 0;
+    int busy_pct[NCLUSTERS] = {-1, -1, -1};
     (void)PE_parse_boot_argn("b2l_dvfs_wait", &wait, sizeof(wait));
     (void)PE_parse_boot_argn("b2l_dvfs_gov", &govern, sizeof(govern));
     delay_for_interval(wait, NSEC_PER_SEC);
@@ -399,28 +448,48 @@ dvfs_thread(void *arg __unused, wait_result_t wr_unused __unused)
     int temp[4]; int worst = read_all_temps(temp);
     dlog("temperatures as S-Boot left them: big %d mid %d little %d g3d %d\n", temp[0], temp[1], temp[2], temp[3]);
     if (ch_tmu.len == 0 || worst < 0) { dlog("no temperatures from ACPM: clocks are not raised without thermal readings\n"); mode = 1; return; }
+    if (worst >= 80) { dlog("hottest zone %d C: no boost this boot\n", worst); mode = 1; return; }
     for (unsigned c = 0; c < NCLUSTERS; c++) {
         if (clusters[c].nrates == 0) { dlog("%s: no FVMAP table: clocks are not raised\n", clusters[c].name); mode = 1; return; }
-        plan(&clusters[c]);
+        if (plan(&clusters[c])) { dlog("%s: boot rate or capped plan invalid: no boost\n", clusters[c].name); mode = 1; return; }
     }
+    /* The observed phone DT requires A55 >= 1053 MHz at our A75 ceiling.
+     * Reject profiles whose baseline/lower cap cannot maintain that floor. */
+    if (clusters[0].safe < 1053000) { dlog("A55 floor cannot support capped A75 profile: no boost\n"); mode = 1; return; }
     /* one cluster at a time, little first, each proven by measurement and by ACPM still answering */
     for (unsigned c = 0; c < NCLUSTERS; c++) {
         struct cluster *k = &clusters[c];
-        if (set_rate(k, k->target)) { mode = 1; return; }
-        k->sent = k->target;
+        if (set_rate(k, k->target)) { restore_baselines(); mode = 1; return; }
         delay_for_interval(50, NSEC_PER_MSEC);
         k->mhz_after = mhz_on_cpu(k->first_cpu);
         int after = read_all_temps(temp);
         dlog("%s: asked %u MHz: measured %llu -> %llu MHz; temperatures big %d mid %d little %d (%s)\n", k->name, k->target / 1000,
             k->mhz_before, k->mhz_after, temp[0], temp[1], temp[2], after < 0 ? "ACPM STOPPED ANSWERING" : "ACPM answering");
-        if (after < 0) { dlog("no further requests this boot\n"); mode = 1; return; }
+        if (after < 0 || after >= 80 || !rate_matches(k->target, k->mhz_after)) {
+            dlog("measurement or thermal check failed: restoring observed boot rates\n");
+            restore_baselines(); mode = 1; return;
+        }
     }
-    dlog("clocks set; %s\n", govern ? "governing by load every 200 ms with thermal steps at 85/95 C" : "pinned with thermal steps at 85/95 C");
+    dlog("initial targets measured; %s, thermal steps at 80/90 C\n", govern ? "governing above observed boot rates" : "pinned within board ceilings");
     for (;; tick++) {
         delay_for_interval(200, NSEC_PER_MSEC);
+        /* Read temperatures before making this iteration's requests. If any
+         * sensor fails, restore the boot rates and stop governing this boot. */
+        if (tick % 5 == 0) {
+            int w = read_all_temps(temp);
+            if (w < 0) { dlog("thermal readings lost: restoring boot rates and stopping\n"); restore_baselines(); mode = 1; return; }
+            for (unsigned c = 0; c < NCLUSTERS; c++) {
+                struct cluster *k = &clusters[c];
+                unsigned want = w >= 90 ? 2 : thermal_level(temp[k->zone], k->level);
+                if (want != k->level)
+                    dlog("%s zone %s %d C: thermal step %u\n", k->name, zones[k->zone], temp[k->zone], want);
+                k->level = want;
+            }
+        }
         for (unsigned c = 0; govern && c < NCLUSTERS; c++) {
             struct cluster *k = &clusters[c];
             int busy = cluster_busy(k);
+            busy_pct[c] = busy;
             unsigned top = k->nrungs - 1, want = k->gov_rung, floor = touch_floor(k);
             if (busy >= 0) {
                 if (busy >= 70) { want = top; k->gov_low = 0; }
@@ -435,34 +504,18 @@ dvfs_thread(void *arg __unused, wait_result_t wr_unused __unused)
             if (want < floor) { want = floor; k->gov_low = 0; }
             k->gov_rung = want;
             uint32_t khz = capped(k, k->rung[want]);
-            if (khz != k->sent && set_rate(k, khz) == 0) k->sent = khz;
+            if (khz != k->sent && set_rate(k, khz)) { restore_baselines(); mode = 1; return; }
         }
-        if (tick % 5) continue;
-        /* every second: temperatures and thermal steps (85 C mid, 95 C safe, released 6 C below) */
-        int w = read_all_temps(temp);
-        for (unsigned c = 0; c < NCLUSTERS; c++) {
-            struct cluster *k = &clusters[c];
-            int t = temp[k->zone]; unsigned want = k->level;
-            if (t < 0) continue;
-            if (t >= 95) want = 2;
-            else if (t >= 85 && want < 1) want = 1;
-            else if (want == 2 && t < 89) want = t >= 85 ? 1 : 0;
-            else if (want == 1 && t < 79) want = 0;
-            if (want != k->level) {
-                k->level = want;
-                uint32_t khz = capped(k, govern ? k->rung[k->gov_rung] : k->target);
-                if (khz != k->sent && set_rate(k, khz) == 0) k->sent = khz;
-                dlog("%s zone %s %d C: thermal step %u, %u MHz\n", k->name, zones[k->zone], t, want, khz / 1000);
+        if (!govern) {
+            for (unsigned c = 0; c < NCLUSTERS; c++) {
+                struct cluster *k = &clusters[c]; uint32_t khz = capped(k, k->target);
+                if (khz != k->sent && set_rate(k, khz)) { restore_baselines(); mode = 1; return; }
             }
         }
-        if (w >= 105) {
-            for (unsigned c = 0; c < NCLUSTERS; c++) { struct cluster *k = &clusters[c]; k->level = 2; if (k->sent != k->safe && set_rate(k, k->safe) == 0) k->sent = k->safe; }
-            dlog("hottest zone %d C: every cluster at its safe clock\n", w);
-        }
         if (tick % 150 == 0) {
-            dlog("30 s: big %d mid %d little %d g3d %d C; sent cl0 %u cl1 %u cl2 %u MHz; steps %u/%u/%u; ipc %llu/%llu answered\n",
+            dlog("30 s: big %d mid %d little %d g3d %d C; sent cl0 %u cl1 %u cl2 %u MHz; steps %u/%u/%u; load_pct %d/%d/%d; ipc %llu/%llu answered\n",
                 temp[0], temp[1], temp[2], temp[3], clusters[0].sent / 1000, clusters[1].sent / 1000, clusters[2].sent / 1000,
-                clusters[0].level, clusters[1].level, clusters[2].level, b2l_dvfs_answered, b2l_dvfs_requests);
+                clusters[0].level, clusters[1].level, clusters[2].level, busy_pct[0], busy_pct[1], busy_pct[2], b2l_dvfs_answered, b2l_dvfs_requests);
         }
     }
 }

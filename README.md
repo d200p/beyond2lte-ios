@@ -115,11 +115,14 @@ reduce-transparency accessibility defaults (`b2l_ax_seed=1`, managed layer plus
 missing user domain file) before launchd, and the pre-userspace apply syncs the
 root once instead of per page (76 s saved per boot at current record counts).
 The diagnostic BOOT with `b2l_dvfs=0` reached Home after a kernel panic on the
-experimental FVMAP SRAM-scanning build. The next trial selects `b2l_dvfs=1`
-to read SRAM and measure clocks without mailbox access; its phone result is
-pending. The revised decoder follows the attached DVFS plugin, uses the correct
-rate-table offset, and accepts only aligned, bounded CPU tables.
-Clock control remains experimental and is disabled in this diagnostic BOOT.
+experimental FVMAP SRAM-scanning build. The subsequent SRAM-only trial reached
+Home and validated all CPU frequency tables without mailbox access, but the
+owner still reports very slow interaction. The next trial selects `b2l_dvfs=2`
+with bounded CPU requests: A55 up to 1950 MHz, A75 up to 2002 MHz and M4 up to
+2080 MHz. Boot-rate floors, initial frequency measurements and thermal checks
+gate the requests; physical clock changes and responsiveness remain unverified.
+The `B2L FRAMES` line now also measures elapsed time inside the framebuffer
+copy path, separately from gaps between submissions.
 See [ACPM diagnosis](docs/acpm-diagnostics.md) for the firmware ABI, tests and
 runtime limitations. The `B2L FRAMES` line reports compositor swaps and the
 longest gap between swaps.
