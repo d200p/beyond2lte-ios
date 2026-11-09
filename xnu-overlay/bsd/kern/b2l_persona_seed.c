@@ -120,8 +120,11 @@ static const char ax_plist[]=
 static int ax_directory(const char *path,uid_t uid,gid_t gid,mode_t mode,vfs_context_t ctx)
 {
     struct nameidata nd;struct vnode_attr va;vnode_t vp=NULL;
+    /* Same lookup form as ensure_keybags: a CREATE namei with NAMEI_NOFOLLOW_ANY
+     * and vnode_open with O_NOFOLLOW plus NOFOLLOW_ANY both fail with EINVAL
+     * on this kernel (observed 2026-11-09: AXSEED managed=22 user=22). */
     NDINIT(&nd,CREATE,OP_MKDIR,LOCKPARENT,UIO_SYSSPACE,CAST_USER_ADDR_T(path),ctx);
-    nd.ni_flag|=NAMEI_NOFOLLOW_ANY;nd.ni_cnd.cn_flags|=WILLBEDIR;
+    nd.ni_cnd.cn_flags|=WILLBEDIR;
     int error=namei(&nd);if(error)return error;
     if(!root_type(nd.ni_dvp,VDIR)){error=EXDEV;goto out;}
     if(nd.ni_vp){error=root_type(nd.ni_vp,VDIR)?0:ENOTDIR;goto out;}
@@ -144,7 +147,7 @@ static int ax_file(const char *path,uid_t uid,gid_t gid,vfs_context_t ctx)
 {
     const size_t n=sizeof(ax_plist)-1;static char verify[sizeof(ax_plist)];
     struct vnode_attr va;vnode_t vp=NULL;int resid=0;
-    int error=vnode_open(path,FREAD|FWRITE|O_CREAT|O_NOFOLLOW,0644,VNODE_LOOKUP_NOFOLLOW_ANY,&vp,ctx);
+    int error=vnode_open(path,FREAD|FWRITE|O_CREAT,0644,VNODE_LOOKUP_NOFOLLOW_ANY,&vp,ctx);
     if(error)return error;
     if(!root_type(vp,VREG)){error=EINVAL;goto close;}
     VATTR_INIT(&va);VATTR_WANTED(&va,va_data_size);VATTR_WANTED(&va,va_nlink);

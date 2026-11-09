@@ -35,6 +35,7 @@
 #include <sys/kauth.h>
 #include <sys/proc.h>
 #include <sys/systm.h>
+extern void b2l_boot_stage(const char *);
 extern int b2l_cache_resolve(vm_map_t,uint64_t,struct vnode**,uint64_t*);
 extern vnode_t rootvnode;
 #define QSIZE 128u
@@ -384,6 +385,7 @@ void b2l_native_cache_before_init(void){
  b2l_nc_pacga_mask=b2l_arm64e_pacga_mask()?1:0;
  printf("B2L NCACHE: PACGA result ABI=%s; records with PACGA rewrites=%llu; PACGA conversion %s\n",
   b2l_arm64e_pacga_name(),pacga_records,b2l_nc_pacga_mask?"enabled":"disabled");
+ b2l_boot_stage("cache-index-end");
  printf("B2L NCACHE: disk=%llu MiB slots=%u used=%u hot=%u KiB index=%llu KiB; disk-backed records\n",
   cache_io.bytes/(1024*1024),store.slots,store.used,(unsigned)(sizeof(hot_cells)/1024),(uint64_t)(key_bytes+bucket_bytes)/1024);
  /* Resolve the measured module before applying any native bytes. Failure is
@@ -411,8 +413,10 @@ void b2l_native_cache_before_init(void){
   if(!durable)deferred[i>>3]|=(uint8_t)(1u<<(i&7));
   else if(restore!=1&&recycle==1&&!reclaim_disabled)reclaim_record(i,r,target);
  }
+ b2l_boot_stage("cache-apply-writes-end");
  if(deferred){
   if(VFS_SYNC(vnode_mount(rootvnode),MNT_WAIT,vfs_context_current()))panic("B2L native cache: root sync failed after apply");
+  b2l_boot_stage("cache-root-sync-end");
   for(unsigned i=0;i<store.used;i++){
    if(!(deferred[i>>3]&(1u<<(i&7))))continue;const uint8_t*r=NULL;
    if(b2l_ncs_read(&store,i,&r)||!r)panic("B2L native cache: durable record read failed before verify");
@@ -420,6 +424,7 @@ void b2l_native_cache_before_init(void){
    if(recycle==1&&!reclaim_disabled)reclaim_record(i,r,target);
   }
   kfree_data(deferred,deferred_bytes);
+  b2l_boot_stage("cache-verify-end");
  }
  if(restore==1&&undo_vp){
   /* Later records can start from an already translated page. Reverse append
