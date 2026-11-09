@@ -32,8 +32,10 @@ class Recovery:
             self.serial = devices[0][0]
         if self.call('get-state').strip() != b'recovery':
             raise ProbeError('Target must be in recovery.')
-        if self.shell('getprop ro.product.device').strip() != b'beyond2lte':
-            raise ProbeError('Target is not beyond2lte.')
+        product = self.shell('getprop ro.product.device').strip()
+        if product not in (b'beyond2lte', b'beyond1lte'):
+            raise ProbeError('Target is not a supported board (beyond2lte or beyond1lte).')
+        self.product = product.decode()
         if not self.shell('getprop ro.twrp.version').strip():
             raise ProbeError('Target must run TWRP.')
         if self.shell('id -u').strip() != b'0':
@@ -138,7 +140,7 @@ def collect(recovery: Recovery, output: Path) -> dict:
     devices = pci_ids((output / 'pci.txt').read_text())
     receipt = {
         'captured_at': dt.datetime.now(dt.timezone.utc).isoformat(),
-        'product': 'beyond2lte', 'device_writes': False,
+        'product': getattr(recovery, 'product', 'unidentified'), 'device_writes': False,
         'pci_config_transactions': False, 'files': records, 'pci_devices': devices,
         'limitation': 'No Broadcom endpoint can mean the link is powered off; it does not prove missing hardware.',
     }

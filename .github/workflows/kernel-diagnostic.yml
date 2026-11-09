@@ -1,8 +1,13 @@
-name: S10+ XNU build
+name: S10 / S10+ XNU build
 
 on:
   workflow_dispatch:
     inputs:
+      device:
+        description: Target board (the kernel is shared; firmware and BOOT image are per board)
+        type: choice
+        options: [beyond2lte, beyond1lte]
+        default: beyond2lte
       boot_profile:
         description: Storage policy and loader root selection
         type: choice
@@ -28,9 +33,10 @@ permissions:
 
 env:
   B2L_BOOT_PROFILE: ${{ inputs.boot_profile || 'diagnostic' }}
+  B2L_DEVICE: ${{ inputs.device || 'beyond2lte' }}
 
 concurrency:
-  group: b2l-xnu-${{ inputs.boot_profile || 'diagnostic' }}-${{ inputs.component || 'all' }}
+  group: b2l-xnu-${{ inputs.device || 'beyond2lte' }}-${{ inputs.boot_profile || 'diagnostic' }}-${{ inputs.component || 'all' }}
   cancel-in-progress: false
 
 jobs:
@@ -166,6 +172,7 @@ jobs:
         run: |
           [[ "$(cat out/ci-kernel/boot-profile.txt)" == "$B2L_BOOT_PROFILE" ]]
           [[ "$(cat out/ci-firmware/boot-profile.txt)" == "$B2L_BOOT_PROFILE" ]]
+          [[ "$(cat out/ci-firmware/device.txt 2>/dev/null || echo beyond2lte)" == "$B2L_DEVICE" ]]
           kernel_revision="$(cat out/ci-kernel/source-revision.txt)"
           firmware_revision="$(cat out/ci-firmware/source-revision.txt)"
           [[ "$kernel_revision" =~ ^[0-9a-f]{40}$ && "$firmware_revision" =~ ^[0-9a-f]{40}$ ]]
@@ -176,7 +183,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y clang-18 llvm-18
-          python3 scripts/package-boot.py \
+          python3 scripts/package-boot.py --device "$B2L_DEVICE" \
             --mu out/ci-firmware/mu --firmware out/ci-firmware/firmware.fd \
             --kernel out/ci-kernel/mach.development.b2l --loader out/ci-firmware/XnuLoader.efi \
             --clang /usr/bin/clang-18 --objcopy /usr/bin/llvm-objcopy-18 \
@@ -186,7 +193,7 @@ jobs:
           printf '%s\n' "$B2L_BOOT_PROFILE" > out/diagnostic-boot/boot-profile.txt
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: s10plus-${{ inputs.boot_profile || 'diagnostic' }}-boot
+          name: ${{ inputs.device == 'beyond1lte' && 's10' || 's10plus' }}-${{ inputs.boot_profile || 'diagnostic' }}-boot
           path: |
             out/diagnostic-boot/boot.img
             out/diagnostic-boot/manifest.json

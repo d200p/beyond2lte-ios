@@ -60,13 +60,24 @@ class ImageReader:
         return data
 
 class AdbReader:
-    def __init__(self, adb):
-        self.adb = [adb, '-s', SERIAL]
+    def __init__(self, adb, serial=SERIAL, device=DEVICE):
+        # Defaults are the original S10+ handset. Another phone passes its own
+        # serial and either its resolved USERDATA node or the by-name link.
+        require(re.fullmatch(r'[A-Za-z0-9._:-]{1,64}', serial) is not None, 'invalid ADB serial')
+        require(re.fullmatch(r'/dev/block/(sd[a-z][0-9]+|by-name/userdata)', device) is not None,
+                'USERDATA must be /dev/block/sdXN or /dev/block/by-name/userdata')
+        self.serial = serial
+        self.adb = [adb, '-s', serial]
         require(self.call('get-state').strip() == b'recovery', 'target must be in recovery')
-        require(self.shell('getprop ro.product.device').strip() == b'beyond2lte', 'wrong product')
+        product = self.shell('getprop ro.product.device').strip()
+        require(product in (b'beyond2lte', b'beyond1lte'), 'wrong product')
         require(self.shell('id -u').strip() == b'0', 'recovery must provide root')
-        resolved = self.shell('readlink -f ' + DEVICE).decode().strip()
-        require(resolved == DEVICE, 'unexpected USERDATA block device')
+        resolved = self.shell('readlink -f ' + device).decode().strip()
+        if device.startswith('/dev/block/by-name/'):
+            require(re.fullmatch(r'/dev/block/sd[a-z][0-9]+', resolved) is not None, 'unexpected USERDATA block device')
+            device = resolved
+        require(resolved == device, 'unexpected USERDATA block device')
+        self.device = device
         mounts = self.shell('cat /proc/mounts').decode(errors='replace')
         for line in mounts.splitlines():
             if not line.split():
@@ -74,11 +85,11 @@ class AdbReader:
             source = line.split()[0]
             if source.startswith('/dev/block/'):
                 source = self.shell('readlink -f ' + shlex.quote(source)).decode().strip()
-            require(source != DEVICE, 'source volume is mounted; export requires a quiescent recovery volume')
-        self.size = int(self.shell('blockdev --getsize64 ' + DEVICE).strip())
+            require(source != device, 'source volume is mounted; export requires a quiescent recovery volume')
+        self.size = int(self.shell('blockdev --getsize64 ' + device).strip())
         require(1024 * 1024 <= self.size <= 2**50 and self.size % 4096 == 0, 'invalid block device size')
-        self.identity = {'transport': 'ADB read only', 'serial': SERIAL,
-                         'product': 'beyond2lte', 'state': 'recovery', 'device': DEVICE}
+        self.identity = {'transport': 'ADB read only', 'serial': serial,
+                         'product': product.decode(), 'state': 'recovery', 'device': device}
     def call(self, *args):
         return subprocess.check_output(self.adb + list(args), timeout=180)
     def shell(self, command):
@@ -90,7 +101,7 @@ class AdbReader:
         first = offset // 4096
         count = (offset % 4096 + size + 4095) // 4096
         data = self.call('exec-out', 'sh', '-c',
-                         f'dd if={DEVICE} bs=4096 skip={first} count={count} 2>/dev/null')
+                         f'dd if={self.device} bs=4096 skip={first} count={count} 2>/dev/null')
         require(len(data) == count * 4096, 'short ADB block read')
         return data[offset % 4096:offset % 4096 + size]
 
@@ -425,6 +436,9 @@ def main():
     parser.add_argument('--include-prefix', action='append', default=[], help='also export files below an absolute HFS path to supplemental/; repeatable')
     parser.add_argument('--include-crash-reports', action='store_true', help='include all mobile/root/system logs as supplemental files')
     parser.add_argument('--image', type=Path, help='local raw HFS partition image instead of live ADB (offline/fixture)')
+    parser.add_argument('--serial', default=SERIAL, help='ADB serial of the phone in recovery (default: the original S10+ handset)')
+    parser.add_argument('--userdata', default=DEVICE,
+                        help='USERDATA block device, /dev/block/sdXN or /dev/block/by-name/userdata (default: the original S10+ node)')
     args = parser.parse_args()
     try:
         prefixes = list(args.include_prefix)
@@ -434,7 +448,7 @@ def main():
         for prefix in prefixes:
             require(prefix.startswith('/') and len(prefix) > 1, 'include prefix must be absolute')
             safe_relative(prefix[1:])
-        reader = ImageReader(args.image) if args.image else AdbReader(args.adb)
+        reader = ImageReader(args.image) if args.image else AdbReader(args.adb, args.serial, args.userdata)
         receipt = export(reader, args.output, prefixes)
         print(json.dumps({'archive': str(args.output), 'complete': receipt['complete'], 'errors': receipt['errors']}))
         return 0 if receipt['complete'] else 2

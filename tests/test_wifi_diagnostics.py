@@ -38,10 +38,22 @@ class RecoveryTests(unittest.TestCase):
                 }
                 return answers[args]
         calls = []
-        with self.assertRaisesRegex(probe.ProbeError, 'not beyond2lte'):
+        with self.assertRaisesRegex(probe.ProbeError, 'not a supported board'):
             Fake('adb', None)
         self.assertEqual(len(calls), 3)
         self.assertFalse(any('sys/' in str(call) for call in calls))
+
+    def test_s10_identity_is_accepted_and_recorded(self):
+        class Fake(probe.Recovery):
+            def call(self, *args):
+                return {
+                    ('devices',): b'List of devices attached\nTEST\trecovery\n',
+                    ('get-state',): b'recovery\n',
+                    ('shell', '-T', 'getprop ro.product.device'): b'beyond1lte\n',
+                    ('shell', '-T', 'getprop ro.twrp.version'): b'3.7.0_12-0\n',
+                    ('shell', '-T', 'id -u'): b'0\n',
+                }[args]
+        self.assertEqual(Fake('adb', None).product, 'beyond1lte')
 
     def test_ambiguous_or_nonrecovery_device(self):
         class Fake(probe.Recovery):

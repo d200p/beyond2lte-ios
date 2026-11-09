@@ -183,6 +183,49 @@ int main(void) {
                             str(source), "-o", str(binary)], check=True, capture_output=True, text=True)
             subprocess.run([str(binary)], check=True)
 
+    def s10_fixture(self, root):
+        """The same fixture, with the board package generated for the S10."""
+        self.fixture(root)
+        source = root / "Platforms/Samsung/beyond2ltePkg"
+        target = root / "Platforms/Samsung/beyond1ltePkg"
+        shutil.copytree(source, target)
+        for name in ("beyond2lte.dsc", "beyond2lte.fdf"):
+            path = target / name
+            path.rename(target / name.replace("beyond2lte", "beyond1lte"))
+        for path in target.rglob("*"):
+            if path.is_file():
+                path.write_text(path.read_text().replace("beyond2lte", "beyond1lte"))
+        shutil.rmtree(source)  # an S10 build must not depend on the S10+ package
+
+    def test_s10_package_is_prepared_with_its_own_evidence(self):
+        with tempfile.TemporaryDirectory(prefix="b2l-s10-firmware-") as directory:
+            root = Path(directory)
+            self.s10_fixture(root)
+            command = [sys.executable, str(PREPARE), "--mu", str(root), "--device", "beyond1lte",
+                       "--loader", str(root / "Loader.efi"), "--loader-guid", GUID]
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            platform = root / "Platforms/Samsung/beyond1ltePkg"
+            self.assertIn("beyond1ltePkg/B2LXnuEmbedded/B2LXnuEmbedded.inf", (platform / "beyond1lte.dsc").read_text())
+            self.assertIn("INF beyond1ltePkg/B2LXnuEmbedded/B2LXnuEmbedded.inf", (platform / "beyond1lte.fdf").read_text())
+            memory = (platform / "Library/MemoryMapLib/MemoryMapLib.c").read_text()
+            self.assertIn("// B2L discontiguous RAM profile v1", memory)
+            self.assertIn('"B2L DT el2_earlymem", 0x9FD800000ULL, 0x2800000ULL', memory)
+            # Only the S10 live tree has mm_debug; it must become a firmware reservation.
+            self.assertIn('"B2L DT mm_debug", 0x91200000ULL, 0x1000ULL', memory)
+            self.assertTrue((platform / "B2LXnuEmbedded/XnuLoader.efi").is_file())
+            self.assertFalse((root / "Platforms/Samsung/beyond2ltePkg").exists())
+
+    def test_s10_requires_generated_package(self):
+        with tempfile.TemporaryDirectory(prefix="b2l-s10-firmware-") as directory:
+            root = Path(directory)
+            self.fixture(root)  # S10+ package only
+            command = [sys.executable, str(PREPARE), "--mu", str(root), "--device", "beyond1lte",
+                       "--loader", str(root / "Loader.efi"), "--loader-guid", GUID]
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("make-beyond1lte-overlay.py", result.stderr)
+
     def test_changed_actual_library_binding_rejected(self):
         with tempfile.TemporaryDirectory(prefix="b2l-firmware-test-") as directory:
             root = Path(directory)

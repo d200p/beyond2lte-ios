@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Package external beyond2lte UEFI + embedded XNU loader + a BOOT trailer.
+"""Package external board UEFI + embedded XNU loader + a BOOT trailer.
 
 No phone I/O or flashing is performed. The Android ramdisk is empty; XNU remains
 on disk until the firmware loader reads its bounded trailer through UFS.
@@ -24,6 +24,42 @@ MAGIC = b"B2LXNU02"
 PAYLOAD_VERSION = 2
 HEADER_SIZE = 320
 SEED_SIZE = 256
+# Board codename -> (retail model, root-model substring of its reference DTB).
+DEVICES = {
+    "beyond2lte": ("SM-G975F", "BEYOND2LTE"),
+    "beyond1lte": ("SM-G973F", "BEYOND1LTE"),
+}
+
+
+def dtb_model(dtb):
+    """Return the root 'model' property of a flattened device tree, or ''."""
+    if len(dtb) < 40:
+        return ""
+    _, total, off_struct, off_strings, _, _, _, _, size_strings, size_struct = struct.unpack_from(">10I", dtb)
+    if total > len(dtb):
+        return ""
+    strings = dtb[off_strings:off_strings + size_strings]
+    pos, end, depth = off_struct, off_struct + size_struct, 0
+    while pos + 4 <= end:
+        token = struct.unpack_from(">I", dtb, pos)[0]
+        pos += 4
+        if token == 1:
+            pos = (dtb.index(b"\0", pos) + 4) & ~3
+            depth += 1
+        elif token == 2:
+            depth -= 1
+        elif token == 3:
+            length, nameoff = struct.unpack_from(">II", dtb, pos)
+            pos += 8
+            name = strings[nameoff:strings.find(b"\0", nameoff)]
+            if depth == 1 and name == b"model":
+                return dtb[pos:pos + length].rstrip(b"\0").decode(errors="replace")
+            pos = (pos + length + 3) & ~3
+        elif token == 9:
+            break
+        elif token != 4:
+            return ""
+    return ""
 
 
 def align(value, alignment=PAGE):
@@ -169,6 +205,8 @@ def main():
     p.add_argument("--clang", default=shutil.which("clang"))
     p.add_argument("--objcopy", default=shutil.which("llvm-objcopy") or "/opt/homebrew/opt/llvm/bin/llvm-objcopy")
     p.add_argument("--verify", type=Path, help="Only validate an existing packaged image")
+    p.add_argument("--device", choices=sorted(DEVICES), default="beyond2lte",
+                   help="Target board: beyond2lte (S10+, default) or beyond1lte (S10)")
     a = p.parse_args()
     if a.verify:
         print(json.dumps(check_boot(a.verify), indent=2))
@@ -188,10 +226,14 @@ def main():
         p.error("--loader must be the built ARM64 EFI application")
     if not firmware_contains_loader(fd, a.loader.read_bytes()):
         p.error("the supplied EFI loader is not embedded in this FD's compressed firmware volume; rebuild the XNU firmware profile first")
-    dtb_path = a.mu / "Resources/DTBs/beyond2lte.dtb"
+    device = a.device
+    retail_model, dtb_marker = DEVICES[device]
+    dtb_path = a.mu / f"Resources/DTBs/{device}.dtb"
     dtb = dtb_path.read_bytes()
     if len(dtb) < 40 or struct.unpack_from(">I", dtb)[0] != 0xd00dfeed:
-        p.error("reference beyond2lte DTB is invalid")
+        p.error(f"reference {device} DTB is invalid")
+    if dtb_marker not in dtb_model(dtb).upper():
+        p.error(f"reference DTB model {dtb_model(dtb)!r} is not a {device} board")
     a.output_dir.mkdir(parents=True, exist_ok=True)
     intermediates = a.output_dir / "components"
     intermediates.mkdir(exist_ok=True)
@@ -211,7 +253,7 @@ def main():
     image = a.output_dir / "boot.img"
     subprocess.run([sys.executable, str(a.mu / "Resources/Scripts/mkbootimg.py"),
                     "--kernel", str(android_kernel), "--ramdisk", str(empty_ramdisk),
-                    "--header_version", "1", "--pagesize", str(PAGE), "--board", "beyond2lte",
+                    "--header_version", "1", "--pagesize", str(PAGE), "--board", device,
                     "--output", str(image)], check=True)
     boot = image.read_bytes()
     expected_trailer = PAGE + align(len(shim) + len(fd) + len(dtb))
@@ -229,7 +271,7 @@ def main():
         out.write(kernel)
     layout = check_boot(image)
     manifest = {
-        "format": "beyond2lte-xnu-boot-v2", "device": "beyond2lte", "model": "SM-G975F",
+        "format": "beyond2lte-xnu-boot-v2", "device": device, "model": retail_model,
         "status": "offline-built; not device-boot-verified", "layout": layout,
         "firmware_base": hex(FD_BASE), "firmware_bytes": FD_SIZE,
         "confirmed_target_boot_partition_bytes": a.boot_partition_bytes,
@@ -244,7 +286,7 @@ def main():
                   "The host seed changes per packaged image, not per reboot; firmware RNG is preferred.",
                   "Verify actual device identity and BOOT capacity, and obtain approval before writing."]}
     (a.output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    archive = a.output_dir / "beyond2lte-xnu-boot.tar"
+    archive = a.output_dir / f"{device}-xnu-boot.tar"
     with tarfile.open(archive, "w", format=tarfile.USTAR_FORMAT) as tar:
         for name in ("boot.img", "manifest.json"):
             tar.add(a.output_dir / name, arcname=name)

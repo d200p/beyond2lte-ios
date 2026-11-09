@@ -5,13 +5,17 @@
  * active firmware/stack/framebuffer/EL2 are excluded. A range is admitted
  * only after actual EFI conventional-memory allocation, never from this
  * whitelist alone. No dynamic Linux CMA allocation is treated as a firmware
- * reservation: RamManagerDxe also removes live secure-world memory holes. */
+ * reservation: RamManagerDxe also removes live secure-world memory holes.
+ * SM-G973F live recovery DT (bootloader G973FXXUHHXJ1, 2026-11-09) adds one
+ * fixed reservation, mm_debug 0x91200000+0x1000; its 16KiB page is excluded
+ * for both boards (common/memory/beyond1lte-8g-dt.json). */
 #define B2L_RAM_MAX_RANGES 128u
 #define B2L_RAM_PAGE 16384ULL
 struct b2l_ram_range { unsigned long long base, size; };
 static const struct b2l_ram_range b2l_ram_allowlist[] = {
     {0x80004000ULL,0x6ffc000ULL},
-    {0x87200000ULL,0xee00000ULL},
+    {0x87200000ULL,0xa000000ULL},
+    {0x91204000ULL,0x4dfc000ULL},
     {0xb4800000ULL,0x6300000ULL},
     {0xc0080000ULL,0x8f80000ULL},
     {0xc9440000ULL,0xbc0000ULL},

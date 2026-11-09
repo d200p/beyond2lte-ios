@@ -11,6 +11,10 @@ import re
 import shutil
 import uuid
 
+# Supported boards. Both are Exynos 9820 with the same live DRAM/reservation map;
+# each keeps its own captured evidence file.
+DEVICES = ("beyond2lte", "beyond1lte")
+
 
 def replace_function(source, name, body):
     start = source.index(name + " (")
@@ -23,7 +27,7 @@ def replace_function(source, name, body):
     return source[:brace] + "{\n" + body + "\n}" + source[end:]
 
 
-def xnu_memory_profile(source):
+def xnu_memory_profile(source, device="beyond2lte"):
     """Remove broad budget guards; retain exact observed fixed reservations."""
     marker="// B2L discontiguous RAM profile v1"
     if marker in source:return source
@@ -31,7 +35,7 @@ def xnu_memory_profile(source):
     if not any(x in source for x in expected):raise ValueError("unrecognized firmware memory profile")
     lines=[l for l in source.splitlines(True) if not any(x in l for x in expected)]
     source=''.join(lines)
-    evidence=Path(__file__).resolve().parents[1]/"common/memory/beyond2lte-8g-dt.json"
+    evidence=Path(__file__).resolve().parents[1]/f"common/memory/{device}-8g-dt.json"
     nodes=json.loads(evidence.read_text());entries=[]
     # Exact fixed reservations, except the existing separately named U-H row.
     for name,p in nodes.items():
@@ -98,21 +102,27 @@ def main():
     p.add_argument("--mu", type=Path, required=True, help="Disposable Mu-Silicium build tree")
     p.add_argument("--loader", type=Path, required=True)
     p.add_argument("--loader-guid", required=True)
-    p.add_argument("--enable-touch", action="store_true", help="Initialize existing beyond2lte sec_ts driver before XNU handoff")
+    p.add_argument("--enable-touch", action="store_true", help="Initialize the board's existing sec_ts driver before XNU handoff")
+    p.add_argument("--device", choices=DEVICES, default="beyond2lte",
+                   help="Board package to prepare: beyond2lte (S10+, default) or beyond1lte (S10)")
     a = p.parse_args()
     root = a.mu.resolve()
     guid = uuid.UUID(a.loader_guid)
+    device = a.device
     # Protect the user's named reference checkout from accidental build edits.
     if root.name == "UEFI_beyond2lte" or not (root / "Mu_Basecore").is_dir():
         p.error("--mu must be a disposable Mu-Silicium build tree, not the reference repository")
-    platform = root / "Platforms/Samsung/beyond2ltePkg"
+    platform = root / f"Platforms/Samsung/{device}Pkg"
+    if not platform.is_dir():
+        hint = " (run scripts/make-beyond1lte-overlay.py first)" if device == "beyond1lte" else ""
+        p.error(f"missing board package Platforms/Samsung/{device}Pkg{hint}")
     if a.enable_touch:
         dxe = platform / "Include/DXE.inc"
         text = dxe.read_text()
-        marker = "  # INF beyond2ltePkg/Drivers/B2LTouchDxe/B2LTouchDxe.inf"
-        enabled = "  INF beyond2ltePkg/Drivers/B2LTouchDxe/B2LTouchDxe.inf"
+        marker = f"  # INF {device}Pkg/Drivers/B2LTouchDxe/B2LTouchDxe.inf"
+        enabled = f"  INF {device}Pkg/Drivers/B2LTouchDxe/B2LTouchDxe.inf"
         if marker not in text and enabled not in text:
-            p.error("expected beyond2lte touch entry is absent")
+            p.error(f"expected {device} touch entry is absent")
         dxe.write_text(text.replace(marker, enabled))
         # The touch branch's yap.sh --touch enables BOTH entries. Enabling only
         # the FV module leaves HsI2cDxe linked to the null bus-data provider,
@@ -128,8 +138,8 @@ def main():
         soc.write_text(soc_text)
 
 
-    dsc_path = platform / "beyond2lte.dsc"
-    fdf_path = platform / "beyond2lte.fdf"
+    dsc_path = platform / f"{device}.dsc"
+    fdf_path = platform / f"{device}.fdf"
     library_root = root / "Silicon/Silicium/SiliciumPkg"
     bindings_path = library_root / "SiliciumPkg.dsc.inc"
     manager_path = library_root / "Library/BootManagerLib/BootManager.c"
@@ -140,10 +150,10 @@ def main():
     for path in (ram_manager_path,memory_path, dsc_path, fdf_path, bindings_path, manager_path, manager_inf_path, gic_path, a.loader):
         if not path.is_file():
             p.error(f"missing input: {path}")
-    if re.search(r"MemoryMapLib\s*\|\s*beyond2ltePkg/Library/MemoryMapLib/MemoryMapLib\.inf", dsc_path.read_text()) is None:
+    if re.search(rf"MemoryMapLib\s*\|\s*{device}Pkg/Library/MemoryMapLib/MemoryMapLib\.inf", dsc_path.read_text()) is None:
         p.error("external MemoryMapLib binding changed")
     try:
-        memory = xnu_memory_profile(memory_path.read_text())
+        memory = xnu_memory_profile(memory_path.read_text(), device)
         ram_manager = xnu_ram_manager_profile(ram_manager_path.read_text())
     except ValueError as error:
         p.error(str(error))
@@ -253,7 +263,7 @@ def main():
     dsc, n = re.subn(r"gPcBdsPkgTokenSpaceGuid\.PcdShellFile\|[^\r\n]*", pcd, dsc)
     if n != 1:
         p.error(f"expected exactly one PcdShellFile, found {n}")
-    component = "beyond2ltePkg/B2LXnuEmbedded/B2LXnuEmbedded.inf"
+    component = f"{device}Pkg/B2LXnuEmbedded/B2LXnuEmbedded.inf"
     if component not in dsc:
         dsc += f"\n[Components]\n  {component}\n"
     fdf = fdf_path.read_text()
@@ -278,7 +288,7 @@ def main():
     gic_path.write_text(gic)
     memory_path.write_text(memory)
     ram_manager_path.write_text(ram_manager)
-    print(f"Prepared external 4 MiB firmware profile at {root}")
+    print(f"Prepared external 4 MiB {device} firmware profile at {root}")
     print(f"Embedded loader {guid}; post-console launch precedes BootNext/BootOrder and stops if the loader returns")
 
 

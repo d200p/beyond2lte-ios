@@ -10,7 +10,7 @@ def main():
  adb=[a.adb,'-s',a.serial]
  def shell(command):return subprocess.check_output(adb+['shell','-T',command],text=True).strip()
  if subprocess.check_output(adb+['get-state'],text=True).strip()!='recovery':p.error('device must be in recovery')
- if shell('getprop ro.product.device')!='beyond2lte' or shell('id -u')!='0':p.error('expected rooted beyond2lte recovery')
+ if shell('getprop ro.product.device') not in ('beyond2lte','beyond1lte') or shell('id -u')!='0':p.error('expected rooted beyond2lte or beyond1lte recovery')
  dev=shell('readlink -f /dev/block/by-name/system')
  if not re.fullmatch(r'/dev/block/sd[a-z][0-9]+',dev):p.error('unexpected SYSTEM block path')
  size=int(shell('blockdev --getsize64 '+shlex.quote(dev)))
