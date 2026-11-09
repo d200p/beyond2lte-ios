@@ -10,10 +10,17 @@ and device family, not functioning Wi-Fi under XNU.
 ## First XNU checkpoint
 
 `b2l_wifi_diag=1` takes one snapshot before launchd of shared PMU, GPIO and
-CMU registers. The userspace loader selects this mode; missing, zero and all
-unsupported values disable it before mapping any register. The diagnostic
-profile does not select it. Lines have the `B2L WIFI:` prefix and are retained
-in the existing persistent console.
+CMU registers. Missing, zero and unsupported values disable the probe before
+mapping any register. The diagnostic profile does not select it. Lines have
+the `B2L WIFI:` prefix and are retained in the existing persistent console.
+
+This read-only mode completed on the phone in epoch 48, followed by launchd,
+frame presentation and user-confirmed menu interaction. PHY isolation bypass
+was zero; WLAN_REG_ON, PERST and CLKREQ were inputs with low sampled levels.
+All six sampled gate words were `0x200000`, and all five QCH words were
+`0x3f0002`. The preceding epoch ended during cache verification before reaching
+this checkpoint. Allow at least five minutes before testing menu interaction
+and returning to recovery; seeing an image alone is insufficient evidence.
 
 The snapshot maps these four shared blocks with I/O memory attributes and
 releases all mappings, including after a partial mapping failure. Mapping
@@ -35,9 +42,35 @@ stops decoding and releases mappings. Mapping success does not itself prove
 that a register is readable; physical execution is still required.
 
 No controller ELBI, PHY, PCS, DBI, configuration window or BAR is mapped or
-read. No GPIO, clock, reset, isolation, ATU, interrupt, SysMMU or PCI command
-register is written. No firmware is loaded and no network interface is
+read. Mode 1 writes no GPIO, clock, reset, isolation, ATU, interrupt, SysMMU or
+PCI command register. No firmware is loaded and no network interface is
 registered. A completed snapshot means only that this limited checkpoint ran.
+
+## Temporary power-path checkpoint
+
+The next userspace loader selects `b2l_wifi_diag=2`. It first takes the same
+snapshot, then accepts only the measured idle pin/isolation state and exact
+clock words above. Any mismatch skips the active part without writes.
+
+It preloads a low PERST data latch and makes that pin an output, preloads a
+low WLAN_REG_ON latch and makes that pin an output, then raises WLAN_REG_ON.
+After Samsung's 200 ms turn-on delay it briefly enables channel-zero PHY
+isolation bypass and checks the shared-register readback. PERST stays low.
+The chip is held in reset throughout the power pulse.
+
+On success or a failed readback it attempts restoration of every owned bit:
+PHY isolation, power/reset data, then the two pin function fields. Each
+restoration is verified and retried at most three times. A failed restoration
+is explicitly logged. Read-modify-write operations preserve all other bits;
+an all-ones read is rejected before modification and as a readback result.
+The complete active part normally takes about 201 ms and has no polling loop.
+
+This mode changes only the two GPIO mux fields, their data bits and PMU PHY
+isolation bit zero. It changes no clocks, regulators, PHY calibration or
+controller state, reads no ELBI/DBI/config/BAR, and enables no link, DMA,
+firmware or network service. Successful GPIO/register readback is not proof
+that the chip booted firmware or established a PCIe link. Physical validation
+of this active mode is pending.
 
 ## Recovery evidence
 
@@ -63,8 +96,9 @@ open; no random variant is used.
 
 ## Following checkpoints
 
-1. Validate the shared-register snapshot on the phone and preserve a rollback.
-2. Port channel-zero power, pin control, clock, PHY calibration and reset
+1. Validate the temporary power-path checkpoint and verified restoration on
+   the phone, preserving the validated read-only BOOT as rollback.
+2. Port channel-zero pin control, clock, PHY calibration and reset
    sequencing from the Exynos 9820 sources. Confirm a bounded Gen1 link before
    configuration transactions. Keep DMA/bus mastering disabled during identity
    probing and do not replace UFS/shared clock configuration wholesale.
@@ -83,7 +117,10 @@ only its network and iOS integration are candidates for reuse here.
 `rtk proxy python3 tests/test_wifi_diagnostics.py` runs the actual diagnostic
 control flow under ASan/UBSan, with an MMIO allowlist, unsupported boot modes,
 mapping failures at every position, reverse cleanup, pin decoding, an invalid
-register and unchanged simulated memory. Recovery tests exercise wrong-device
+register and unchanged simulated memory in mode 1. Mode 2 tests preserve
+unrelated pin/PMU bits, drop every write in turn, reject all-ones readback,
+exercise unexpected baseline states and bound persistent restoration failure.
+Recovery tests exercise wrong-device
 and ambiguous-device rejection, PCI parsing, private output and no overwrite.
 These host checks cannot prove hardware register accessibility or Wi-Fi support.
 
