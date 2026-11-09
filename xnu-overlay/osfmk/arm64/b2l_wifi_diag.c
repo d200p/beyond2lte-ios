@@ -7,12 +7,17 @@
  * b2l_wifi_diag=3 additionally reads six controller ELBI status/reset words
  * during that pulse. It writes no controller register, trains no link and
  * accesses no PHY/PCS/DBI/config/BAR, firmware or network registration.
+ * b2l_wifi_diag=4 initializes the channel-zero PHY/root port for one bounded
+ * Gen1 x1 link attempt, then asserts reset and powers the PHY down. No ATU,
+ * endpoint configuration/BAR, DMA mapping, IRQ enabling or firmware loading.
  * A powered PHY alone does not establish that DBI/ELBI accesses are safe.
  * All addresses/offsets are sourced in docs/wifi-bringup.md.
  */
 #include <arm64/b2l_early.h>
+#include <arm64/b2l_wifi_phy_data.h>
 #include <kern/clock.h>
 #include <kern/misc_protos.h>
+#include <mach/mach_time.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <vm/pmap.h>
@@ -60,7 +65,186 @@ wifi_restore_bits(const struct wifi_region *region, unsigned offset, uint32_t ma
     return -1;
 }
 
+/* PCI configuration control is in the low half-word. Write zero to status
+ * bits in the high half, and to PME_Status (W1C) in the PMCSR low half. */
+static int
+wifi_control16(const struct wifi_region *dbi, unsigned off, uint32_t mask, uint32_t value)
+{
+    uint32_t before = wifi_read(dbi, off);
+    if (before == UINT32_MAX) return -1;
+    uint32_t next = ((before & 0xffffu) & ~mask) | (value & mask);
+    if (off == 0x44) next &= ~0x8000u;
+    wifi_write(dbi, off, next);
+    uint32_t checked = wifi_read(dbi, off);
+    return checked != UINT32_MAX && (checked & mask) == (value & mask) ? 0 : -1;
+}
+
+static int
+wifi_reset_pulse(const struct wifi_region *elbi, unsigned off, unsigned final_us)
+{
+    wifi_write(elbi, off, 1); delay(10);
+    wifi_write(elbi, off, 0); delay(10);
+    wifi_write(elbi, off, 1); delay(final_us);
+    return wifi_read(elbi, off) == 1 ? 0 : -1;
+}
+
 static void
+wifi_gen1_probe(struct wifi_region *regions)
+{
+    const struct wifi_region *gpio = &regions[2], *elbi = &regions[4];
+    const struct wifi_region *phy = &regions[5], *pcs = &regions[6];
+    const struct wifi_region *sysreg = &regions[7], *dbi = &regions[8];
+    struct { unsigned off; uint32_t mask, value; } saved[] = {
+        { 0x18, 2, 0 }, { 0xf4, 0x11, 0 }, { 0x1b8, 3, 0 }, { 0x2c8, 0xfff, 0 },
+    };
+    uint32_t clock_mux, clock_pull, hs, lane, idle;
+    uint32_t ro_before = 0, link = 0, status = 0;
+    int ro_changed = 0, dbi_ready = 0, trained = 0, cleanup_failed = 0;
+    const char *stage = "pins-and-power";
+    /* Accept the inactive controller/reset state verified in epoch 51. */
+    if (wifi_read(elbi, 0x2c) != 0 || (wifi_read(elbi, 0x74) & 31u) != 0 ||
+        wifi_read(elbi, 0x1d0) != 1 || wifi_read(elbi, 0x288) != 1 ||
+        wifi_read(elbi, 0x28c) != 1 || wifi_read(elbi, 0x290) != 1) {
+        wlog("Gen1 probe skipped: controller differs from verified idle baseline\n");
+        return;
+    }
+    clock_mux = wifi_read(gpio, 0x20); clock_pull = wifi_read(gpio, 0x28);
+    if (clock_mux == UINT32_MAX || clock_pull == UINT32_MAX || (clock_mux & 15u) != 0) {
+        wlog("Gen1 probe skipped: CLKREQ pad differs from verified idle baseline\n");
+        return;
+    }
+    hs = wifi_read(sysreg, 0x1044); lane = wifi_read(sysreg, 0x1050);
+    idle = wifi_read(pcs, 0xec);
+    if (hs == UINT32_MAX || lane == UINT32_MAX || idle == UINT32_MAX) {
+        wlog("Gen1 probe skipped: controller/shared state differs from verified idle baseline\n");
+        return;
+    }
+    for (unsigned i = 0; i < sizeof(saved) / sizeof(saved[0]); i++) {
+        saved[i].value = wifi_read(elbi, saved[i].off);
+        if (saved[i].value == UINT32_MAX) {
+            wlog("Gen1 probe skipped: invalid ELBI control word\n");
+            return;
+        }
+    }
+    wlog("Gen1 probe begin: channel 0, 26 MHz PHY profile, x1; one 500 ms attempt\n");
+    /* Keep all PCIe interrupt sources masked. There is no IRQ handler or DMA
+     * client in this experiment. Do not restore an old interrupt-enable mask. */
+    if (wifi_bits(elbi, 0x0c, UINT32_MAX, 0) || wifi_bits(elbi, 0x10, UINT32_MAX, 0) ||
+        wifi_bits(elbi, 0x14, UINT32_MAX, 0) ||
+        wifi_bits(gpio, 0x28, 15u, 3u) || wifi_bits(gpio, 0x20, 15u, 2u) ||
+        wifi_bits(pcs, 0x100, 1u << 6, 0) || wifi_bits(pcs, 0x104, 1u << 7, 0))
+        goto out;
+    wifi_write(phy, 0x80, 0xc0); wifi_write(phy, 0x15c, 0x7e);
+    if (wifi_bits(pcs, 0xec, 8u, 8u)) goto out; /* Ignore RX electrical idle for DBI access. */
+    wifi_write(elbi, 0x1d0, 0); delay(20);
+    if (wifi_bits(elbi, 0x1d0, 1, 1) || wifi_bits(gpio, 0x24, 4, 4)) goto out;
+    delay_for_interval(20, NSEC_PER_MSEC);
+    stage = "phy-calibration";
+    if (wifi_bits(elbi, 0xf4, 0x11, 0x11) || wifi_bits(elbi, 0x1b8, 3, 2) ||
+        wifi_bits(elbi, 0x2c8, 0xfff, 0) || wifi_bits(sysreg, 0x1044, 2, 2) ||
+        wifi_bits(sysreg, 0x1050, 0xfe, 0x0c) ||
+        wifi_bits(sysreg, 0x1050, 0x1000, 0x1000) || wifi_reset_pulse(elbi, 0x288, 10))
+        goto out;
+    for (unsigned i = 0; i < sizeof(b2l_wifi_cmn); i++) wifi_write(phy, i * 4, b2l_wifi_cmn[i]);
+    for (unsigned i = 0; i < sizeof(b2l_wifi_trsv); i++) wifi_write(phy, 0xc0 + i * 4, b2l_wifi_trsv[i]);
+    wifi_write(pcs, 0xf8, 0x70); wifi_write(pcs, 0x100, 0x87); wifi_write(pcs, 0x104, 0x50);
+    if (wifi_bits(pcs, 0x0c, 0x12, 0x10) || wifi_reset_pulse(elbi, 0x290, 10) ||
+        wifi_reset_pulse(elbi, 0x28c, 100)) goto out;
+    uint32_t cdr = wifi_read(pcs, 0xd0);
+    if (cdr == UINT32_MAX) goto out;
+    wifi_write(pcs, 0xd0, cdr | 0xc0); delay(20);
+    cdr = wifi_read(pcs, 0xd0);
+    if (cdr == UINT32_MAX) goto out;
+    wifi_write(pcs, 0xd0, (cdr & ~0xc0u) | 0x80); wifi_write(pcs, 0xd0, cdr & ~0xc0u);
+    if (wifi_bits(elbi, 0x18, 2, 0)) goto out; /* Enable bus-number handling; no ATU. */
+    stage = "root-dbi";
+    uint32_t root_id = wifi_read(dbi, 0);
+    ro_before = wifi_read(dbi, 0x8bc);
+    /* Samsung programs the root vendor/device IDs during full PCI bus setup;
+     * zero can be an uninitialized root identity, not an absent endpoint. */
+    if (root_id == UINT32_MAX || ro_before == UINT32_MAX) {
+        wlog("Gen1 probe stopped: invalid root DBI identity/control\n");
+        goto out;
+    }
+    wlog("Gen1 root DBI ID=%#x; endpoint remains unconfigured\n", root_id);
+    dbi_ready = 1;
+    stage = "root-policy";
+    /* Root command: memory decoding only, never bus mastering. Status W1C
+     * fields are written as zero. No endpoint configuration window is mapped. */
+    if (wifi_control16(dbi, 0x04, 0x147, 2) || wifi_control16(dbi, 0x44, 0x103, 0)) goto out;
+    ro_changed = 1;
+    if (wifi_bits(dbi, 0x8bc, 1, 1) || wifi_bits(dbi, 0x710, 0x3f0000, 0x10000) ||
+        wifi_bits(dbi, 0x80c, 0x1f00, 0x100) ||
+        wifi_bits(dbi, 0x7c, 0x383ff, 0x38012) || wifi_bits(dbi, 0xb40, UINT32_MAX, 26) ||
+        wifi_control16(dbi, 0xa0, 15, 1) || wifi_control16(dbi, 0x80, 3, 0) ||
+        wifi_restore_bits(dbi, 0x8bc, 1, ro_before)) goto out;
+    ro_changed = 0;
+    uint32_t width = wifi_read(dbi, 0x80c), control = wifi_read(dbi, 0x80);
+    if (width == UINT32_MAX || control == UINT32_MAX) goto out;
+    wifi_write(dbi, 0x80c, width | (1u << 17));
+    wifi_write(dbi, 0x80, (control & 0xffffu) | 0x20u);
+    if (wifi_bits(elbi, 0x0c, UINT32_MAX, 0) || wifi_bits(elbi, 0x10, UINT32_MAX, 0) ||
+        wifi_bits(elbi, 0x14, UINT32_MAX, 0) || wifi_bits(pcs, 0xec, 8, 0) ||
+        wifi_bits(elbi, 0x2c, 1, 1)) goto out;
+    stage = "link-training";
+    uint64_t deadline;
+    clock_interval_to_deadline(500, NSEC_PER_MSEC, &deadline);
+    for (unsigned tick = 0; tick < 500 && mach_absolute_time() < deadline; tick++) {
+        link = wifi_read(elbi, 0x74);
+        if (link == UINT32_MAX) break;
+        unsigned state = link & 31u;
+        if (state >= 0x0d && state <= 0x14) {
+            /* Like the vendor DBI accessor, avoid RX-idle clock gating while
+             * sampling config, including a link that drops during the read. */
+            if (wifi_bits(pcs, 0xec, 8, 8)) goto out;
+            status = wifi_read(dbi, 0x80);
+            if (wifi_bits(pcs, 0xec, 8, 0) || status == UINT32_MAX) goto out;
+            unsigned speed = (status >> 16) & 15u, lanes = (status >> 20) & 63u;
+            if (speed == 1 && lanes == 1) { trained = 1; break; }
+            if (speed > 1 || lanes > 1) break;
+        }
+        delay_for_interval(1, NSEC_PER_MSEC);
+    }
+    wlog("Gen1 link %s: ELBI=%#x speed=%u lanes=%u; endpoint/DMA/firmware untouched\n",
+        trained ? "up" : "not established", link, (status >> 16) & 15u, (status >> 20) & 63u);
+out:
+    if (!trained) wlog("Gen1 probe stopped: stage=%s ELBI=%#x\n", stage, link);
+    /* Assert endpoint reset, stop training and force the vendor PHY power-down
+     * state before the caller re-isolates and removes WLAN power. Internal
+     * PHY/DBI programming is retained, not claimed to match S-Boot bytewise. */
+    cleanup_failed |= wifi_restore_bits(gpio, 0x24, 4, 0);
+    cleanup_failed |= wifi_restore_bits(elbi, 0x2c, 1, 0);
+    cleanup_failed |= wifi_restore_bits(elbi, 0x0c, UINT32_MAX, 0);
+    cleanup_failed |= wifi_restore_bits(elbi, 0x10, UINT32_MAX, 0);
+    cleanup_failed |= wifi_restore_bits(elbi, 0x14, UINT32_MAX, 0);
+    if (dbi_ready) {
+        if (wifi_restore_bits(pcs, 0xec, 8, 8)) cleanup_failed = -1;
+        else {
+            int master_failed = -1;
+            for (unsigned attempt = 0; attempt < 3; attempt++) {
+                if (!wifi_control16(dbi, 0x04, 0x147, 2)) { master_failed = 0; break; }
+                delay_for_interval(1, NSEC_PER_MSEC);
+            }
+            cleanup_failed |= master_failed;
+            if (ro_changed) cleanup_failed |= wifi_restore_bits(dbi, 0x8bc, 1, ro_before);
+        }
+    }
+    cleanup_failed |= wifi_restore_bits(phy, 0x15c, 0xff, 0xfe);
+    cleanup_failed |= wifi_restore_bits(phy, 0x80, 0xff, 0xc1);
+    cleanup_failed |= wifi_restore_bits(pcs, 0x100, 0x40, 0x40);
+    cleanup_failed |= wifi_restore_bits(pcs, 0x104, 0x80, 0x80);
+    cleanup_failed |= wifi_restore_bits(pcs, 0xec, 8, idle);
+    cleanup_failed |= wifi_restore_bits(sysreg, 0x1044, 2, hs);
+    cleanup_failed |= wifi_restore_bits(sysreg, 0x1050, 0x10fe, lane);
+    cleanup_failed |= wifi_restore_bits(gpio, 0x20, 15, clock_mux);
+    cleanup_failed |= wifi_restore_bits(gpio, 0x28, 15, clock_pull);
+    for (unsigned i = 0; i < sizeof(saved) / sizeof(saved[0]); i++)
+        cleanup_failed |= wifi_restore_bits(elbi, saved[i].off, saved[i].mask, saved[i].value);
+    wlog("Gen1 quiesce %s; PHY power-down requested, PCIe IRQs stay masked\n",
+        cleanup_failed ? "FAILED" : "verified");
+}
+
+static int
 wifi_controller_snapshot(const struct wifi_region *elbi)
 {
     static const unsigned offsets[] = { 0x02c, 0x074, 0x1d0, 0x288, 0x28c, 0x290 };
@@ -70,10 +254,11 @@ wifi_controller_snapshot(const struct wifi_region *elbi)
         wlog("ELBI +%#x raw=%#x\n", offsets[i], value);
         if (value == UINT32_MAX) {
             wlog("ELBI snapshot failed: all-ones register; stopping controller reads\n");
-            return;
+            return -1;
         }
     }
     wlog("ELBI snapshot complete; no controller writes, link training or endpoint access\n");
+    return 0;
 }
 
 static void
@@ -108,8 +293,8 @@ wifi_power_probe(struct wifi_region *regions, uint32_t mode)
         }
     }
     wlog("power probe begin: hold PERST low; temporary WLAN power and PHY bypass\n");
-    /* Program the low data latch before changing each pad from input to output.
-     * Hold PERST asserted throughout; no link or DMA can be started here. */
+    /* Program low latches before selecting output. Modes 2/3 hold reset; mode
+     * 4 temporarily releases/reasserts it inside the separate link probe. */
     int failed = wifi_bits(&regions[2], 0x24, reset_level, 0) ||
         wifi_bits(&regions[2], 0x20, reset_function, 1u << 8) ||
         wifi_bits(&regions[1], 0x84, wlan_level, 0) ||
@@ -125,7 +310,8 @@ wifi_power_probe(struct wifi_region *regions, uint32_t mode)
         }
     }
     wlog("power probe readback %s\n", failed ? "failed" : "passed");
-    if (!failed && mode == 3) wifi_controller_snapshot(&regions[4]);
+    if (!failed && mode >= 3 && !wifi_controller_snapshot(&regions[4]) && mode == 4)
+        wifi_gen1_probe(regions);
     /* Re-isolate before powering down. Restore data while pads are still
      * outputs, then restore mux fields. Attempt every restoration on failure. */
     int restore_failed = 0;
@@ -146,17 +332,22 @@ b2l_wifi_diag_start(void)
         { 0x10430000, 0, 0x4000 }, /* PERIC0 GPIO: GPG0-5 WLAN_REG_ON */
         { 0x13c40000, 0, 0x4000 }, /* FSYS1 GPIO: GPF2-0 CLKREQ, GPF2-2 PERST */
         { 0x13c00000, 0, 0x4000 }, /* CMU_FSYS1, shared with booted UFS */
-        { 0x13ed0000, 0, 0x4000 }, /* PCIe0 ELBI, mode 3 only */
+        { 0x13ed0000, 0, 0x4000 }, /* PCIe0 ELBI, modes 3/4 */
+        { 0x13ef0000, 0, 0x4000 }, /* PCIe0 PHY, mode 4 only */
+        { 0x13ee0000, 0, 0x4000 }, /* PCIe0 PCS */
+        { 0x13c10000, 0, 0x4000 }, /* SYSREG_FSYS1, PCIe0 fields only */
+        { 0x13f00000, 0, 0x4000 }, /* PCIe0 root DBI */
     };
     static const unsigned gates[] = { 0x2030, 0x2034, 0x2038, 0x203c, 0x2040, 0x2044 };
     static const unsigned qch[] = { 0x3034, 0x3038, 0x303c, 0x3040, 0x3044 };
     unsigned count = 4;
 
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 3) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 4) {
         wlog("diagnostic disabled; no MMIO access\n");
         return;
     }
-    if (mode == 3) count = sizeof(regions) / sizeof(regions[0]);
+    if (mode == 3) count = 5;
+    if (mode == 4) count = sizeof(regions) / sizeof(regions[0]);
     /* Map every shared block before reading any of them. Release all mappings
      * even when an allocation fails. Mode 3 also maps ELBI, but cannot read it
      * until the verified power/reset/isolation sequence has completed. */

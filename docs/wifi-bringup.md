@@ -77,7 +77,7 @@ epochs to find the actual long test session.
 
 ## Controller status checkpoint
 
-The next userspace loader selects `b2l_wifi_diag=3`. This repeats the guarded
+`b2l_wifi_diag=3` repeats the guarded
 power probe and, only after successful power/reset/isolation readback and the
 201 ms delay, reads six channel-zero ELBI registers. ELBI is mapped at
 `0x13ed0000`, length 16 KiB, but remains unread if shared-state validation or
@@ -97,7 +97,58 @@ restoration runs after either success or a failed ELBI readback. This mode
 writes no controller register and accesses no PHY, PCS, DBI, configuration
 window, BAR or endpoint. No link training, IRQ, DMA, firmware or network
 interface is enabled. Completion establishes only ELBI register accessibility
-under the tested conditions. Physical validation of mode 3 is pending.
+under the tested conditions. Mode 3 completed on the phone in epoch 51:
+LTSSM enable was zero, link status `0xf15400`, and all four sampled reset
+registers were one. The power restoration and interactive Home were verified.
+
+## One Gen1 link attempt
+
+The next userspace loader selects `b2l_wifi_diag=4`. After the verified power
+and ELBI checkpoints, it accepts only the observed inactive controller/reset
+state and an unowned CLKREQ pad. It then uses the Exynos 9820 channel-zero
+26 MHz PHY profile and DesignWare root-port link controls for one Gen1 x1
+attempt. The physical outcome is pending.
+
+Additional I/O mappings, each 16 KiB, come from this board's device tree:
+
+| Block | Base | Scope |
+| --- | --- | --- |
+| PHY | `0x13ef0000` | 48 common and 80 TRSV register words; power controls |
+| PCS | `0x13ee0000` | Channel-zero reset, reference-clock and RX-idle controls |
+| SYSREG_FSYS1 | `0x13c10000` | PCIe fields at `0x1044` and `0x1050` only |
+| Root DBI | `0x13f00000` | Root link width/speed, auxiliary clock and PCI command controls |
+
+The PHY data header records its pinned Samsung source hash. Independent
+golden hashes in the host test check both arrays. Recovery's exposed kernel
+configuration has no EXYNOS_OTP definition; this trial makes no OTP access.
+CLKREQ uses the board's function 2 and pull-up 3, while the caller owns the
+PERST output. Shared SYSREG and pin fields are restored with masked writes.
+No CMU, ACPM DVFS or regulator setting is changed.
+
+The sequence enables the PHY, pulses the documented resets, programs the
+PHY/PCS profile, and configures the root port for one lane and target Gen1.
+RX electrical-idle checking is bypassed while accessing DBI, as in Samsung's
+accessor. Root bus mastering, SERR and parity responses are disabled; all
+PCIe interrupts remain masked. PCI command/control writes put zero in W1C
+status fields. Root vendor/device IDs are read for diagnostics, not rewritten;
+an uninitialized zero root identity is allowed if control readback works.
+
+Training has a 500 ms monotonic deadline and a second limit of 500 polls,
+with 1 ms spacing. Preemption or an individual I/O access can extend observed
+elapsed time. Only LTSSM states `0x0d..0x14` with negotiated speed 1 and width
+1 count as success. There is one attempt, with no retry or panic on timeout.
+No iATU/configuration window, endpoint BAR, SysMMU/DMA map or endpoint command
+is touched; no firmware or network service is started.
+
+On every path after initialization begins, the probe attempts to assert PERST,
+disable LTSSM, mask interrupts, clear root bus mastering, request and check the
+PHY power-down controls, and restore the shared pin/SYSREG and selected ELBI
+fields. Then the caller restores isolation and WLAN power. Root DBI and PHY
+configuration bytes are retained rather than restored to their S-Boot image;
+the intended final condition is reset, isolated and powered down. Failed
+quiescence is explicit and bounded, and does not suppress common restoration.
+Look for all three results: `Gen1 link up`, `Gen1 quiesce verified`, and
+`power probe restore verified`. Interactive Home alone does not prove a link.
 
 ## Recovery evidence
 
@@ -123,12 +174,10 @@ open; no random variant is used.
 
 ## Following checkpoints
 
-1. Validate the controller status checkpoint and restoration on the phone,
-   preserving the validated mode-2 BOOT as rollback.
-2. Port channel-zero pin control, clock, PHY calibration and reset
-   sequencing from the Exynos 9820 sources. Confirm a bounded Gen1 link before
-   configuration transactions. Keep DMA/bus mastering disabled during identity
-   probing and do not replace UFS/shared clock configuration wholesale.
+1. Validate the Gen1 link attempt and quiescence on the phone, preserving the
+   validated mode-3 BOOT as rollback.
+2. Only after a validated link, add bounded endpoint identity reads through
+   the board's configuration window, keeping bus mastering disabled.
 3. Read the endpoint and chip revision, select verified board firmware/NVRAM,
    and bring up firmware with an appropriate DMA/SysMMU design.
 4. Establish scanning, authentication, packet transport and DHCP, then adapt
@@ -154,6 +203,15 @@ with cleanup, and permits no controller writes. Recovery tests exercise wrong-de
 and ambiguous-device rejection, PCI parsing, private output and no overwrite.
 These host checks cannot prove hardware register accessibility or Wi-Fi support.
 
+`rtk proxy python3 tests/test_wifi_gen1.py` runs the actual mode-4 control flow
+with strict MMIO, power/reset and DBI RX-idle prerequisites. It checks the
+source PHY table hashes, Gen1 success, timeout, preemption/deadline behavior,
+unexpected speed, invalid DBI data, inactive-state rejection, every mapping
+failure and a dropped write at every position. Permanent LTSSM/PHY cleanup
+failures remain explicit while common power restoration is still attempted.
+The backend rejects bus-master/IRQ enabling, W1C status acknowledgement,
+CMU writes, and all ATU/endpoint/config/BAR access.
+
 ## Source references
 
 Samsung/LineageOS is pinned to
@@ -163,6 +221,8 @@ Samsung/LineageOS is pinned to
 - [PCIe host driver and sequencing](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/pci/dwc/pcie-exynos-host-v0.c)
 - [PCIe register offsets](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/pci/dwc/pcie-exynos-host-v0.h)
 - [Exynos 9820 PHY calibration](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/pci/dwc/pci-exynos9820_cal.c)
+- [DesignWare root-port link setup](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/pci/dwc/pcie-designware.c)
+- [DesignWare root configuration semantics](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/pci/dwc/pcie-designware-host.c)
 - [GPIO bank offsets](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c)
 - [Clock register bases, offsets and fields](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/soc/samsung/cal-if/exynos9820/cmucal-sfr.c)
 - [WLAN power and PCIe channel setup](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/dhd_custom_exynos.c)

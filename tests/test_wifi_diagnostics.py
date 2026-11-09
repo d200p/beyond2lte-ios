@@ -93,6 +93,7 @@ def test_kernel():
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include "b2l_wifi_phy_data.h"
 typedef uintptr_t vm_offset_t;
 typedef unsigned long vm_size_t;
 #define VM_WIMG_IO 0x66
@@ -105,9 +106,16 @@ static unsigned controller_reads;
 static int mode;
 static char logs[4096];
 static unsigned log_size;
+static uint64_t host_time_us;
+static uint64_t mach_absolute_time(void) { return host_time_us; }
+static void clock_interval_to_deadline(unsigned amount, unsigned unit, uint64_t *deadline) {
+    *deadline = host_time_us + (uint64_t)amount * unit / 1000;
+}
+static void delay(unsigned us) { host_time_us += us; }
 static void delay_for_interval(unsigned amount, unsigned unit) {
-    assert(unit == NSEC_PER_MSEC && (amount == 200 || amount == 1));
+    assert(unit == NSEC_PER_MSEC && (amount == 200 || amount == 20 || amount == 1));
     delays_ms += amount;
+    host_time_us += amount * 1000;
 }
 static void b2l_early_trace(const char *fmt, ...) {
     va_list args; va_start(args, fmt);
@@ -180,7 +188,7 @@ static void reset(int requested, unsigned fail) {
     memset(memory, 0, sizeof(memory)); memset(logs, 0, sizeof(logs));
 }
 int main(void) {
-    const int disabled[] = {-1, 0, 4, 5, -2};
+    const int disabled[] = {-1, 0, 5, 6, -2};
     for (unsigned i = 0; i < sizeof(disabled)/sizeof(disabled[0]); i++) {
         reset(disabled[i], 0); b2l_wifi_diag_start();
         assert(!maps && !reads && !writes && !unmapped && strstr(logs, "disabled"));
@@ -280,6 +288,7 @@ int main(void) {
         compiler = shlex.split(os.environ.get('CC', 'cc'))
         subprocess.run(compiler + ['-std=c11', '-Wall', '-Wextra', '-Werror',
                                    '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
+                                   '-I', str(REPO / 'xnu-overlay/osfmk/arm64'),
                                    str(path), '-o', str(binary)], check=True)
         subprocess.run([str(binary)], check=True)
 
