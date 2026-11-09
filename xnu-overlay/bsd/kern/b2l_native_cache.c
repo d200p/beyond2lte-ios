@@ -164,31 +164,57 @@ static int undo_open(int create){
 static void undo_close(void){
  if(undo_vp){vnode_close(undo_vp,FREAD|FWRITE,vfs_context_current());undo_vp=NULL;}
 }
-/* Return 1 only for a matching file and fully synced/read-back target. */
-static int apply_record(const uint8_t*r,int restore,const uint8_t**target_out){
- vnode_t vp=NULL;*target_out=NULL;
- if(VFS_VGET(vnode_mount(rootvnode),(ino64_t)b2l_nc_u64(r+16),&vp,vfs_context_current())||!vp){skipped++;return 0;}
+/* Native/original page selection for a matching record. count=1 accounts the
+ * measured-text exclusion statistics; the verify pass recomputes silently. */
+static const uint8_t*record_target(const uint8_t*r,vnode_t vp,int restore,int count){
  unsigned len=b2l_nc_u32(r+60);uint64_t off=b2l_nc_u64(r+32);
- if(same_file(vp,r)||rd(vp,off,page,len)||b2l_nc_page_state(r,page,len)<0){skipped++;vnode_put(vp);return 0;}
  const uint8_t*target=r+B2L_NC_DATA+(restore==1?0:4096);
  if(restore!=1&&b2l_nc_u32(r+56)==2){
   struct integrity_file*f=integrity_file(vp,b2l_nc_u64(r+24),r+40);
   if(!f||f->result<0){vnode_put(vp);panic("B2L native cache: corecrypto section metadata unsafe");}
   if(f->result==1){
-   integrity_excluded+=b2l_xfilter(r,&f->range,target_page);target=target_page;
-   uint64_t start=off>f->range.offset?off:f->range.offset;
-   uint64_t end=off+len<f->range.offset+f->range.bytes?off+len:f->range.offset+f->range.bytes;
-   for(uint64_t at=start;at<end;at+=4)if(memcmp(page+at-off,target+at-off,4))integrity_restored++;
+   uint64_t excluded=b2l_xfilter(r,&f->range,target_page);target=target_page;
+   if(count){
+    integrity_excluded+=excluded;
+    uint64_t start=off>f->range.offset?off:f->range.offset;
+    uint64_t end=off+len<f->range.offset+f->range.bytes?off+len:f->range.offset+f->range.bytes;
+    for(uint64_t at=start;at<end;at+=4)if(memcmp(page+at-off,target+at-off,4))integrity_restored++;
+   }
   }
  }
+ return target;
+}
+/* Return 1 only for a matching file. durable=1 writes synchronously, flushes
+ * and reads back before returning (maintenance restore and fallback). durable=0
+ * only writes through the buffer cache; the caller must VFS_SYNC the root and
+ * run verify_record on every deferred index before any reclamation or EL0. */
+static int apply_record(const uint8_t*r,int restore,const uint8_t**target_out,int durable){
+ vnode_t vp=NULL;*target_out=NULL;
+ if(VFS_VGET(vnode_mount(rootvnode),(ino64_t)b2l_nc_u64(r+16),&vp,vfs_context_current())||!vp){skipped++;return 0;}
+ unsigned len=b2l_nc_u32(r+60);uint64_t off=b2l_nc_u64(r+32);
+ if(same_file(vp,r)||rd(vp,off,page,len)||b2l_nc_page_state(r,page,len)<0){skipped++;vnode_put(vp);return 0;}
+ const uint8_t*target=record_target(r,vp,restore,1);
  int e=0,resid=0,changed=memcmp(page,target,len)!=0;
- if(changed)e=vn_rdwr(UIO_WRITE,vp,(caddr_t)target,(int)len,(off_t)off,UIO_SYSSPACE,IO_SYNC,kauth_cred_get(),&resid,current_proc());
- if(!e&&!resid)e=VNOP_FSYNC(vp,MNT_WAIT,vfs_context_current());
- if(e||resid||rd(vp,off,page,len)||memcmp(page,target,len)){
-  failures++;vnode_put(vp);panic("B2L native cache apply failed before userspace");
- }
+ if(changed)e=vn_rdwr(UIO_WRITE,vp,(caddr_t)target,(int)len,(off_t)off,UIO_SYSSPACE,durable?IO_SYNC:0,kauth_cred_get(),&resid,current_proc());
+ if(durable){
+  if(!e&&!resid)e=VNOP_FSYNC(vp,MNT_WAIT,vfs_context_current());
+  if(e||resid||rd(vp,off,page,len)||memcmp(page,target,len)){
+   failures++;vnode_put(vp);panic("B2L native cache apply failed before userspace");
+  }
+ }else if(e||resid){failures++;vnode_put(vp);panic("B2L native cache deferred apply write failed before userspace");}
  if(changed)applied++;else already++;
  *target_out=target;vnode_put(vp);return 1;
+}
+/* After the single root sync: the page must equal the selected target. */
+static const uint8_t*verify_record(const uint8_t*r,int restore){
+ vnode_t vp=NULL;
+ if(VFS_VGET(vnode_mount(rootvnode),(ino64_t)b2l_nc_u64(r+16),&vp,vfs_context_current())||!vp)panic("B2L native cache: applied file vanished before userspace");
+ unsigned len=b2l_nc_u32(r+60);uint64_t off=b2l_nc_u64(r+32);
+ const uint8_t*target=record_target(r,vp,restore,0);
+ if(same_file(vp,r)||rd(vp,off,page,len)||memcmp(page,target,len)){
+  failures++;vnode_put(vp);panic("B2L native cache apply verification failed before userspace");
+ }
+ vnode_put(vp);return target;
 }
 static void reclaim_record(unsigned index,const uint8_t*r,const uint8_t*target){
  /* A filtered record archives exactly the bytes actually applied, including
@@ -369,11 +395,28 @@ void b2l_native_cache_before_init(void){
   if(restore!=1)printf("B2L NCACHE: undo archive unavailable (%d); retaining SYSTEM records\n",archive_error);
  }
  if(b2l_nc_u32(store.headers+store.header_copy*4096+8)!=2)reclaim_disabled=1;
+ /* Normal boots write every matching page through the buffer cache, sync the
+  * root once, then verify each deferred page. A per-page IO_SYNC+fsync took
+  * about 4 ms each (76 s for 17,910 pages on 2026-11-09). Durability is the
+  * same: nothing is reclaimed and no EL0 runs before the sync and readback. */
+ int durable=restore==1;uint8_t*deferred=NULL;size_t deferred_bytes=((size_t)store.used+7)/8;
+ if(!durable&&deferred_bytes){deferred=kalloc_data(deferred_bytes,Z_WAITOK|Z_ZERO);if(!deferred)durable=1;}
  for(unsigned i=0;i<store.used;i++){
   if(!store.keys[i].inode)continue;const uint8_t*r=NULL,*target=NULL;
   if(b2l_ncs_read(&store,i,&r)||!r)panic("B2L native cache: durable record read failed before apply");
-  if(apply_record(r,restore,&target)&&restore!=1&&recycle==1&&!reclaim_disabled)
-   reclaim_record(i,r,target);
+  if(!apply_record(r,restore,&target,durable))continue;
+  if(!durable)deferred[i>>3]|=(uint8_t)(1u<<(i&7));
+  else if(restore!=1&&recycle==1&&!reclaim_disabled)reclaim_record(i,r,target);
+ }
+ if(deferred){
+  if(VFS_SYNC(vnode_mount(rootvnode),MNT_WAIT,vfs_context_current()))panic("B2L native cache: root sync failed after apply");
+  for(unsigned i=0;i<store.used;i++){
+   if(!(deferred[i>>3]&(1u<<(i&7))))continue;const uint8_t*r=NULL;
+   if(b2l_ncs_read(&store,i,&r)||!r)panic("B2L native cache: durable record read failed before verify");
+   const uint8_t*target=verify_record(r,restore);
+   if(recycle==1&&!reclaim_disabled)reclaim_record(i,r,target);
+  }
+  kfree_data(deferred,deferred_bytes);
  }
  if(restore==1&&undo_vp){
   /* Later records can start from an already translated page. Reverse append
@@ -381,7 +424,7 @@ void b2l_native_cache_before_init(void){
   for(uint64_t i=undo.count;i;i--){
    const uint8_t*target=NULL;
    if(b2l_ncu_read(&undo,i-1,undo_record))panic("B2L native cache: durable undo read failed");
-   if(apply_record(undo_record,1,&target))undo_restored++;
+   if(apply_record(undo_record,1,&target,1))undo_restored++;
   }
  }
  if(restore!=1&&reclaimed&&!reclaim_disabled&&b2l_ncs_trim(&store,undo.next,verify)){

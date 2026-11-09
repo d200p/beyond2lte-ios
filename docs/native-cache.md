@@ -171,6 +171,17 @@ owning-subcache and saved-native-cache paths as its three arguments. It verifies
 that every restored byte equals the pristine measured code, while every byte
 outside that range retains its cached native value.
 
+## Deferred apply sync (2026-11-09)
+
+Normal boots no longer write each matching page with `IO_SYNC` plus a per-file
+`VNOP_FSYNC` (about 4 ms per page; 17,910 pages took 76 s). All matching pages
+are written through the buffer cache, the root is synced once with `VFS_SYNC`,
+and every deferred page is read back and compared with its selected target
+before any cell is reclaimed and before `load_init_program`. A mismatch still
+panics. Maintenance restore (`b2l_cache_restore=1`) keeps the per-record
+synchronous path. An interrupted boot leaves the same original/native/mixed
+page states the existing durable records already repair.
+
 ## PACGA mask result ABI (2026-11-09)
 
 Every CoreFoundation object creation and check executes two `PACGA`

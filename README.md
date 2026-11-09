@@ -106,7 +106,14 @@ CoreFoundation's PACGA sites to `AND` instead of trapping on every object
 creation and check. The `B2L LIVE` line now also reports a measured core clock
 for the reporting CPU. See [native cache](docs/native-cache.md) and
 [ARM64e runtime](docs/arm64e-runtime.md). The physical result of this change
-is pending device verification.
+is pending device verification. Device evidence from the same day: PACGA traps
+disappeared after the first learning boot and the wrapper now costs about
+1.8 us per trap; the remaining slowness is CPU composition, and backboardd
+aborted twice in QuartzCore's software renderer during glass/blur transitions
+(`CA::OGL::Context::push_surface`). The loader therefore seeds reduce-motion and
+reduce-transparency accessibility defaults (`b2l_ax_seed=1`, managed layer plus
+missing user domain file) before launchd, and the pre-userspace apply syncs the
+root once instead of per page (76 s saved per boot at current record counts).
 
 | Component | Device status | How it works / current limits |
 | --- | --- | --- |
