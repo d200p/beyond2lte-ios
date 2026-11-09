@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise the actual Gen1 bring-up flow with strict MMIO and protocol guards."""
+"""Exercise actual Gen1 and read-only endpoint flows with strict MMIO guards."""
 import os
 import hashlib
 from pathlib import Path
@@ -38,14 +38,18 @@ typedef uintptr_t vm_offset_t;
 typedef unsigned long vm_size_t;
 #define VM_WIMG_IO 0x66
 #define NSEC_PER_MSEC 1000000u
-static _Alignas(16384) uint32_t memory[9][4096];
+static _Alignas(16384) uint32_t memory[10][4096];
 static const uintptr_t physical[] = {
     0x15860000, 0x10430000, 0x13c40000, 0x13c00000, 0x13ed0000,
-    0x13ef0000, 0x13ee0000, 0x13c10000, 0x13f00000
+    0x13ef0000, 0x13ee0000, 0x13c10000, 0x13f00000, 0x14ffc000
 };
 static unsigned maps, unmaps, fail_map, writes, drop_write, link_polls;
 static unsigned trained, scenario, gen1_reads;
 static unsigned invalid_profile_once;
+static unsigned mode = 4, endpoint_reads, endpoint_fault, atu_enable_write, fault_served;
+static uint32_t atu[7];
+static uint32_t original_viewport;
+static uint64_t enabled_at;
 static uint64_t now_us;
 static char logs[8192];
 static unsigned log_size;
@@ -56,18 +60,19 @@ static void b2l_early_trace(const char *fmt, ...) {
     log_size += (unsigned)n;
 }
 static int PE_parse_boot_argn(const char *name, void *value, unsigned size) {
-    assert(!strcmp(name, "b2l_wifi_diag") && size == 4); *(uint32_t *)value = 4; return 1;
+    assert(!strcmp(name, "b2l_wifi_diag") && size == 4); *(uint32_t *)value = mode; return 1;
 }
 static uint64_t mach_absolute_time(void) { return now_us; }
 static void clock_interval_to_deadline(unsigned n, unsigned unit, uint64_t *at) {
-    assert(n == 500 && unit == NSEC_PER_MSEC); *at = now_us + 500000;
+    assert((n == 500 || (mode == 5 && n == 100)) && unit == NSEC_PER_MSEC); *at = now_us + n * 1000;
 }
 static void delay(unsigned us) { assert(us == 10 || us == 20 || us == 100); now_us += us; }
 static void delay_for_interval(unsigned n, unsigned unit) {
-    assert(unit == NSEC_PER_MSEC && (n == 1 || n == 20 || n == 200)); now_us += n * 1000;
+    assert(unit == NSEC_PER_MSEC && (n == 1 || n == 20 || n == 200 ||
+        (mode == 5 && (n == 9 || n == 100)))); now_us += n * 1000;
 }
 static uintptr_t ml_io_map_unmappable(uintptr_t pa, unsigned long size, unsigned flags) {
-    assert(maps < 9 && pa == physical[maps] && size == 0x4000 && flags == VM_WIMG_IO);
+    assert(maps < (mode == 5 ? 10u : 9u) && pa == physical[maps] && size == 0x4000 && flags == VM_WIMG_IO);
     unsigned index = maps++;
     return maps == fail_map ? 0 : (uintptr_t)memory[index];
 }
@@ -77,8 +82,8 @@ static void ml_io_unmap(uintptr_t va, unsigned long size) {
     assert(va == (uintptr_t)memory[successful - ++unmaps]);
 }
 static unsigned region_index(uintptr_t address) {
-    assert(maps == 9 && !fail_map && !unmaps);
-    for (unsigned i = 0; i < 9; i++) if (address == (uintptr_t)memory[i]) return i;
+    assert(maps == (mode == 5 ? 10u : 9u) && !fail_map && !unmaps);
+    for (unsigned i = 0; i < 10; i++) if (address == (uintptr_t)memory[i]) return i;
     assert(0); return 99; /* No config/BAR/ATU/SysMMU/CMU-other mappings. */
 }
 static void powered(unsigned index) {
@@ -87,7 +92,7 @@ static void powered(unsigned index) {
     assert(memory[0][0x71c/4] & 1);
     assert(((memory[1][0x80/4] >> 20) & 15) == 1 && (memory[1][0x84/4] & 32));
     assert(((memory[2][0x20/4] >> 8) & 15) == 1);
-    if (index == 8) assert(memory[6][0xec/4] & 8); /* Every DBI read/write ignores RX idle. */
+    if (index >= 8) assert(memory[6][0xec/4] & 8); /* DBI/config accesses ignore RX idle. */
 }
 static int valid_link_setup(void) {
     for (unsigned i = 0; i < sizeof(b2l_wifi_cmn); i++)
@@ -119,9 +124,36 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
         (i == 6 && (off == 0xc || off == 0xd0 || off == 0xec || off == 0x100 || off == 0x104)) ||
         (i == 7 && (off == 0x1044 || off == 0x1050)) ||
         (i == 8 && (off == 0 || off == 4 || off == 0x44 || off == 0x7c || off == 0x80 ||
-                    off == 0xa0 || off == 0x710 || off == 0x80c || off == 0x8bc || off == 0xb40));
+                    off == 0xa0 || off == 0x710 || off == 0x80c || off == 0x8bc || off == 0xb40 ||
+                    (mode == 5 && (off == 0x0c || off == 0x18 || (off >= 0x900 && off <= 0x91c))))) ||
+        (mode == 5 && i == 9 && (off == 0x2000 || off == 0x2004 || off == 0x2008 || off == 0x202c));
     assert(allowed);
+    if (i == 8 && (off == 0x0c || off == 0x18 || (off >= 0x900 && off <= 0x91c)))
+        assert(mode == 5 && trained && valid_link_setup());
     if (i >= 5) gen1_reads++;
+    if (mode == 5 && atu_enable_write) {
+        if (i == 4 && off == 0x74 &&
+            (endpoint_fault == 5 || (endpoint_fault == 6 && endpoint_reads))) return 0;
+        if (i == 8 && off == 0x04 && endpoint_fault == 15 && atu[1]) return 6;
+        if (i == 8 && off == 0x80 && endpoint_fault == 17) return 0x120000;
+    }
+    if (i == 9) {
+        static const unsigned expected[] = { 0x2000, 0x2004, 0x2008, 0x202c };
+        assert(endpoint_reads < 4 && off == expected[endpoint_reads++]);
+        assert(trained && valid_link_setup() && now_us >= enabled_at + 100000);
+        assert(memory[8][0x900/4] == 1 && (memory[8][0x18/4] & 0xffffff) == 0x10100);
+        assert(!(memory[8][4/4] & 0x145));
+        assert(atu[0] == 4 && atu[1] == 0x80000000 && atu[2] == 0x14ffe000 &&
+            atu[3] == 0 && atu[4] == 0x14ffefff && atu[5] == 0x01000000 && atu[6] == 0);
+        if (endpoint_fault == 11) now_us += 110000;
+        if (off == 0x2000 && endpoint_fault == 1) return 0x123414e4;
+        if (off == 0x2000 && endpoint_fault == 2) return UINT32_MAX;
+        if (off == 0x2000 && endpoint_fault == 14) return 0;
+        if (off == 0x2004 && endpoint_fault == 3) return 4;
+        if (off == 0x202c && endpoint_fault == 4) return 0x000014e4;
+        if (off == 0x2008 && endpoint_fault == 13) return UINT32_MAX;
+        return memory[i][off/4];
+    }
     if (i == 4 && off == 0x74 && (memory[4][0x2c/4] & 1)) {
         link_polls++;
         if (scenario == 4) now_us += 300000; /* Preemption must not extend polling indefinitely. */
@@ -135,6 +167,11 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
         return (memory[8][off/4] & 0xffff) | ((scenario == 2 ? 2u : 1u) << 16) | (1u << 20);
     }
     if (i == 8 && off == 0 && scenario == 5) return UINT32_MAX;
+    if (i == 8 && mode == 5 && off >= 0x904 && off <= 0x91c) {
+        assert(memory[8][0x900/4] == 1); /* Never touch ATU0 or inbound regions. */
+        if (endpoint_fault == 12 && off == 0x908 && atu_enable_write && !fault_served++) return UINT32_MAX;
+        return atu[(off - 0x904)/4];
+    }
     if (i == 7 && off == 0x1050 && invalid_profile_once) {
         invalid_profile_once = 0;
         return UINT32_MAX;
@@ -164,6 +201,23 @@ static void host_write(uintptr_t address, unsigned off, uint32_t value) {
     if (i == 7 && off == 0x1044) mask = 2;
     if (i == 7 && off == 0x1050) mask = 0x10fe;
     if (i == 8) {
+        if (mode == 5 && off >= 0x904 && off <= 0x91c) {
+            assert(trained && memory[8][0x900/4] == 1 && !(memory[8][4/4] & 0x145));
+            static const uint32_t allowed[] = { 4, 0x80000000, 0x14ffe000, 0, 0x14ffefff, 0x01000000, 0 };
+            unsigned slot = (off - 0x904)/4;
+            assert(value == allowed[slot] || (off == 0x908 && value == 0));
+            writes++;
+            if (off == 0x908 && value == 0x80000000) {
+                atu_enable_write = writes;
+                enabled_at = now_us;
+            }
+            if (writes == drop_write || (endpoint_fault == 9 && off == 0x908 && value) ||
+                (endpoint_fault == 10 && off == 0x908 && !value && atu[1])) return;
+            atu[slot] = value;
+            return;
+        }
+        if (mode == 5 && off == 0x18) mask = 0xffffff;
+        if (mode == 5 && off == 0x900) { mask = UINT32_MAX; assert(value == original_viewport || value == 1); }
         if (off == 4 || off == 0x44 || off == 0x80 || off == 0xa0) {
             assert(!(value >> 16));
             if (off == 4) assert(!(value & 0x145));
@@ -200,6 +254,9 @@ post = r'''
 static void reset(unsigned which, unsigned failure) {
     maps = unmaps = writes = drop_write = link_polls = 0;
     trained = gen1_reads = log_size = invalid_profile_once = 0;
+    endpoint_reads = endpoint_fault = atu_enable_write = fault_served = 0;
+    enabled_at = 0; memset(atu, 0, sizeof(atu));
+    original_viewport = 0;
     now_us = 0; fail_map = failure; scenario = which;
     memset(memory, 0, sizeof(memory)); memset(logs, 0, sizeof(logs));
     memory[1][0x84/4] = 1;
@@ -215,6 +272,12 @@ static void reset(unsigned which, unsigned failure) {
     memory[8][0] = 0x123416c3;
     memory[8][4/4] = 0xdead0144; /* BME, parity and SERR must be cleared before training. */
     memory[8][0x44/4] = 0xbeef8003; /* PME_Status must not be acknowledged by copying it. */
+    memory[8][0x18/4] = 0xa5000000; /* Preserve the bridge latency byte. */
+    memory[8][0x0c/4] = 0x00010000; /* Type-1 bridge, not endpoint BAR2 at +0x18. */
+    memory[9][0x2000/4] = 0x447514e4;
+    memory[9][0x2004/4] = 0x00100000;
+    memory[9][0x2008/4] = 0x02800005;
+    memory[9][0x202c/4] = 0x437514e4;
 }
 static void verify_quiet(void) {
     assert(!(memory[0][0x71c/4] & 1));
@@ -229,7 +292,13 @@ static void verify_quiet(void) {
     assert(strstr(logs, "power probe restore verified"));
     if (strstr(logs, "Gen1 probe begin:"))
         assert(!(memory[4][0xc/4] | memory[4][0x10/4] | memory[4][0x14/4]));
-    assert(unmaps == 9 && now_us < 1000000 && link_polls <= 500);
+    assert(unmaps == (mode == 5 ? 10u : 9u) && now_us < 1000000 && link_polls <= 500);
+    if (mode == 5) {
+        uint32_t expected_control = endpoint_fault == 7 || endpoint_fault == 10 ? 0x80000000 : 0;
+        if (endpoint_fault == 16) expected_control = UINT32_MAX;
+        assert(atu[1] == expected_control && memory[8][0x900/4] == (endpoint_fault == 8 ? UINT32_MAX : original_viewport));
+        assert(memory[8][0x18/4] == 0xa5000000);
+    }
 }
 int main(void) {
     reset(0, 0); b2l_wifi_diag_start(); verify_quiet();
@@ -299,6 +368,43 @@ int main(void) {
         assert(now_us < 1000000 && unmaps == 9 && writes < normal_writes + 20);
     }
     puts("Gen1: exact MMIO boundaries, PHY profile, reset/power ordering, no BME/ATU/endpoint access, deadline, dropped writes and quiescence passed");
+    mode = 5;
+    reset(8, 0); b2l_wifi_diag_start(); verify_quiet();
+    assert(endpoint_reads == 4 && strstr(logs, "endpoint identity verified: 14e4:4475 subsystem 14e4:4375 PCI revision=5 class=0x28000"));
+    assert(strstr(logs, "endpoint probe end: stage=complete cleanup=verified"));
+    unsigned endpoint_writes = writes;
+    for (unsigned failure = 1; failure <= endpoint_writes; failure++) {
+        reset(8, 0); drop_write = failure; b2l_wifi_diag_start(); verify_quiet();
+        assert(endpoint_reads <= 4);
+    }
+    for (unsigned failure = 1; failure <= 10; failure++) {
+        reset(8, failure); b2l_wifi_diag_start();
+        assert(!writes && !endpoint_reads && maps == failure && unmaps == failure - 1);
+    }
+    for (unsigned fault = 1; fault <= 18; fault++) {
+        reset(8, 0); endpoint_fault = fault;
+        if (fault == 7) atu[1] = 0x80000000; /* Existing active region must not be changed. */
+        if (fault == 8) memory[8][0x900/4] = UINT32_MAX; /* Unsupported unrolled ATU. */
+        if (fault == 16) atu[1] = UINT32_MAX;
+        if (fault == 18) memory[8][0x0c/4] = 0;
+        b2l_wifi_diag_start(); verify_quiet();
+        if (fault == 1 || fault == 2 || fault == 6 || fault == 11 || fault == 14) assert(endpoint_reads == 1);
+        if (fault == 3) assert(endpoint_reads == 2);
+        if (fault == 13) assert(endpoint_reads == 3);
+        if (fault == 4 || fault == 10) assert(endpoint_reads == 4);
+        if (fault == 5 || fault == 7 || fault == 8 || fault == 9 || fault == 12 || fault == 15 || fault == 16 || fault == 17 || fault == 18)
+            assert(!endpoint_reads);
+        if (fault == 10) {
+            assert(strstr(logs, "cleanup=FAILED") && strstr(logs, "Gen1 quiesce FAILED"));
+            assert(writes < endpoint_writes + 20);
+        } else assert(!strstr(logs, "endpoint identity verified:") && strstr(logs, "Gen1 quiesce verified"));
+    }
+    reset(8, 0); original_viewport = memory[8][0x900/4] = 0x80000002;
+    b2l_wifi_diag_start(); verify_quiet();
+    assert(endpoint_reads == 4 && strstr(logs, "endpoint identity verified:"));
+    reset(1, 0); b2l_wifi_diag_start(); verify_quiet();
+    assert(link_polls == 500 && !endpoint_reads && !atu_enable_write);
+    puts("Endpoint: exact read-only CFG0 scope, ATU1/bus guards and cleanup, link/deadline checks, all mapping/dropped-write failures passed");
 }
 '''
 

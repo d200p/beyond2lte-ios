@@ -103,8 +103,8 @@ registers were one. The power restoration and interactive Home were verified.
 
 ## One Gen1 link attempt
 
-The userspace loader selects `b2l_wifi_diag=4`. After the verified power
-and ELBI checkpoints, it accepts only the observed inactive controller/reset
+`b2l_wifi_diag=4` follows the verified power and ELBI checkpoints. It accepts
+only the observed inactive controller/reset
 state and an unowned CLKREQ pad. It then uses the Exynos 9820 channel-zero
 26 MHz PHY profile and DesignWare root-port link controls for one Gen1 x1
 attempt. The first physical trial stopped during `phy-calibration`, before
@@ -117,13 +117,15 @@ training status was sampled, so the initial `last_ELBI=0` is not a measured
 link state.
 
 Samsung's channel-zero calibration writes the same profile without verifying
-its readback. The next trial preserves that write and accepts the exact
+its readback. The corrected trial preserves that write and accepts the exact
 observed baseline/write/readback triple above as a board-specific exception.
 Normal masked readback verification still applies otherwise; a different
 baseline with the same discrepancy, any other missing bit or all-ones value
 stops the probe. The exception is logged and does not apply to restoration
-or any other register. The physical meaning of bit 3 is unconfirmed; this is
-not a claim that it is read-only or that link training will succeed.
+or any other register. That trial established a Gen1 x1 link on the phone,
+followed by verified PHY shutdown, shared-state restoration and interactive
+Home. The root DBI ID was `0xa598144d`; this is not the endpoint identity.
+The physical meaning of bit 3 remains unconfirmed.
 
 Additional I/O mappings, each 16 KiB, come from this board's device tree:
 
@@ -166,6 +168,54 @@ quiescence is explicit and bounded, and does not suppress common restoration.
 Look for all three results: `Gen1 link up`, `Gen1 quiesce verified`, and
 `power probe restore verified`. Interactive Home alone does not prove a link.
 
+## Read-only endpoint identity
+
+The userspace loader now selects `b2l_wifi_diag=5`. It repeats the verified
+Gen1 sequence, then reads only CFG0 words at offsets `0x00`, `0x04`, `0x08`
+and `0x2c` for bus 1/device 0/function 0. These contain vendor/device IDs,
+command/status, PCI class/revision and subsystem IDs. The physical outcome
+of this additional checkpoint is pending.
+
+The live DT's configuration resource is `0x14ffe000`, length `0x2000`.
+Samsung splits it into 4 KiB CFG0 and CFG1 halves and uses outbound viewport
+1 for CFG0. Mode 5 maps a 16 KiB envelope at `0x14ffc000`, but accesses only
+the four words at envelope offset `0x2000` plus the offsets above. It touches
+neither the preceding memory aperture nor CFG1. Other modes do not map it.
+
+After confirmed Gen1 x1 and RX-idle bypass, it verifies a type-1 root bridge
+header and disabled root bus mastering, saves the viewport and root bus
+numbers, selects outbound ATU1, and accepts only an inactive zero control
+word. Unsupported/all-ones or occupied ATU state skips endpoint reads.
+It temporarily sets primary/secondary/subordinate buses to 0/1/1, retaining
+the latency byte, and programs only ATU1's CFG0 descriptor:
+
+| Field | Value |
+| --- | --- |
+| CPU base / limit | `0x14ffe000` / `0x14ffefff` |
+| PCI target | `0x01000000` (01:00.0) |
+| Type / enable | `4` (CFG0) / `0x80000000` |
+
+All descriptor fields are checked before one enable write, followed by at
+most five 9 ms enable checks. After a fixed 100 ms readiness interval, the
+four reads share a 100 ms deadline, with no endpoint request retries. Before
+each word, the probe checks the link, negotiated Gen1 x1, root command and
+ATU enable. A single MMIO access can still fault or exceed the software
+deadline; host tests do not prove hardware accessibility.
+
+An invalid/unexpected vendor/device ID, enabled endpoint I/O/memory/master
+command bits, invalid word or mismatched subsystem stops further reads.
+Success requires `14e4:4475` and subsystem `14e4:4375`; the PCI revision is
+logged separately and is not a backplane chip revision or firmware selection.
+The probe writes no endpoint register, BAR or command, enables no interrupt,
+programs no memory/inbound ATU region, and allocates no DMA map or firmware.
+
+On exit it disables its owned ATU1 region with checked bounded retries and
+restores root bus numbers and viewport. The disabled descriptor's programming
+bytes are retained. Cleanup failure is explicit, contributes to the Gen1
+quiescence failure result, and does not suppress the common PHY/power cleanup.
+Require `endpoint identity verified`, `endpoint probe end: stage=complete
+cleanup=verified`, `Gen1 quiesce verified` and `power probe restore verified`.
+
 ## Recovery evidence
 
 With one rooted beyond2lte in TWRP, collect cached PCI IDs, resources, driver
@@ -190,13 +240,11 @@ open; no random variant is used.
 
 ## Following checkpoints
 
-1. Validate the Gen1 link attempt and quiescence on the phone, preserving the
-   validated mode-3 BOOT as rollback.
-2. Only after a validated link, add bounded endpoint identity reads through
-   the board's configuration window, keeping bus mastering disabled.
-3. Read the endpoint and chip revision, select verified board firmware/NVRAM,
+1. Validate the bounded endpoint identity reads and CFG0/PHY/power cleanup,
+   preserving the validated Gen1 BOOT as rollback.
+2. Read the backplane chip revision, select verified board firmware/NVRAM,
    and bring up firmware with an appropriate DMA/SysMMU design.
-4. Establish scanning, authentication, packet transport and DHCP, then adapt
+3. Establish scanning, authentication, packet transport and DHCP, then adapt
    the HakiOS network and Apple80211 interfaces to this iOS release.
 
 Linux can initialize this hardware, but its driver is not a loadable XNU
@@ -228,8 +276,16 @@ failures remain explicit while common power restoration is still attempted.
 The measured SYSREG readback is replayed with the exact vendor write, including
 dropped writes throughout that path and rejection of a different baseline,
 another missing bit and invalid readback.
-The backend rejects bus-master/IRQ enabling, W1C status acknowledgement,
-CMU writes, and all ATU/endpoint/config/BAR access.
+The mode-4 backend rejects bus-master/IRQ enabling, W1C status acknowledgement,
+CMU writes, and all ATU/endpoint/config/BAR access. Mode 5 additionally verifies
+the exact ATU1 CFG0 mapping and four ordered reads, checks readiness and the
+deadline, and exercises all ten mapping failures and every dropped write.
+It rejects wrong/all-ones identities, endpoint mastering, link loss, root
+command/speed changes, a non-bridge header, occupied/unsupported ATU state and
+failed enable. Permanent ATU-disable failure remains explicit while common
+power restoration still runs. Prior viewport selection and root bus numbers
+are restored, including a previously selected inbound viewport. No endpoint
+writes, memory/inbound region programming or BAR access is permitted.
 
 ## Source references
 
