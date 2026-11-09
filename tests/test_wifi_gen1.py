@@ -45,6 +45,7 @@ static const uintptr_t physical[] = {
 };
 static unsigned maps, unmaps, fail_map, writes, drop_write, link_polls;
 static unsigned trained, scenario, gen1_reads;
+static unsigned invalid_profile_once;
 static uint64_t now_us;
 static char logs[8192];
 static unsigned log_size;
@@ -95,7 +96,7 @@ static int valid_link_setup(void) {
         if (memory[5][0x30+i] != b2l_wifi_trsv[i]) return 0;
     return (memory[2][0x24/4] & 4) && (memory[2][0x20/4] & 15) == 2 &&
         (memory[2][0x28/4] & 15) == 3 && (memory[7][0x1044/4] & 2) &&
-        (memory[7][0x1050/4] & 0x10fe) == 0x100c &&
+        (memory[7][0x1050/4] & 0x10fe) == (scenario == 8 ? 0x1004u : 0x100cu) &&
         memory[4][0x1d0/4] == 1 && memory[4][0x288/4] == 1 &&
         memory[4][0x28c/4] == 1 && memory[4][0x290/4] == 1 &&
         !(memory[4][0x0c/4] | memory[4][0x10/4] | memory[4][0x14/4]) &&
@@ -134,6 +135,10 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
         return (memory[8][off/4] & 0xffff) | ((scenario == 2 ? 2u : 1u) << 16) | (1u << 20);
     }
     if (i == 8 && off == 0 && scenario == 5) return UINT32_MAX;
+    if (i == 7 && off == 0x1050 && invalid_profile_once) {
+        invalid_profile_once = 0;
+        return UINT32_MAX;
+    }
     return memory[i][off/4];
 }
 static void host_write(uintptr_t address, unsigned off, uint32_t value) {
@@ -180,14 +185,21 @@ static void host_write(uintptr_t address, unsigned off, uint32_t value) {
     writes++;
     if (scenario == 6 && i == 4 && off == 0x2c && before == 1 && value == 0) return;
     if (scenario == 7 && i == 5 && off == 0x80 && value == 0xc1) return;
-    if (writes != drop_write) memory[i][off/4] = value;
+    if (writes != drop_write) {
+        memory[i][off/4] = value;
+        if (i == 7 && off == 0x1050 && value == 0x1d0c) {
+            if (scenario == 8 || scenario == 9) memory[i][off/4] &= ~8u;
+            if (scenario == 10) memory[i][off/4] &= ~4u;
+            if (scenario == 11) invalid_profile_once = 1;
+        }
+    }
 }
 '''
 
 post = r'''
 static void reset(unsigned which, unsigned failure) {
     maps = unmaps = writes = drop_write = link_polls = 0;
-    trained = gen1_reads = log_size = 0;
+    trained = gen1_reads = log_size = invalid_profile_once = 0;
     now_us = 0; fail_map = failure; scenario = which;
     memset(memory, 0, sizeof(memory)); memset(logs, 0, sizeof(logs));
     memory[1][0x84/4] = 1;
@@ -199,6 +211,7 @@ static void reset(unsigned which, unsigned failure) {
     memory[4][0x18/4] = 0x12; memory[4][0xf4/4] = 0x20;
     memory[4][0x1b8/4] = 0x80; memory[4][0x2c8/4] = 0xaaaa0555;
     memory[7][0x1044/4] = 0x8040; memory[7][0x1050/4] = 0x80000101;
+    if (which >= 8 && which <= 11) memory[7][0x1050/4] = which == 9 ? 0x1d82 : 0x1d02;
     memory[8][0] = 0x123416c3;
     memory[8][4/4] = 0xdead0144; /* BME, parity and SERR must be cleared before training. */
     memory[8][0x44/4] = 0xbeef8003; /* PME_Status must not be acknowledged by copying it. */
@@ -208,7 +221,9 @@ static void verify_quiet(void) {
     assert(memory[1][0x80/4] == 0 && memory[1][0x84/4] == 1);
     assert(!memory[2][0x20/4] && !memory[2][0x24/4] && !memory[2][0x28/4]);
     assert(!(memory[4][0x2c/4] & 1));
-    assert(memory[7][0x1044/4] == 0x8040 && memory[7][0x1050/4] == 0x80000101);
+    uint32_t original_lane = scenario >= 8 && scenario <= 11 ?
+        (scenario == 9 ? 0x1d82 : 0x1d02) : 0x80000101;
+    assert(memory[7][0x1044/4] == 0x8040 && memory[7][0x1050/4] == original_lane);
     assert(memory[4][0x18/4] == 0x12 && memory[4][0xf4/4] == 0x20);
     assert(memory[4][0x1b8/4] == 0x80 && memory[4][0x2c8/4] == 0xaaaa0555);
     assert(strstr(logs, "power probe restore verified"));
@@ -261,6 +276,21 @@ int main(void) {
         }
     }
     assert(bits_diagnostic && reset_diagnostic && pci_diagnostic);
+    /* Replay the exact hardware mismatch, keeping the vendor write of 0x1d0c.
+     * A different baseline, another missing bit or all-ones readback must stop. */
+    reset(8, 0); b2l_wifi_diag_start(); verify_quiet();
+    assert(strstr(logs, "Gen1 link up:") && strstr(logs, "Gen1 quiesce verified"));
+    assert(strstr(logs, "observed board readback before=0x1d02 wrote=0x1d0c got=0x1d04"));
+    unsigned board_writes = writes;
+    for (unsigned failure = 1; failure <= board_writes; failure++) {
+        reset(8, 0); drop_write = failure; b2l_wifi_diag_start(); verify_quiet();
+    }
+    for (unsigned fault = 9; fault <= 11; fault++) {
+        reset(fault, 0); b2l_wifi_diag_start(); verify_quiet();
+        assert(!link_polls && !strstr(logs, "Gen1 root DBI ID="));
+        assert(strstr(logs, "PHY SYSREG profile mismatch"));
+        assert(strstr(logs, "stage=phy-calibration polls=0") && strstr(logs, "Gen1 quiesce verified"));
+    }
     for (unsigned fault = 6; fault <= 7; fault++) {
         reset(fault, 0); b2l_wifi_diag_start();
         assert(strstr(logs, "Gen1 quiesce FAILED") && strstr(logs, "power probe restore verified"));

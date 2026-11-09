@@ -109,11 +109,21 @@ state and an unowned CLKREQ pad. It then uses the Exynos 9820 channel-zero
 26 MHz PHY profile and DesignWare root-port link controls for one Gen1 x1
 attempt. The first physical trial stopped during `phy-calibration`, before
 root DBI setup or link training. PHY power-down, shared-state restoration and
-interactive Home were verified. The failed register check remains unidentified;
-the next trial logs its address, mask, previous value, readback and expected
-masked value without changing the sequence or relaxing a check. The stop line
-also reports the number of link-status polls: zero means no training status
-was sampled, so the initial `last_ELBI=0` is not a measured link state.
+interactive Home were verified. The diagnostic follow-up identified SYSREG
+`0x13c11050`: baseline `0x1d02`, vendor write `0x1d0c`, readback `0x1d04`.
+It also stopped before training, with verified restoration and interactive
+Home. The stop line reports the number of link-status polls: zero means no
+training status was sampled, so the initial `last_ELBI=0` is not a measured
+link state.
+
+Samsung's channel-zero calibration writes the same profile without verifying
+its readback. The next trial preserves that write and accepts the exact
+observed baseline/write/readback triple above as a board-specific exception.
+Normal masked readback verification still applies otherwise; a different
+baseline with the same discrepancy, any other missing bit or all-ones value
+stops the probe. The exception is logged and does not apply to restoration
+or any other register. The physical meaning of bit 3 is unconfirmed; this is
+not a claim that it is read-only or that link training will succeed.
 
 Additional I/O mappings, each 16 KiB, come from this board's device tree:
 
@@ -215,6 +225,9 @@ source PHY table hashes, Gen1 success, timeout, preemption/deadline behavior,
 unexpected speed, invalid DBI data, inactive-state rejection, every mapping
 failure and a dropped write at every position. Permanent LTSSM/PHY cleanup
 failures remain explicit while common power restoration is still attempted.
+The measured SYSREG readback is replayed with the exact vendor write, including
+dropped writes throughout that path and rejection of a different baseline,
+another missing bit and invalid readback.
 The backend rejects bus-master/IRQ enabling, W1C status acknowledgement,
 CMU writes, and all ATU/endpoint/config/BAR access.
 

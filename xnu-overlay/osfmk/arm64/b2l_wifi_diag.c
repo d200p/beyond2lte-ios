@@ -72,6 +72,32 @@ wifi_restore_bits(const struct wifi_region *region, unsigned offset, uint32_t ma
     return -1;
 }
 
+/* Samsung writes this channel-zero profile without checking its readback.
+ * Epoch 53 measured 0x1d02 -> write 0x1d0c -> read 0x1d04 on this board.
+ * Preserve that exact vendor write; accept only the exact observed exception,
+ * not a general waiver for bit 3 or a claim that the bit is read-only. */
+static int
+wifi_phy_sysreg_profile(const struct wifi_region *sysreg)
+{
+    uint32_t before = wifi_read(sysreg, 0x1050);
+    if (before == UINT32_MAX) {
+        wlog("PHY SYSREG profile invalid initial read\n");
+        return -1;
+    }
+    uint32_t next = (before & ~0xfeu) | 0x0cu;
+    if (next != before) wifi_write(sysreg, 0x1050, next);
+    uint32_t checked = wifi_read(sysreg, 0x1050);
+    if (checked != UINT32_MAX && (checked & 0xfeu) == 0x0c) return 0;
+    if (before == 0x1d02 && next == 0x1d0c && checked == 0x1d04) {
+        wlog("PHY SYSREG profile: observed board readback before=%#x wrote=%#x got=%#x\n",
+            before, next, checked);
+        return 0;
+    }
+    wlog("PHY SYSREG profile mismatch before=%#x wrote=%#x got=%#x mask=0xfe want=0xc\n",
+        before, next, checked);
+    return -1;
+}
+
 /* PCI configuration control is in the low half-word. Write zero to status
  * bits in the high half, and to PME_Status (W1C) in the PMCSR low half. */
 static int
@@ -156,7 +182,7 @@ wifi_gen1_probe(struct wifi_region *regions)
     stage = "phy-calibration";
     if (wifi_bits(elbi, 0xf4, 0x11, 0x11) || wifi_bits(elbi, 0x1b8, 3, 2) ||
         wifi_bits(elbi, 0x2c8, 0xfff, 0) || wifi_bits(sysreg, 0x1044, 2, 2) ||
-        wifi_bits(sysreg, 0x1050, 0xfe, 0x0c) ||
+        wifi_phy_sysreg_profile(sysreg) ||
         wifi_bits(sysreg, 0x1050, 0x1000, 0x1000) || wifi_reset_pulse(elbi, 0x288, 10))
         goto out;
     for (unsigned i = 0; i < sizeof(b2l_wifi_cmn); i++) wifi_write(phy, i * 4, b2l_wifi_cmn[i]);
