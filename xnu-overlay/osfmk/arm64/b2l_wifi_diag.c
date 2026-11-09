@@ -138,6 +138,10 @@ wifi_endpoint_identity(struct wifi_region *regions)
 {
     const struct wifi_region *elbi = &regions[4], *dbi = &regions[8], *cfg = &regions[9];
     static const unsigned offsets[] = { 0x00, 0x04, 0x08, 0x2c };
+    static const struct { unsigned off; uint32_t value; } descriptor[] = {
+        { 0x90c, 0x14ffe000 }, { 0x910, 0 }, { 0x914, 0x14ffefff },
+        { 0x918, 0x01000000 }, { 0x91c, 0 }, { 0x904, 4 },
+    };
     uint32_t words[4] = { 0 }, viewport = wifi_read(dbi, 0x900);
     uint32_t buses = wifi_read(dbi, 0x18);
     uint32_t header = wifi_read(dbi, 0x0c), initial_command = wifi_read(dbi, 0x04);
@@ -160,13 +164,19 @@ wifi_endpoint_identity(struct wifi_region *regions)
     atu_owned = 1;
     buses_changed = 1;
     stage = "cfg0-programming";
-    if (wifi_bits(dbi, 0x18, 0xffffff, 0x010100) ||
-        wifi_bits(dbi, 0x90c, UINT32_MAX, 0x14ffe000) ||
-        wifi_bits(dbi, 0x910, UINT32_MAX, 0) ||
-        wifi_bits(dbi, 0x914, UINT32_MAX, 0x14ffefff) ||
-        wifi_bits(dbi, 0x918, UINT32_MAX, 0x01000000) ||
-        wifi_bits(dbi, 0x91c, UINT32_MAX, 0) ||
-        wifi_bits(dbi, 0x904, UINT32_MAX, 4)) goto out;
+    if (wifi_bits(dbi, 0x18, 0xffffff, 0x010100)) goto out;
+    /* Own all descriptor bits while disabled. Like Samsung, write full words;
+     * an old address/limit of all ones is data, not a failed RMW prerequisite.
+     * Every requested new word is non-all-ones and must read back exactly. */
+    for (unsigned i = 0; i < sizeof(descriptor) / sizeof(descriptor[0]); i++) {
+        wifi_write(dbi, descriptor[i].off, descriptor[i].value);
+        uint32_t checked = wifi_read(dbi, descriptor[i].off);
+        if (checked != descriptor[i].value) {
+            wlog("endpoint ATU1 mismatch off=%#x got=%#x want=%#x\n",
+                descriptor[i].off, checked, descriptor[i].value);
+            goto out;
+        }
+    }
     /* DesignWare enable readback: one write and at most five 9 ms waits. */
     wifi_write(dbi, 0x908, 0x80000000);
     int enabled = 0;

@@ -195,6 +195,8 @@ the latency byte, and programs only ATU1's CFG0 descriptor:
 | PCI target | `0x01000000` (01:00.0) |
 | Type / enable | `4` (CFG0) / `0x80000000` |
 
+Descriptor words are written in full while disabled and read back exactly;
+old all-ones address/limit contents are data rather than an RMW prerequisite.
 All descriptor fields are checked before one enable write, followed by at
 most five 9 ms enable checks. After a fixed 100 ms readiness interval, the
 four reads share a 100 ms deadline, with no endpoint request retries. Before

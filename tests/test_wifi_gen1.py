@@ -170,6 +170,7 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
     if (i == 8 && mode == 5 && off >= 0x904 && off <= 0x91c) {
         assert(memory[8][0x900/4] == 1); /* Never touch ATU0 or inbound regions. */
         if (endpoint_fault == 12 && off == 0x908 && atu_enable_write && !fault_served++) return UINT32_MAX;
+        if (endpoint_fault == 19 && off == 0x914) return UINT32_MAX;
         return atu[(off - 0x904)/4];
     }
     if (i == 7 && off == 0x1050 && invalid_profile_once) {
@@ -381,7 +382,7 @@ int main(void) {
         reset(8, failure); b2l_wifi_diag_start();
         assert(!writes && !endpoint_reads && maps == failure && unmaps == failure - 1);
     }
-    for (unsigned fault = 1; fault <= 18; fault++) {
+    for (unsigned fault = 1; fault <= 19; fault++) {
         reset(8, 0); endpoint_fault = fault;
         if (fault == 7) atu[1] = 0x80000000; /* Existing active region must not be changed. */
         if (fault == 8) memory[8][0x900/4] = UINT32_MAX; /* Unsupported unrolled ATU. */
@@ -392,7 +393,7 @@ int main(void) {
         if (fault == 3) assert(endpoint_reads == 2);
         if (fault == 13) assert(endpoint_reads == 3);
         if (fault == 4 || fault == 10) assert(endpoint_reads == 4);
-        if (fault == 5 || fault == 7 || fault == 8 || fault == 9 || fault == 12 || fault == 15 || fault == 16 || fault == 17 || fault == 18)
+        if (fault == 5 || fault == 7 || fault == 8 || fault == 9 || fault == 12 || fault == 15 || fault == 16 || fault == 17 || fault == 18 || fault == 19)
             assert(!endpoint_reads);
         if (fault == 10) {
             assert(strstr(logs, "cleanup=FAILED") && strstr(logs, "Gen1 quiesce FAILED"));
@@ -400,6 +401,9 @@ int main(void) {
         } else assert(!strstr(logs, "endpoint identity verified:") && strstr(logs, "Gen1 quiesce verified"));
     }
     reset(8, 0); original_viewport = memory[8][0x900/4] = 0x80000002;
+    b2l_wifi_diag_start(); verify_quiet();
+    assert(endpoint_reads == 4 && strstr(logs, "endpoint identity verified:"));
+    reset(8, 0); atu[0] = atu[2] = atu[3] = atu[4] = atu[5] = atu[6] = UINT32_MAX;
     b2l_wifi_diag_start(); verify_quiet();
     assert(endpoint_reads == 4 && strstr(logs, "endpoint identity verified:"));
     reset(1, 0); b2l_wifi_diag_start(); verify_quiet();
