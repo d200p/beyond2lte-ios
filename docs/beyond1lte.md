@@ -1,8 +1,29 @@
 # Galaxy S10 (beyond1lte) board support
 
-Status: **not built in CI and never booted on an S10.** The hardware-equality
-claims come from device trees and source code. The memory evidence comes from a
-real S10 in TWRP. Nothing has been written to that phone.
+Status: **diagnostic profile boots on a real S10 (2026-11-09).** The firmware and
+kernel came from CI run 42695735637 on commit `9a3071b`, and the BOOT image sha256 is `d931b528…fe4ee`. The
+handset is an SM-G973F/DS with bootloader `G973FXXUHHXJ1` (binary 17). The iOS
+userspace profile has not been tried.
+
+## First hardware boot (diagnostic profile)
+
+Observed on the panel (photos kept privately by the owner):
+
+1. Binary-17 S-Boot accepted the BOOT image. BootShim, the generated `beyond1ltePkg` UEFI and XnuLoader handed off to XNU.
+2. SMP: CPU1–7 reached secondary stages 17/18; `timer and remote xcall verified`
+   on CPU0–7; Edge scheduler psets for clusters 0/1/2 (M4 > A75 > A55);
+   `B2L CPU: 8/8 CPUs initialized, per-CPU timer and bidirectional SGI1 verified`.
+3. BSD/IOKit init: Skywalk self-tests passed; HFS `hfs-715.120.4` registered.
+4. Native UFS on the S10: contiguous DMA verified, LUN 0 `capacity=31236096`
+   blocks of 4096 bytes (128 GB), `/dev/b2lufs0` ready **read-only**, primary+backup GPT CRC verified (31
+   partitions), `system` p25 recognised as ext4-family read-only.
+5. As the diagnostic profile requires (`rd=b2l-diagnostic`, `b2l_root_rw=0`,
+   `b2l_system_log=0`), no root device of that name exists. IOKit waits for it, then panics with
+   `Failed to mount root device @IOKitBSDInit.cpp:963` and the panic path ends
+   in `spinning forever`. This is the expected end of a diagnostic boot, not a fault.
+
+No partition other than BOOT was written. Touch and buttons were not exercised:
+the diagnostic profile starts no userspace.
 
 ## Why the S10 can reuse the S10+ port
 
@@ -112,11 +133,8 @@ unmodified upstream tree. The causes are Windows-only: reopening a
 
 ## Open risks
 
-* **Bootloader binary 17.** Mu-Silicium's S10 page states binary 16 is required.
-  This handset has 17, and Samsung bootloaders cannot be downgraded. S-Boot, the
-  EL2 hypervisor (U-H) and EL3 behaviour were measured on the S10+ with binary 16.
-  The first diagnostic BOOT test will show whether binary 17 accepts the UEFI image.
-  Recovery stays intact, so a failed boot is undone by restoring BOOT from TWRP.
+* **Bootloader binary 17:** resolved for the diagnostic path. Mu-Silicium's S10 page
+  says binary 16 is required, but binary 17 boots the UEFI image, and XNU runs on all 8 CPUs.
 * The touch and MAX77705 drivers are expected to work unchanged. The panel
   coordinate range (4096x4096) and the S10's smaller 6.1-inch panel have not
   been checked on hardware.
