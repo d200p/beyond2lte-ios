@@ -17,6 +17,7 @@ extern "C" {
 }
 extern "C" void b2l_hid_key(int,int);
 extern "C" void b2l_hid_touch(int,int,int,int);
+extern "C" void b2l_native_cache_input_activity(void);
 class B2LInput : public IOService {
     OSDeclareDefaultStructors(B2LInput);
     IOMemoryDescriptor *gpioDesc,*i2cDesc;
@@ -194,6 +195,7 @@ void B2LInput::poll(OSObject *owner,IOTimerEventSource *sender){
             ++s->eventCount;
             if(B2LSecTsParseEvent(events[0],&s->pointer)==B2LSecTsUpdated){
                 ++s->updateCount;
+                b2l_native_cache_input_activity();
                 b2l_hid_touch(0,s->pointer.Active,s->pointer.X,s->pointer.Y);
             }
             unsigned remaining=B2LSecTsRemainingEvents(events[0]);
@@ -206,6 +208,7 @@ void B2LInput::poll(OSObject *owner,IOTimerEventSource *sender){
                     ++s->eventCount;
                     if(B2LSecTsParseEvent(events[i],&s->pointer)==B2LSecTsUpdated){
                         ++s->updateCount;
+                        b2l_native_cache_input_activity();
                         b2l_hid_touch(0,s->pointer.Active,s->pointer.X,s->pointer.Y);
                     }
                 }

@@ -79,6 +79,9 @@ jobs:
           python3 tests/test_ufs_disk.py xnu --overlay
           python3 tests/test_boot_policy.py xnu
           python3 tests/test_early_console.py xnu
+          python3 tests/test-input-poll.py
+          bash scripts/test-native-cache.sh
+          python3 tests/test-native-cache-workers.py
           bash scripts/test-ufs-transport.sh
           bash scripts/ci/kernel.sh build 2>&1 | tee -a out/ci-logs/kernel.log
       - name: Upload diagnostic reports
@@ -114,6 +117,7 @@ jobs:
         run: |
           mkdir -p out/ci-logs
           set -o pipefail
+          LLVM_MC=/usr/bin/llvm-mc-18 python3 tests/test_cache_fastpaths.py --require-llvm
           bash scripts/ci/firmware.sh 2>&1 | tee out/ci-logs/firmware.log
       - name: Upload firmware reports
         if: always()

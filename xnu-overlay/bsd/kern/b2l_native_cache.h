@@ -6,4 +6,5 @@
 void b2l_native_cache_storage(const struct b2l_io*,const uint8_t[12]);
 void b2l_native_cache_before_init(void);
 void b2l_native_cache_observe(uint64_t,uint32_t);
+void b2l_native_cache_input_activity(void);
 #endif

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the actual B2LInput::poll body with a scripted sec_ts bus and real parser."""
 from pathlib import Path
-import subprocess,tempfile
+import os,shlex,subprocess,tempfile
 root=Path(__file__).resolve().parents[1];arm=root/'xnu-overlay/iokit/Kernel/arm'
 s=(arm/'B2LInput.cpp').read_text();body=s[s.index('void B2LInput::poll('):s.index('void B2LInput::stop(')]
 pre=r'''
@@ -20,6 +20,8 @@ struct OSObject{};
 struct IOTimerEventSource{unsigned ms=0;void setTimeoutMS(unsigned n){ms=n;}};
 static uint64_t tick=1;
 static std::vector<std::tuple<int,int,int,int>> delivered;
+static unsigned activity_hints;
+void b2l_native_cache_input_activity(){activity_hints++;}
 void b2l_hid_key(int,int){}
 void b2l_hid_touch(int f,int d,int x,int y){delivered.emplace_back(f,d,x,y);}
 void IOLog(const char*,...){}
@@ -58,7 +60,7 @@ public:
 post=r'''
 int main(){
  IOTimerEventSource timer;
- {B2LInput s;s.add(0x60,{Event{}});B2LInput::poll(&s,&timer);assert(s.next==1&&!s.eventCount&&timer.ms==20);}
+ {B2LInput s;unsigned before=activity_hints;s.add(0x60,{Event{}});B2LInput::poll(&s,&timer);assert(s.next==1&&!s.eventCount&&timer.ms==20&&activity_hints==before);}
  // Deferred retry runs after its deadline and preserves the GPIO/poll cadence.
  {B2LInput s;s.touch=false;s.initPending=true;s.nextInitUS=tick+1000000;
   B2LInput::poll(&s,&timer);assert(!s.initCalls&&s.initPending&&timer.ms==20);
@@ -66,12 +68,13 @@ int main(){
   assert(s.initCalls==1&&s.touch&&!s.initPending&&s.next==1&&timer.ms==20);
  }
  // Preserve a press, 30 moves and release in chronological order using 2 bus commands.
- {B2LInput s;delivered.clear();std::vector<Event> bulk;
+ {B2LInput s;delivered.clear();std::vector<Event> bulk;unsigned before=activity_hints;
   s.add(0x60,{event(1,100,200,31)});
   for(unsigned i=0;i<30;i++)bulk.push_back(event(2,101+i,201+i,30-i));
   bulk.push_back(event(3,140,240,0));s.add(0x61,bulk);
   B2LInput::poll(&s,&timer);assert(s.next==2&&s.eventCount==32&&s.updateCount==32&&s.bulkCount==1);
   assert(delivered.size()==32&&std::get<1>(delivered.front())==1&&std::get<1>(delivered.back())==0);
+  assert(activity_hints==before+32);
   assert(std::get<2>(delivered[1])==101&&std::get<2>(delivered[30])==130&&!s.pointer.Active);
  }
  // 63 remaining is legitimate backlog: bounded 248-byte bulk, no clear/reset/drop.
@@ -98,7 +101,7 @@ int main(){
 '''
 with tempfile.TemporaryDirectory(prefix='b2l-input-poll-') as td:
  p=Path(td);(p/'test.cpp').write_text(pre+body+post)
- subprocess.run(['clang','-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I',str(arm),'-c',str(arm/'B2LSecTsParser.c'),'-o',str(p/'parser.o')],check=True)
- subprocess.run(['clang++','-std=c++17','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I',str(arm),str(p/'test.cpp'),str(p/'parser.o'),'-o',str(p/'test')],check=True)
+ subprocess.run(shlex.split(os.environ.get('CC','clang'))+['-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I',str(arm),'-c',str(arm/'B2LSecTsParser.c'),'-o',str(p/'parser.o')],check=True)
+ subprocess.run(shlex.split(os.environ.get('CXX','clang++'))+['-std=c++17','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I',str(arm),str(p/'test.cpp'),str(p/'parser.o'),'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True)
 print('actual poll + real parser: FIFO ordering, 32-record bound, 63 backlog, partial failure, cutoff, timing PASS')

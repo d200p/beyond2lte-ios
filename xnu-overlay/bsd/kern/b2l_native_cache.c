@@ -8,6 +8,7 @@
 #include "b2l_cache_core.h"
 #include "b2l_nc_store.h"
 #include "b2l_nc_undo.h"
+#include "b2l_cache_activity.h"
 #include <sys/fcntl.h>
 #include <kern/kalloc.h>
 #include "b2l_cache_exclusion.h"
@@ -72,6 +73,12 @@ static vnode_t undo_vp;
 static uint8_t undo_record[B2L_NC_COPY],reclaim_zero[B2L_NC_COPY];
 static uint64_t reclaimed,undo_restored;
 static int reclaim_disabled;
+static uint64_t interactive_deadline,interactive_window,interactive_pauses;
+
+void b2l_native_cache_input_activity(void){
+ if(__atomic_load_n(&ready,__ATOMIC_ACQUIRE)&&interactive_window)
+  b2l_cache_activity_note(&interactive_deadline,mach_absolute_time(),interactive_window);
+}
 
 
 static int enabled(void){int v=0;return b2l_arm64e_compat_enabled()&&PE_parse_boot_argn("b2l_native_cache",&v,sizeof(v))&&v==1;}
@@ -270,7 +277,15 @@ static void worker(void*arg,wait_result_t why __unused){
  b2l_early_trace("B2L NCACHE: worker=%u joined IO-storage thread group (A75 preference)\n",w->id);
  nanoseconds_to_deadline(30*NSEC_PER_SEC,&report_at);
  for(;;){struct request q;unsigned budget=32;
-  while(budget--&&cache_dequeue(&q)){
+  /* Yield outside every VM, VFS, commit and disk lock while a gesture and
+   * its immediate response are active. Existing durable commits complete;
+   * queued requests stay intact and resume after the monotonic deadline. */
+  if(b2l_cache_activity_active(&interactive_deadline,mach_absolute_time())){
+   __atomic_fetch_add(&interactive_pauses,1,__ATOMIC_RELAXED);
+   assert_wait_timeout((event_t)&queue,THREAD_UNINT,10,NSEC_PER_MSEC);
+   thread_block(THREAD_CONTINUE_NULL);continue;
+  }
+  while(budget--&&!b2l_cache_activity_active(&interactive_deadline,mach_absolute_time())&&cache_dequeue(&q)){
    unsigned n=__atomic_add_fetch(&active,1,__ATOMIC_RELAXED),peak=__atomic_load_n(&peak_active,__ATOMIC_RELAXED);
    while(n>peak&&!__atomic_compare_exchange_n(&peak_active,&peak,n,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED)){}
    unsigned cpu=(unsigned)cpu_number();if(cpu<32)__atomic_fetch_or(&w->cpu_mask,1u<<cpu,__ATOMIC_RELAXED);
@@ -279,13 +294,14 @@ static void worker(void*arg,wait_result_t why __unused){
   }
   if(!w->id&&mach_absolute_time()>=report_at){
    uint32_t cpus=0;for(unsigned i=0;i<CACHE_WORKERS;i++)cpus|=__atomic_load_n(&workers[i].cpu_mask,__ATOMIC_RELAXED);
-   b2l_early_trace("B2L NCACHE: queued=%llu learned=%llu applied=%llu skipped=%llu dropped=%llu errors=%llu pending=%u active=%u peak=%u workers=%u cpus=0x%x w0=%llu w1=%llu w2=%llu w3=%llu\n",
+   b2l_early_trace("B2L NCACHE: queued=%llu learned=%llu applied=%llu skipped=%llu dropped=%llu errors=%llu pending=%u active=%u peak=%u workers=%u cpus=0x%x w0=%llu w1=%llu w2=%llu w3=%llu interactive_pauses=%llu\n",
     __atomic_load_n(&queued,__ATOMIC_RELAXED),__atomic_load_n(&learned,__ATOMIC_RELAXED),applied,
     __atomic_load_n(&skipped,__ATOMIC_RELAXED),__atomic_load_n(&dropped,__ATOMIC_RELAXED),__atomic_load_n(&failures,__ATOMIC_RELAXED),
     __atomic_load_n(&pending,__ATOMIC_RELAXED),__atomic_load_n(&active,__ATOMIC_RELAXED),__atomic_load_n(&peak_active,__ATOMIC_RELAXED),
     __atomic_load_n(&worker_count,__ATOMIC_ACQUIRE),cpus,
     __atomic_load_n(&workers[0].processed,__ATOMIC_RELAXED),__atomic_load_n(&workers[1].processed,__ATOMIC_RELAXED),
-    __atomic_load_n(&workers[2].processed,__ATOMIC_RELAXED),__atomic_load_n(&workers[3].processed,__ATOMIC_RELAXED));
+    __atomic_load_n(&workers[2].processed,__ATOMIC_RELAXED),__atomic_load_n(&workers[3].processed,__ATOMIC_RELAXED),
+    __atomic_load_n(&interactive_pauses,__ATOMIC_RELAXED));
    nanoseconds_to_deadline(30*NSEC_PER_SEC,&report_at);
   }
   /* Register the wait before rechecking published queue depth: an enqueue
@@ -361,6 +377,11 @@ void b2l_native_cache_before_init(void){
  printf("B2L NCACHE: pre-init %s applied=%llu already=%llu skipped=%llu; journal replay completed by HFS\n",restore==1?"restore":"apply",applied,already,skipped);
  printf("B2L NCACHE: corecrypto measured text original; excluded=%llu restored=%llu words; other translations retained\n",integrity_excluded,integrity_restored);
  if(restore==1||failures)return;
+ int interactive=0;(void)PE_parse_boot_argn("b2l_cache_interactive",&interactive,sizeof(interactive));
+ if(interactive==1){
+  nanoseconds_to_absolutetime(750*NSEC_PER_MSEC,&interactive_window);
+  printf("B2L NCACHE: gesture priority enabled; learning pauses for 750 ms after input\n");
+ }
  int count=CACHE_WORKERS;(void)PE_parse_boot_argn("b2l_cache_workers",&count,sizeof(count));
  if(count<1||count>(int)CACHE_WORKERS)count=CACHE_WORKERS;
  for(unsigned i=0;i<(unsigned)count;i++){

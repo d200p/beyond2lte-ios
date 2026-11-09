@@ -1,13 +1,16 @@
 /* SPDX-License-Identifier: BSD-2-Clause
  * Observed-instruction cache for the opt-in stripped-pointer development ABI.
- * This converter deliberately excludes PACGA, LDRA and unknown instructions.
+ * PACGA stays excluded. Selected LDRA encodings have a single ordinary-load
+ * equivalent in this existing stripped-pointer ABI; SP and ambiguous forms
+ * stay in the emulator. Unknown instructions are never converted.
  */
 #include "b2l_cache_core.h"
+#include "b2l_nc_crc.h"
 uint32_t b2l_nc_u32(const uint8_t*p){return (uint32_t)p[0]|(uint32_t)p[1]<<8|(uint32_t)p[2]<<16|(uint32_t)p[3]<<24;}
 uint64_t b2l_nc_u64(const uint8_t*p){return b2l_nc_u32(p)|(uint64_t)b2l_nc_u32(p+4)<<32;}
 void b2l_nc_p32(uint8_t*p,uint32_t v){for(unsigned i=0;i<4;i++)p[i]=(uint8_t)(v>>(8*i));}
 void b2l_nc_p64(uint8_t*p,uint64_t v){for(unsigned i=0;i<8;i++)p[i]=(uint8_t)(v>>(8*i));}
-uint32_t b2l_nc_crc(const void*v,size_t n){const uint8_t*p=v;uint32_t c=~0u;while(n--){c^=*p++;for(unsigned j=0;j<8;j++)c=(c>>1)^(0xedb88320u&-(c&1u));}return ~c;}
+uint32_t b2l_nc_crc(const void*v,size_t n){const uint8_t*p=v;uint32_t c=~0u;while(n--)c=b2l_nc_crc_byte(c,*p++);return ~c;}
 int b2l_nc_native(uint32_t i,uint32_t*out){
  if(!out)return 0;
  if((i&0xffffe000u)==0xdac10000u||(i&0xffffe3e0u)==0xdac123e0u||
@@ -24,6 +27,20 @@ int b2l_nc_native(uint32_t i,uint32_t*out){
   *out=((i&0x200000u)?0xd63f0000u:0xd61f0000u)|(rn<<5);return 1;
  }
  if((i&0x3ffffc00u)==0x38bfc000u){*out=(i&0xc00003ffu)|0x08dffc00u;return 1;}
+ if((i&0xff200400u)==0xf8200400u){
+  unsigned rn=(i>>5)&31u,rd=i&31u,wb=(i>>11)&1u;
+  unsigned imm=((i>>12)&511u)|((i>>13)&512u);
+  int offset=(imm>=512u?(int)imm-1024:(int)imm)*8;
+  /* Preserve the emulator's rejection of overlapping writeback. Leave SP
+   * forms alone rather than assuming hardware SP-alignment configuration. */
+  if(rn==31u||(wb&&rn==rd))return 0;
+  if(!wb&&offset>=0){
+   *out=0xf9400000u|((unsigned)(offset/8)<<10)|(rn<<5)|rd;return 1;
+  }
+  if(offset>=-256&&offset<=255){
+   *out=0xf8400000u|(((unsigned)offset&511u)<<12)|(wb?0xc00u:0)|(rn<<5)|rd;return 1;
+  }
+ }
  return 0;
 }
 uint64_t b2l_nc_header_bytes(const uint8_t*h){return b2l_nc_u32(h+8)==1?b2l_nc_u32(h+12):b2l_nc_u64(h+36);}
@@ -82,7 +99,7 @@ int b2l_nc_record(const uint8_t*r){
   if(x!=y){if(i+4>len||!b2l_nc_native(x,&z)||z!=y)return -1;changes++;}}
  if(!changes||changes!=b2l_nc_u32(r+132))return -1;
  /* CRC covers every byte, with the CRC field represented as zero. */
- uint32_t crc=~0u;for(unsigned i=0;i<B2L_NC_COPY;i++){crc^=(i>=128&&i<132)?0:r[i];for(unsigned j=0;j<8;j++)crc=(crc>>1)^(0xedb88320u&-(crc&1u));}
+ uint32_t crc=~0u;for(unsigned i=0;i<B2L_NC_COPY;i++)crc=b2l_nc_crc_byte(crc,(i>=128&&i<132)?0:r[i]);
  return ~crc==b2l_nc_u32(r+128)?0:-1;
 }
 int b2l_nc_select(const uint8_t*c,const uint8_t**out){
