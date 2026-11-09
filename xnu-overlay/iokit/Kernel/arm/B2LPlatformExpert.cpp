@@ -8,6 +8,32 @@
 #include <IOKit/IOLib.h>
 #include <libkern/c++/OSData.h>
 #include <pexpert/pexpert.h>
+#include <IOKit/IORegistryEntry.h>
+#include <IOKit/IOService.h>
+extern "C" void b2l_early_trace(const char *fmt, ...);
+/* configd's InterfaceNamer logs "timed out waiting for IOKit to quiesce" and
+ * SystemConfiguration clients (Settings) wait on it. Report the root busy
+ * state and every busy service so the holder can be identified. Read-only. */
+extern "C" void
+b2l_iokit_busy_report(void)
+{
+	IOService *root = IOService::getServiceRoot();
+	if (!root) return;
+	uint32_t busy = root->getBusyState();
+	b2l_early_trace("B2L IOKIT: root busy=%u\n", busy);
+	if (!busy) return;
+	IORegistryIterator *it = IORegistryIterator::iterateOver(gIOServicePlane, kIORegistryIterateRecursively);
+	if (!it) return;
+	unsigned listed = 0;
+	while (IORegistryEntry *e = it->getNextObject()) {
+		IOService *s = OSDynamicCast(IOService, e);
+		if (!s || !s->getBusyState() || listed >= 24) continue;
+		listed++;
+		b2l_early_trace("B2L IOKIT: busy=%u state=0x%llx %s (%s) depth=%u\n", s->getBusyState(),
+		    (unsigned long long)s->getState(), s->getName(), s->getMetaClass()->getClassName(), e->getDepth(gIOServicePlane));
+	}
+	it->release();
+}
 
 class B2LPlatformExpert : public IODTPlatformExpert {
 	OSDeclareDefaultStructors(B2LPlatformExpert);

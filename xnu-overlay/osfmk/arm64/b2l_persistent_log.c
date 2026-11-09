@@ -12,6 +12,7 @@
 static struct b2l_log_ring console_ring;
 extern void b2l_fb_swap_snapshot(uint64_t out[4]);
 extern void b2l_acpm_dvfs_snapshot(int32_t temps[4], uint32_t sent_khz[3]);
+extern void b2l_iokit_busy_report(void);
 /* Estimate the current CPU's core clock from a dependent add chain of
  * 1,048,576 single-cycle instructions timed by the generic timer. No PMU or
  * clock-management register is touched. The value is the clock of whichever
@@ -65,6 +66,7 @@ static void b2l_log_worker(void*argument __unused,wait_result_t result __unused)
             int32_t temps[4];uint32_t sent[3];b2l_acpm_dvfs_snapshot(temps,sent);
             b2l_early_trace("B2L FRAMES: swaps=%llu max_gap_ms=%llu gaps_over_2s=%llu temps=%d/%d/%d/%d sent_mhz=%u/%u/%u\n",
                 swaps[0],gap_ns/1000000,swaps[2],temps[0],temps[1],temps[2],temps[3],sent[0]/1000,sent[1]/1000,sent[2]/1000);
+            b2l_iokit_busy_report();
         }
         assert_wait_timeout((event_t)&disk_writer,THREAD_UNINT,5,NSEC_PER_SEC);
         thread_block(THREAD_CONTINUE_NULL);

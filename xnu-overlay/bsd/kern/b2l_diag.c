@@ -33,8 +33,8 @@ static int progress_role(void)
     int r=-1;
     if(!strcmp(p->p_comm,"SpringBoard"))r=0;
     else if(!strcmp(p->p_comm,"backboardd"))r=1;
-    else if(!strncmp(p->p_comm,"containermanage",14))r=2;
-    else if(!strcmp(p->p_comm,"lsd"))r=3;
+    else if(!strcmp(p->p_comm,"Preferences"))r=2;   /* Settings: main thread stuck in SCNetworkInterfaceCopyAll? */
+    else if(!strcmp(p->p_comm,"configd"))r=3;       /* InterfaceNamer: IOKit quiesce / network stack waits */
     else if(!strcmp(p->p_comm,"assetsd"))r=4;
     else if(!strcmp(p->p_comm,"tccd"))r=5;
     if(r<0)return -1;
@@ -116,7 +116,7 @@ static void progress_note(int r,unsigned event,uint64_t a,uint64_t b,uint64_t c,
 void b2l_diag_progress(void)
 {
     int requested=0;PE_parse_boot_argn("b2l_diag",&requested,sizeof(requested));if(requested!=1)return;
-    static const char *const names[]={"SpringBoard","backboardd","container","lsd","assetsd","tccd"};
+    static const char *const names[]={"SpringBoard","backboardd","Preferences","configd","assetsd","tccd"};
     uint64_t now=progress_seconds();unsigned records=0,busy=0;
     for(unsigned r=0;r<B2L_PROGRESS_ROLES;r++)for(unsigned i=0;i<B2L_PROGRESS_SLOTS;i++){
         struct progress_slot *p=&progress_slots[r][i],q={0};bool valid=false;
