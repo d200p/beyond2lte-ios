@@ -104,7 +104,7 @@ static unsigned maps, unmapped, reads, fail_map;
 static unsigned writes, drop_write, permanent_drop, delays_ms, poison_once_after_write;
 static unsigned controller_reads;
 static int mode;
-static char logs[4096];
+static char logs[8192];
 static unsigned log_size;
 static uint64_t host_time_us;
 static uint64_t mach_absolute_time(void) { return host_time_us; }

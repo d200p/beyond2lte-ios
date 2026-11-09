@@ -48,11 +48,18 @@ static int
 wifi_bits(const struct wifi_region *region, unsigned offset, uint32_t mask, uint32_t value)
 {
     uint32_t before = wifi_read(region, offset);
-    if (before == UINT32_MAX) return -1;
+    if (before == UINT32_MAX) {
+        wlog("bits invalid read pa=%#lx off=%#x mask=%#x\n",
+            (unsigned long)region->physical, offset, mask);
+        return -1;
+    }
     uint32_t after = (before & ~mask) | (value & mask);
     if (after != before) wifi_write(region, offset, after);
     uint32_t checked = wifi_read(region, offset);
-    return checked != UINT32_MAX && (checked & mask) == (value & mask) ? 0 : -1;
+    if (checked != UINT32_MAX && (checked & mask) == (value & mask)) return 0;
+    wlog("bits mismatch pa=%#lx off=%#x mask=%#x before=%#x got=%#x want=%#x\n",
+        (unsigned long)region->physical, offset, mask, before, checked, value & mask);
+    return -1;
 }
 
 static int
@@ -76,7 +83,10 @@ wifi_control16(const struct wifi_region *dbi, unsigned off, uint32_t mask, uint3
     if (off == 0x44) next &= ~0x8000u;
     wifi_write(dbi, off, next);
     uint32_t checked = wifi_read(dbi, off);
-    return checked != UINT32_MAX && (checked & mask) == (value & mask) ? 0 : -1;
+    if (checked != UINT32_MAX && (checked & mask) == (value & mask)) return 0;
+    wlog("PCI control mismatch off=%#x mask=%#x before=%#x got=%#x want=%#x\n",
+        off, mask, before, checked, value & mask);
+    return -1;
 }
 
 static int
@@ -85,7 +95,10 @@ wifi_reset_pulse(const struct wifi_region *elbi, unsigned off, unsigned final_us
     wifi_write(elbi, off, 1); delay(10);
     wifi_write(elbi, off, 0); delay(10);
     wifi_write(elbi, off, 1); delay(final_us);
-    return wifi_read(elbi, off) == 1 ? 0 : -1;
+    uint32_t value = wifi_read(elbi, off);
+    if (value == 1) return 0;
+    wlog("reset pulse mismatch off=%#x got=%#x want=1\n", off, value);
+    return -1;
 }
 
 static void
@@ -100,6 +113,7 @@ wifi_gen1_probe(struct wifi_region *regions)
     uint32_t clock_mux, clock_pull, hs, lane, idle;
     uint32_t ro_before = 0, link = 0, status = 0;
     int ro_changed = 0, dbi_ready = 0, trained = 0, cleanup_failed = 0;
+    unsigned polls = 0;
     const char *stage = "pins-and-power";
     /* Accept the inactive controller/reset state verified in epoch 51. */
     if (wifi_read(elbi, 0x2c) != 0 || (wifi_read(elbi, 0x74) & 31u) != 0 ||
@@ -151,10 +165,10 @@ wifi_gen1_probe(struct wifi_region *regions)
     if (wifi_bits(pcs, 0x0c, 0x12, 0x10) || wifi_reset_pulse(elbi, 0x290, 10) ||
         wifi_reset_pulse(elbi, 0x28c, 100)) goto out;
     uint32_t cdr = wifi_read(pcs, 0xd0);
-    if (cdr == UINT32_MAX) goto out;
+    if (cdr == UINT32_MAX) { wlog("Gen1 CDR initial read invalid\n"); goto out; }
     wifi_write(pcs, 0xd0, cdr | 0xc0); delay(20);
     cdr = wifi_read(pcs, 0xd0);
-    if (cdr == UINT32_MAX) goto out;
+    if (cdr == UINT32_MAX) { wlog("Gen1 CDR pulse read invalid\n"); goto out; }
     wifi_write(pcs, 0xd0, (cdr & ~0xc0u) | 0x80); wifi_write(pcs, 0xd0, cdr & ~0xc0u);
     if (wifi_bits(elbi, 0x18, 2, 0)) goto out; /* Enable bus-number handling; no ATU. */
     stage = "root-dbi";
@@ -191,6 +205,7 @@ wifi_gen1_probe(struct wifi_region *regions)
     clock_interval_to_deadline(500, NSEC_PER_MSEC, &deadline);
     for (unsigned tick = 0; tick < 500 && mach_absolute_time() < deadline; tick++) {
         link = wifi_read(elbi, 0x74);
+        polls++;
         if (link == UINT32_MAX) break;
         unsigned state = link & 31u;
         if (state >= 0x0d && state <= 0x14) {
@@ -208,7 +223,7 @@ wifi_gen1_probe(struct wifi_region *regions)
     wlog("Gen1 link %s: ELBI=%#x speed=%u lanes=%u; endpoint/DMA/firmware untouched\n",
         trained ? "up" : "not established", link, (status >> 16) & 15u, (status >> 20) & 63u);
 out:
-    if (!trained) wlog("Gen1 probe stopped: stage=%s ELBI=%#x\n", stage, link);
+    if (!trained) wlog("Gen1 probe stopped: stage=%s polls=%u last_ELBI=%#x\n", stage, polls, link);
     /* Assert endpoint reset, stop training and force the vendor PHY power-down
      * state before the caller re-isolates and removes WLAN power. Internal
      * PHY/DBI programming is retained, not claimed to match S-Boot bytewise. */

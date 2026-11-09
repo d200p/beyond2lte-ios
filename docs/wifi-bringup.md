@@ -103,11 +103,17 @@ registers were one. The power restoration and interactive Home were verified.
 
 ## One Gen1 link attempt
 
-The next userspace loader selects `b2l_wifi_diag=4`. After the verified power
+The userspace loader selects `b2l_wifi_diag=4`. After the verified power
 and ELBI checkpoints, it accepts only the observed inactive controller/reset
 state and an unowned CLKREQ pad. It then uses the Exynos 9820 channel-zero
 26 MHz PHY profile and DesignWare root-port link controls for one Gen1 x1
-attempt. The physical outcome is pending.
+attempt. The first physical trial stopped during `phy-calibration`, before
+root DBI setup or link training. PHY power-down, shared-state restoration and
+interactive Home were verified. The failed register check remains unidentified;
+the next trial logs its address, mask, previous value, readback and expected
+masked value without changing the sequence or relaxing a check. The stop line
+also reports the number of link-status polls: zero means no training status
+was sampled, so the initial `last_ELBI=0` is not a measured link state.
 
 Additional I/O mappings, each 16 KiB, come from this board's device tree:
 

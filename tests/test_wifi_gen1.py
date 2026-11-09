@@ -243,10 +243,24 @@ int main(void) {
     assert(!(memory[1][0x84/4] & 32) && unmaps == 9);
     /* A lost write anywhere, including cleanup, must not leave power/reset or
      * root bus mastering enabled. Training requires all actual PHY values. */
+    unsigned bits_diagnostic = 0, reset_diagnostic = 0, pci_diagnostic = 0;
     for (unsigned failure = 1; failure <= normal_writes; failure++) {
         reset(0, 0); drop_write = failure; b2l_wifi_diag_start(); verify_quiet();
         if (strstr(logs, "Gen1 root DBI ID=")) assert(!(memory[8][4/4] & 4));
+        if (strstr(logs, "bits mismatch pa=0x13ed0000 off=0xf4 mask=0x11 before=0x20 got=0x20 want=0x11")) {
+            bits_diagnostic++;
+            assert(strstr(logs, "stage=phy-calibration polls=0 last_ELBI=0"));
+        }
+        if (strstr(logs, "reset pulse mismatch off=0x288 got=0 want=1")) {
+            reset_diagnostic++;
+            assert(strstr(logs, "stage=phy-calibration polls=0 last_ELBI=0"));
+        }
+        if (strstr(logs, "PCI control mismatch off=0x4 mask=0x147 before=0xdead0144 got=0xdead0144 want=0x2")) {
+            pci_diagnostic++;
+            assert(strstr(logs, "stage=root-policy polls=0 last_ELBI=0"));
+        }
     }
+    assert(bits_diagnostic && reset_diagnostic && pci_diagnostic);
     for (unsigned fault = 6; fault <= 7; fault++) {
         reset(fault, 0); b2l_wifi_diag_start();
         assert(strstr(logs, "Gen1 quiesce FAILED") && strstr(logs, "power probe restore verified"));
