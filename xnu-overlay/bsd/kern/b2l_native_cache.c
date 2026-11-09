@@ -75,9 +75,12 @@ static uint64_t reclaimed,undo_restored;
 static int reclaim_disabled;
 static uint64_t interactive_deadline,interactive_window,interactive_pauses;
 
+extern uint64_t b2l_dvfs_touch_at;
 void b2l_native_cache_input_activity(void){
+ uint64_t now=mach_absolute_time();
+ __atomic_store_n(&b2l_dvfs_touch_at,now,__ATOMIC_RELAXED);
  if(__atomic_load_n(&ready,__ATOMIC_ACQUIRE)&&interactive_window)
-  b2l_cache_activity_note(&interactive_deadline,mach_absolute_time(),interactive_window);
+  b2l_cache_activity_note(&interactive_deadline,now,interactive_window);
 }
 
 

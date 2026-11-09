@@ -10,6 +10,8 @@
 #include <kern/cpu_data.h>
 #include <mach/mach_time.h>
 static struct b2l_log_ring console_ring;
+extern void b2l_fb_swap_snapshot(uint64_t out[4]);
+extern void b2l_acpm_dvfs_snapshot(int32_t temps[4], uint32_t sent_khz[3]);
 /* Estimate the current CPU's core clock from a dependent add chain of
  * 1,048,576 single-cycle instructions timed by the generic timer. No PMU or
  * clock-management register is touched. The value is the clock of whichever
@@ -59,6 +61,10 @@ static void b2l_log_worker(void*argument __unused,wait_result_t result __unused)
             unsigned cpu=0;uint64_t mhz=b2l_cpu_mhz_sample(&cpu);
             b2l_early_trace("B2L LIVE: traps=%llu done=%llu pid=%llu pc=0x%llx flush_errors=%llu last_error=%d sec=%llu pacga=%s cpu=%u mhz=%llu\n",
                 v[0],v[1],v[2],v[3],__atomic_load_n(&flush_failures,__ATOMIC_RELAXED),__atomic_load_n(&last_error,__ATOMIC_RELAXED),ns/1000000000,b2l_arm64e_pacga_name(),cpu,mhz);
+            uint64_t swaps[4];b2l_fb_swap_snapshot(swaps);uint64_t gap_ns=0;absolutetime_to_nanoseconds(swaps[1],&gap_ns);
+            int32_t temps[4];uint32_t sent[3];b2l_acpm_dvfs_snapshot(temps,sent);
+            b2l_early_trace("B2L FRAMES: swaps=%llu max_gap_ms=%llu gaps_over_2s=%llu temps=%d/%d/%d/%d sent_mhz=%u/%u/%u\n",
+                swaps[0],gap_ns/1000000,swaps[2],temps[0],temps[1],temps[2],temps[3],sent[0]/1000,sent[1]/1000,sent[2]/1000);
         }
         assert_wait_timeout((event_t)&disk_writer,THREAD_UNINT,5,NSEC_PER_SEC);
         thread_block(THREAD_CONTINUE_NULL);

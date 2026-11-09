@@ -210,6 +210,29 @@ get32(const uint8_t *p, uint32_t off)
 }
 
 static uint32_t b2l_fb_swaps_logged;
+/* Presentation telemetry for the LIVE reporter: swaps, the longest gap between
+ * two swaps since the last snapshot and how many gaps exceeded two seconds. */
+static uint64_t b2l_fb_swap_count, b2l_fb_swap_last_abs, b2l_fb_swap_max_gap_abs, b2l_fb_swap_long_gaps;
+extern "C" void
+b2l_fb_swap_snapshot(uint64_t out[4])
+{
+	out[0] = __atomic_load_n(&b2l_fb_swap_count, __ATOMIC_RELAXED);
+	out[1] = __atomic_exchange_n(&b2l_fb_swap_max_gap_abs, 0, __ATOMIC_RELAXED);
+	out[2] = __atomic_load_n(&b2l_fb_swap_long_gaps, __ATOMIC_RELAXED);
+	out[3] = __atomic_load_n(&b2l_fb_swap_last_abs, __ATOMIC_RELAXED);
+}
+static void
+b2l_fb_swap_note(void)
+{
+	uint64_t now = mach_absolute_time(), last = __atomic_exchange_n(&b2l_fb_swap_last_abs, now, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&b2l_fb_swap_count, 1, __ATOMIC_RELAXED);
+	if (last && now > last) {
+		uint64_t gap = now - last, two_seconds = 0, max = __atomic_load_n(&b2l_fb_swap_max_gap_abs, __ATOMIC_RELAXED);
+		nanoseconds_to_absolutetime(2 * NSEC_PER_SEC, &two_seconds);
+		while (gap > max && !__atomic_compare_exchange_n(&b2l_fb_swap_max_gap_abs, &max, gap, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {}
+		if (gap > two_seconds) __atomic_fetch_add(&b2l_fb_swap_long_gaps, 1, __ATOMIC_RELAXED);
+	}
+}
 
 /* Copy each enabled layer's surface into the panel memory (no scaling). */
 void
@@ -220,6 +243,7 @@ AppleCLCD::swap(const uint8_t *rec)
 	 * SwapBegin. Reading it silently discarded every native CPU frame. */
 	uint32_t mask = get32(rec, 0x14c);
 	uint32_t disabled = get32(rec, 0x150);
+	b2l_fb_swap_note();
 	static unsigned records;
 	if (__atomic_fetch_add(&records, 1, __ATOMIC_RELAXED) < 32) {
 		b2l_diag_record("B2L FB RECORD: swap=%u updated=0x%x disabled=0x%x ids=%u,%u,%u,%u\n",

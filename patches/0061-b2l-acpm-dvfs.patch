@@ -1,0 +1,22 @@
+Subject: [PATCH] Register the Exynos 9820 ACPM DVFS driver in the osfmk build
+
+The driver is an owned overlay source (osfmk/arm64/b2l_acpm_dvfs.c). It is
+scalar-only like the other B2L osfmk objects.
+---
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -135,3 +135,5 @@
+ 
+ osfmk/arm64/b2l_log_core.c optional b2l
+ osfmk/arm64/b2l_persistent_log.c optional b2l
++
++osfmk/arm64/b2l_acpm_dvfs.c optional b2l
+--- a/osfmk/conf/Makefile.template
++++ b/osfmk/conf/Makefile.template
+@@ -527,3 +527,6 @@
+ 
+ # First-panic framebuffer and checkpoint formatter must not borrow SIMD.
+ b2l_early.o_CFLAGS_ADD += -mgeneral-regs-only
++
++# ACPM mailbox client and load governor run from a kernel thread; scalar only.
++b2l_acpm_dvfs.o_CFLAGS_ADD += -mgeneral-regs-only
