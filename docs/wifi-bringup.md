@@ -48,7 +48,7 @@ registered. A completed snapshot means only that this limited checkpoint ran.
 
 ## Temporary power-path checkpoint
 
-The next userspace loader selects `b2l_wifi_diag=2`. It first takes the same
+`b2l_wifi_diag=2` first takes the same
 snapshot, then accepts only the measured idle pin/isolation state and exact
 clock words above. Any mismatch skips the active part without writes.
 
@@ -69,8 +69,35 @@ This mode changes only the two GPIO mux fields, their data bits and PMU PHY
 isolation bit zero. It changes no clocks, regulators, PHY calibration or
 controller state, reads no ELBI/DBI/config/BAR, and enables no link, DMA,
 firmware or network service. Successful GPIO/register readback is not proof
-that the chip booted firmware or established a PCIe link. Physical validation
-of this active mode is pending.
+that the chip booted firmware or established a PCIe link. This mode completed
+on the phone in epoch 49: `power probe readback passed` and
+`power probe restore verified`, followed by user-confirmed menu interaction.
+The subsequent short epoch 50 contains only early boot; decode all retained
+epochs to find the actual long test session.
+
+## Controller status checkpoint
+
+The next userspace loader selects `b2l_wifi_diag=3`. This repeats the guarded
+power probe and, only after successful power/reset/isolation readback and the
+201 ms delay, reads six channel-zero ELBI registers. ELBI is mapped at
+`0x13ed0000`, length 16 KiB, but remains unread if shared-state validation or
+the power probe fails. Failure to map it stops before any register sampling.
+
+| ELBI offset | Samsung driver name / purpose |
+| --- | --- |
+| `0x02c` | APP_LTSSM_ENABLE |
+| `0x074` | ELBI_RDLH_LINKUP |
+| `0x1d0` | SOFT_CORE_RESET |
+| `0x288` | PCS global reset |
+| `0x28c` | PHY PCS/PMA reset |
+| `0x290` | MAC reset |
+
+An all-ones value stops further controller reads. Power/isolation/pin
+restoration runs after either success or a failed ELBI readback. This mode
+writes no controller register and accesses no PHY, PCS, DBI, configuration
+window, BAR or endpoint. No link training, IRQ, DMA, firmware or network
+interface is enabled. Completion establishes only ELBI register accessibility
+under the tested conditions. Physical validation of mode 3 is pending.
 
 ## Recovery evidence
 
@@ -96,8 +123,8 @@ open; no random variant is used.
 
 ## Following checkpoints
 
-1. Validate the temporary power-path checkpoint and verified restoration on
-   the phone, preserving the validated read-only BOOT as rollback.
+1. Validate the controller status checkpoint and restoration on the phone,
+   preserving the validated mode-2 BOOT as rollback.
 2. Port channel-zero pin control, clock, PHY calibration and reset
    sequencing from the Exynos 9820 sources. Confirm a bounded Gen1 link before
    configuration transactions. Keep DMA/bus mastering disabled during identity
@@ -120,7 +147,10 @@ mapping failures at every position, reverse cleanup, pin decoding, an invalid
 register and unchanged simulated memory in mode 1. Mode 2 tests preserve
 unrelated pin/PMU bits, drop every write in turn, reject all-ones readback,
 exercise unexpected baseline states and bound persistent restoration failure.
-Recovery tests exercise wrong-device
+Mode 3 additionally checks the exact ELBI read allowlist and requires asserted
+reset, power/bypass readback and the delay before every controller read. It
+tests all-ones controller words, rejected power/clock state and failed mapping
+with cleanup, and permits no controller writes. Recovery tests exercise wrong-device
 and ambiguous-device rejection, PCI parsing, private output and no overwrite.
 These host checks cannot prove hardware register accessibility or Wi-Fi support.
 

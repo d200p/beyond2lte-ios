@@ -97,10 +97,11 @@ typedef uintptr_t vm_offset_t;
 typedef unsigned long vm_size_t;
 #define VM_WIMG_IO 0x66
 #define NSEC_PER_MSEC 1000000u
-static _Alignas(16384) uint32_t memory[4][4096];
-static const uintptr_t physical[] = {0x15860000, 0x10430000, 0x13c40000, 0x13c00000};
+static _Alignas(16384) uint32_t memory[5][4096];
+static const uintptr_t physical[] = {0x15860000, 0x10430000, 0x13c40000, 0x13c00000, 0x13ed0000};
 static unsigned maps, unmapped, reads, fail_map;
 static unsigned writes, drop_write, permanent_drop, delays_ms, poison_once_after_write;
+static unsigned controller_reads;
 static int mode;
 static char logs[4096];
 static unsigned log_size;
@@ -120,7 +121,7 @@ static int PE_parse_boot_argn(const char *name, void *value, unsigned size) {
     *(uint32_t *)value = (uint32_t)mode; return 1;
 }
 static uintptr_t ml_io_map_unmappable(uintptr_t address, unsigned long size, unsigned flags) {
-    assert(maps < 4 && address == physical[maps] && size == 0x4000 && flags == VM_WIMG_IO);
+    assert(maps < (mode == 3 ? 5u : 4u) && address == physical[maps] && size == 0x4000 && flags == VM_WIMG_IO);
     unsigned i = maps++;
     return maps == fail_map ? 0 : (uintptr_t)memory[i];
 }
@@ -130,14 +131,23 @@ static void ml_io_unmap(uintptr_t address, unsigned long size) {
     assert(address == (uintptr_t)memory[successful - ++unmapped]);
 }
 static uint32_t host_read(uintptr_t address, unsigned offset) {
-    assert(maps == 4 && !fail_map && !unmapped && !(offset & 3));
-    for (unsigned i = 0; i < 4; i++) if (address == (uintptr_t)memory[i]) {
+    assert(maps == (mode == 3 ? 5u : 4u) && !fail_map && !unmapped && !(offset & 3));
+    for (unsigned i = 0; i < 5; i++) if (address == (uintptr_t)memory[i]) {
         int allowed = (i == 0 && offset == 0x71c) ||
             (i == 1 && (offset == 0x80 || offset == 0x84)) ||
             (i == 2 && (offset == 0x20 || offset == 0x24)) ||
             (i == 3 && ((offset >= 0x2030 && offset <= 0x2044) ||
-                        (offset >= 0x3034 && offset <= 0x3044)));
+                        (offset >= 0x3034 && offset <= 0x3044))) ||
+            (i == 4 && (offset == 0x2c || offset == 0x74 || offset == 0x1d0 ||
+                        offset == 0x288 || offset == 0x28c || offset == 0x290));
         assert(allowed); reads++;
+        if (i == 4) {
+            assert(mode == 3 && delays_ms >= 201);
+            assert(memory[0][0x71c/4] & 1);
+            assert(((memory[1][0x80/4] >> 20) & 15) == 1 && (memory[1][0x84/4] & 32));
+            assert(((memory[2][0x20/4] >> 8) & 15) == 1 && !(memory[2][0x24/4] & 4));
+            controller_reads++;
+        }
         if (poison_once_after_write && writes == poison_once_after_write) {
             poison_once_after_write = 0; return UINT32_MAX;
         }
@@ -146,7 +156,7 @@ static uint32_t host_read(uintptr_t address, unsigned offset) {
     assert(0); return 0;
 }
 static void host_write(uintptr_t address, unsigned offset, uint32_t value) {
-    assert(maps == 4 && !fail_map && !unmapped && !(offset & 3));
+    assert(maps == (mode == 3 ? 5u : 4u) && !fail_map && !unmapped && !(offset & 3));
     for (unsigned i = 0; i < 3; i++) if (address == (uintptr_t)memory[i]) {
         uint32_t mask = 0;
         if (i == 0 && offset == 0x71c) mask = 1;
@@ -166,11 +176,11 @@ static void host_write(uintptr_t address, unsigned offset, uint32_t value) {
     post = r'''
 static void reset(int requested, unsigned fail) {
     mode = requested; fail_map = fail; maps = unmapped = reads = log_size = 0;
-    writes = drop_write = permanent_drop = delays_ms = poison_once_after_write = 0;
+    writes = drop_write = permanent_drop = delays_ms = poison_once_after_write = controller_reads = 0;
     memset(memory, 0, sizeof(memory)); memset(logs, 0, sizeof(logs));
 }
 int main(void) {
-    const int disabled[] = {-1, 0, 3, -2};
+    const int disabled[] = {-1, 0, 4, 5, -2};
     for (unsigned i = 0; i < sizeof(disabled)/sizeof(disabled[0]); i++) {
         reset(disabled[i], 0); b2l_wifi_diag_start();
         assert(!maps && !reads && !writes && !unmapped && strstr(logs, "disabled"));
@@ -183,7 +193,7 @@ int main(void) {
     memory[0][0x71c/4] = 1;
     memory[1][0x80/4] = 1u << 20; memory[1][0x84/4] = 1u << 5;
     memory[2][0x20/4] = (1u << 8) | 2u; memory[2][0x24/4] = 5;
-    uint32_t before[4][4096]; memcpy(before, memory, sizeof(before));
+    uint32_t before[5][4096]; memcpy(before, memory, sizeof(before));
     b2l_wifi_diag_start();
     assert(maps == 4 && unmapped == 4 && reads == 16 && !writes && !memcmp(before, memory, sizeof(before)));
     assert(strstr(logs, "isolation_bypass=1; WLAN_REG_ON function=1 level=1"));
@@ -238,6 +248,29 @@ int main(void) {
     assert(unmapped == 4 && strstr(logs, "power probe restore FAILED"));
     assert(writes <= 20 && delays_ms <= 220); /* Failed cleanup is bounded and explicit. */
     puts("Wi-Fi power probe: owned-bit writes, failure rollback, busy-state guards and bounded cleanup passed");
+    for (unsigned scenario = 0; scenario < 6; scenario++) {
+        reset(3, 0);
+        for (unsigned off = 0x2030; off <= 0x2044; off += 4) memory[3][off/4] = 0x200000;
+        for (unsigned off = 0x3034; off <= 0x3044; off += 4) memory[3][off/4] = 0x3f0002;
+        if (scenario == 1) memory[4][0x2c/4] = UINT32_MAX;
+        if (scenario == 2) memory[4][0x1d0/4] = UINT32_MAX;
+        if (scenario == 3) drop_write = 3;
+        if (scenario == 4) memory[3][0x203c/4] = 0;
+        if (scenario == 5) fail_map = 5;
+        memcpy(before, memory, sizeof(before));
+        b2l_wifi_diag_start();
+        assert(!memcmp(before, memory, sizeof(before)));
+        assert(maps == 5 && unmapped == (scenario == 5 ? 4u : 5u));
+        if (!scenario) assert(controller_reads == 6 && writes == 8 && strstr(logs, "ELBI snapshot complete"));
+        if (scenario == 1 || scenario == 2) {
+            assert(controller_reads == (scenario == 1 ? 1u : 3u));
+            assert(strstr(logs, "ELBI snapshot failed") && !strstr(logs, "ELBI snapshot complete"));
+        }
+        if (scenario >= 3) assert(!controller_reads);
+        if (scenario >= 4) assert(!writes);
+        if (scenario < 4) assert(strstr(logs, "power probe restore verified"));
+    }
+    puts("ELBI snapshot: powered/reset prerequisites, fixed read allowlist, no controller writes and failure cleanup passed");
 }
 '''
     with tempfile.TemporaryDirectory(prefix='b2l-wifi-') as temporary:

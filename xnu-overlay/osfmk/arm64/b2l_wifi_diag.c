@@ -3,8 +3,10 @@
  *
  * b2l_wifi_diag=1 samples shared PMU, GPIO and CMU registers once, read only.
  * b2l_wifi_diag=2 additionally pulses WLAN power with PERST held low, tests
- * PHY isolation bypass readback, then restores the owned bits. Neither mode
- * accesses the PCIe controller/config/BAR, firmware or network registration.
+ * PHY isolation bypass readback, then restores the owned bits.
+ * b2l_wifi_diag=3 additionally reads six controller ELBI status/reset words
+ * during that pulse. It writes no controller register, trains no link and
+ * accesses no PHY/PCS/DBI/config/BAR, firmware or network registration.
  * A powered PHY alone does not establish that DBI/ELBI accesses are safe.
  * All addresses/offsets are sourced in docs/wifi-bringup.md.
  */
@@ -59,7 +61,23 @@ wifi_restore_bits(const struct wifi_region *region, unsigned offset, uint32_t ma
 }
 
 static void
-wifi_power_probe(struct wifi_region regions[4])
+wifi_controller_snapshot(const struct wifi_region *elbi)
+{
+    static const unsigned offsets[] = { 0x02c, 0x074, 0x1d0, 0x288, 0x28c, 0x290 };
+    wlog("ELBI snapshot begin: PERST held low, PHY bypass verified; read only\n");
+    for (unsigned i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+        uint32_t value = wifi_read(elbi, offsets[i]);
+        wlog("ELBI +%#x raw=%#x\n", offsets[i], value);
+        if (value == UINT32_MAX) {
+            wlog("ELBI snapshot failed: all-ones register; stopping controller reads\n");
+            return;
+        }
+    }
+    wlog("ELBI snapshot complete; no controller writes, link training or endpoint access\n");
+}
+
+static void
+wifi_power_probe(struct wifi_region *regions, uint32_t mode)
 {
     const uint32_t wlan_function = 15u << 20, wlan_level = 1u << 5;
     const uint32_t reset_function = 15u << 8, reset_level = 1u << 2;
@@ -106,7 +124,8 @@ wifi_power_probe(struct wifi_region regions[4])
                 (wifi_read(&regions[1], 0x84) & wlan_level) == 0;
         }
     }
-    wlog("power probe readback %s; controller remains unprobed\n", failed ? "failed" : "passed");
+    wlog("power probe readback %s\n", failed ? "failed" : "passed");
+    if (!failed && mode == 3) wifi_controller_snapshot(&regions[4]);
     /* Re-isolate before powering down. Restore data while pads are still
      * outputs, then restore mux fields. Attempt every restoration on failure. */
     int restore_failed = 0;
@@ -127,17 +146,20 @@ b2l_wifi_diag_start(void)
         { 0x10430000, 0, 0x4000 }, /* PERIC0 GPIO: GPG0-5 WLAN_REG_ON */
         { 0x13c40000, 0, 0x4000 }, /* FSYS1 GPIO: GPF2-0 CLKREQ, GPF2-2 PERST */
         { 0x13c00000, 0, 0x4000 }, /* CMU_FSYS1, shared with booted UFS */
+        { 0x13ed0000, 0, 0x4000 }, /* PCIe0 ELBI, mode 3 only */
     };
     static const unsigned gates[] = { 0x2030, 0x2034, 0x2038, 0x203c, 0x2040, 0x2044 };
     static const unsigned qch[] = { 0x3034, 0x3038, 0x303c, 0x3040, 0x3044 };
-    unsigned count = sizeof(regions) / sizeof(regions[0]);
+    unsigned count = 4;
 
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 2) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 3) {
         wlog("diagnostic disabled; no MMIO access\n");
         return;
     }
+    if (mode == 3) count = sizeof(regions) / sizeof(regions[0]);
     /* Map every shared block before reading any of them. Release all mappings
-     * even when an allocation fails. No controller region is ever mapped. */
+     * even when an allocation fails. Mode 3 also maps ELBI, but cannot read it
+     * until the verified power/reset/isolation sequence has completed. */
     for (unsigned i = 0; i < count; i++) {
         regions[i].mapped = ml_io_map_unmappable(regions[i].physical,
             regions[i].size, VM_WIMG_IO);
@@ -174,7 +196,7 @@ b2l_wifi_diag_start(void)
         wlog("CMU QCH +%#x raw=%#x\n", qch[i], value);
     }
     wlog("snapshot complete; PCI identity, firmware and Wi-Fi remain unprobed\n");
-    if (mode == 2) wifi_power_probe(regions);
+    if (mode >= 2) wifi_power_probe(regions, mode);
 out:
     for (unsigned i = count; i > 0; i--) {
         if (regions[i - 1].mapped)
