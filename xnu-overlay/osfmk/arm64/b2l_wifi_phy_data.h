@@ -2,7 +2,7 @@
  * Exynos 9820 channel-zero 26 MHz PHY register values.
  * Hardware configuration facts from Samsung pci-exynos9820_cal.c at
  * a412cfaf86b980ce35cae96a35f678c8ea551575; source SHA-256:
- * c1382c136896e153ab56d1b55450e81699179aded0e85c544294ce0e1e1f48a6.
+ * e92d93dd28ade44e3661cb76a1de61d49722383c5d1d36a057fd1af446b3e09a.
  * See docs/wifi-bringup.md. No Exynos 990 or channel-one values.
  */
 #ifndef B2L_WIFI_PHY_DATA_H
