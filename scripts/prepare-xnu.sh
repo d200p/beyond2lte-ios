@@ -74,7 +74,8 @@ python3 "$repo_root/scripts/apply-board-patches.py" "$xnu_path" \
   "$repo_root/patches/0059-b2l-typed-critical-exit.patch" \
   "$repo_root/patches/0060-b2l-bounded-rtc-wait-and-boot-timing.patch" \
   "$repo_root/patches/0061-b2l-acpm-dvfs.patch" \
-  "$repo_root/patches/0062-b2l-platform-error-fault-detail.patch"
+  "$repo_root/patches/0062-b2l-platform-error-fault-detail.patch" \
+  "$repo_root/patches/0063-b2l-wifi-shared-block-diagnostic.patch"
 # New files have separate provenance and are kept as an overlay.
 while IFS= read -r -d '' source_file; do
   relative="${source_file#"$repo_root/xnu-overlay/"}"

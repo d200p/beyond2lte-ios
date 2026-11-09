@@ -1,0 +1,22 @@
+Subject: [PATCH] Register the opt-in Wi-Fi shared-block snapshot
+
+The first checkpoint deliberately does not map the PCIe controller. Sources
+and its limited meaning are documented in docs/wifi-bringup.md.
+---
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -137,3 +137,5 @@
+ osfmk/arm64/b2l_persistent_log.c optional b2l
+ 
+ osfmk/arm64/b2l_acpm_dvfs.c optional b2l
++
++osfmk/arm64/b2l_wifi_diag.c optional b2l
+--- a/osfmk/conf/Makefile.template
++++ b/osfmk/conf/Makefile.template
+@@ -530,3 +530,6 @@
+ 
+ # ACPM mailbox client and load governor run from a kernel thread; scalar only.
+ b2l_acpm_dvfs.o_CFLAGS_ADD += -mgeneral-regs-only
++
++# Early Wi-Fi diagnostics must not borrow SIMD state.
++b2l_wifi_diag.o_CFLAGS_ADD += -mgeneral-regs-only
