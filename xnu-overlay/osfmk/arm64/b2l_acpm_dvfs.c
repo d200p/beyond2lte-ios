@@ -247,10 +247,43 @@ mhz_on_cpu(unsigned cpu)
 /* FVMAP (fvmap.h): 24-byte headers { dvfs_type, num_of_lv, num_of_members, num_of_pll, num_of_mux,
  * num_of_div, u16 gearratio, init_lv, num_of_gate, reserved[2], u16 block_addr[3], u16 o_members,
  * u16 o_ratevolt, u16 o_tables }; rate/volt pairs { u32 rate_kHz, u32 volt_uV } at o_ratevolt. */
+/* The FVMAP sits at fvmap_offset (0xa400) from the DVFS plugin's base in SRAM
+ * (acpm.c: fvmap_init(fw_base_addr + offset)), not from the SRAM start; the
+ * first boot read nothing at SRAM+0xa400. Scan the SRAM for the header array
+ * instead of trusting the plugin descriptor layout: headers 0..4 must carry
+ * dvfs_type 0..4 (MIF, INT, CL0, CL1, CL2), 1..24 levels and a descending
+ * kHz table inside the 8 KiB map. */
+static volatile uint8_t *
+find_fvmap(void)
+{
+    for (uint32_t base = 0; base + FVMAP_SIZE <= ACPM_SRAM_SIZE; base += 4) {
+        volatile uint8_t *map = sram + base;
+        unsigned ok = 0;
+        for (unsigned i = 0; i < 5; i++) {
+            volatile uint8_t *h = map + i * 24;
+            unsigned type = h[0], levels = h[1];
+            uint32_t o_ratevolt = (uint32_t)h[18] | ((uint32_t)h[19] << 8);
+            if (type != i || levels == 0 || levels > MAX_RATES || o_ratevolt < 5 * 24 || o_ratevolt + (uint32_t)levels * 8 > FVMAP_SIZE) break;
+            uint32_t last = 0xffffffffu; unsigned sane = 1;
+            for (unsigned l = 0; l < levels; l++) {
+                uint32_t rate = rd(map + o_ratevolt + l * 8);
+                if (rate == 0 || rate > 4000000 || rate >= last || (rate % 1000)) { sane = 0; break; }
+                last = rate;
+            }
+            if (!sane) break;
+            ok++;
+        }
+        if (ok == 5) { dlog("fvmap found at SRAM+%#x\n", base); return map; }
+    }
+    dlog("no fvmap header array found in SRAM (also not at +%#x)\n", ACPM_FVMAP);
+    return NULL;
+}
+
 static void
 read_fvmap(void)
 {
-    volatile uint8_t *map = sram + ACPM_FVMAP;
+    volatile uint8_t *map = find_fvmap();
+    if (!map) return;
     for (unsigned i = 0; i < 16; i++) {
         volatile uint8_t *h = map + i * 24;
         unsigned type = h[0], levels = h[1], members = h[2];
