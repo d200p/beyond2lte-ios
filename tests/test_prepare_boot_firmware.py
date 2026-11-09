@@ -33,7 +33,16 @@ VOID PlatformBootManagerAfterConsole () {
             INF: "[LibraryClasses]\n  PcdLib\n[Pcd]\n  gEfiMdePkgTokenSpaceGuid.PcdPlatformBootTimeOut\n",
             GIC: "VOID ArmGicV2DisableInterruptInterface (UINTN GicInterruptInterfaceBase) { OriginalDisable (); }\n"
                  "VOID GicV2ExitBootServicesEvent (EFI_EVENT Event, VOID *Context) { OriginalDrain (); }\n",
-            "Platforms/Samsung/beyond2ltePkg/Library/MemoryMapLib/MemoryMapLib.c": '  {"Upper bank guard", 0x980000000ULL, 0x080000000ULL, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_THROUGH},',
+            "Platforms/Samsung/beyond2ltePkg/Library/MemoryMapLib/MemoryMapLib.c": '  // DDR Regions\n  {"Upper bank guard", 0x980000000ULL, 0x080000000ULL, AddMem, MEM_RES, SYS_MEM_CAP, Reserv, WRITE_THROUGH},\n',
+            "Silicon/Samsung/SamsungPkg/Library/RamManagerLib/RamManager.c": (
+                "STATIC EFI_PHYSICAL_ADDRESS MemoryStart;\n"
+                "EFI_STATUS\nEFIAPI\nGetUsableMemoryRanges (VOID) { return EFI_SUCCESS; }\n"
+                "EFI_STATUS\nEFIAPI\nGetMemoryHoles () {\n" +
+                "".join("  if (!EFI_ERROR (Status)) {\n    HoleRange[%d].Length  = HoleLength;\n  }\n" % i
+                        for i in range(4)) +
+                "  return EFI_SUCCESS;\n}\n"
+                "EFI_STATUS\nEFIAPI\nGetMemoryData (VOID) {\n  return EFI_SUCCESS;\n}\n"
+            ),
             "Loader.efi": "MZ-test-loader",
         }
         for name, text in files.items():

@@ -140,7 +140,8 @@ static struct uio make_uio(int64_t offset,int64_t count,unsigned char*data){
 }
 static int media_read(uint64_t lba,uint32_t count,void*out){
  read_calls++;if(fault_call&&read_calls==fault_call)return EIO;
- assert(count==1&&lba<256);memcpy(out,image+lba*bs,bs);return 0;
+ assert(count&&count*bs<=65536&&lba<256&&count<=256-lba);
+ memcpy(out,image+lba*bs,count*bs);return 0;
 }
 static int media_write(uint64_t lba,uint32_t count,const void*in){
  write_calls++;if(fault_write_call&&write_calls==fault_write_call)return EIO;
@@ -219,8 +220,25 @@ static void read_tests(void){
  assert(b2l_ufs_read_view(&b2l_reader,4096,4096,4097,1,0,out,&done)==EINVAL);
  assert(!b2l_ufs_read_view(&b2l_reader,4096,4096,4096,1,0,out,&done)&&done==0);
  assert(!b2l_ufs_read_view(&b2l_reader,4096,4096,4090,100,0,out,&done)&&done==6&&!memcmp(out,image+8186,6));
- before=read_calls;fault_call=before+2;assert(b2l_ufs_read_view(&b2l_reader,0,sizeof(image),0,8192,0,out,&done)==EIO&&done==4096);
+ /* Failed tail read preserves the completed unaligned prefix. */
+ before=read_calls;fault_call=before+2;assert(b2l_ufs_read_view(&b2l_reader,0,sizeof(image),1,8192,0,out,&done)==EIO&&done==4095);
  fault_call=0;assert(b2l_ufs_read_bytes(&b2l_reader,0,1,NULL,&done)==EINVAL);
+ /* Both native sector sizes, unaligned output, 64 KiB ceiling and
+  * successful-prefix accounting when the second large command fails. */
+ unsigned char *large=malloc(131074);assert(large);
+ for(unsigned sector=512;sector<=4096;sector*=8){
+  fixture(sector);for(size_t i=0;i<sizeof(image);i++)image[i]=(unsigned char)(i*13+i/sector);
+  memset(large,0xa5,131074);
+  assert(!b2l_ufs_read_bytes(&b2l_reader,0,131072,large+1,&done));
+  assert(done==131072&&read_calls==2&&!memcmp(large+1,image,131072));
+  assert(large[0]==0xa5&&large[131073]==0xa5);
+  read_calls=0;fault_call=2;memset(large,0xa5,131074);
+  assert(b2l_ufs_read_bytes(&b2l_reader,0,131072,large+1,&done)==EIO);
+  assert(done==65536&&!memcmp(large+1,image,65536)&&large[65537]==0xa5);
+  read_calls=0;fault_call=1;
+  assert(b2l_ufs_read_bytes(&b2l_reader,0,65536,large+1,&done)==EIO&&done==0);
+ }
+ free(large);
 }
 static void write_view_tests(void){
  fixture(4096);for(size_t i=0;i<sizeof(image);i++)image[i]=(unsigned char)(i*23+i/4096);
@@ -265,7 +283,7 @@ static void strategy_tests(void){
  b=(struct buf){.dev=1,.count=512,.flags=B_READ,.blkno=16,.data=out};b2l_strategy(&b);assert(!b.error&&b.resid==512);
  b=(struct buf){.dev=1,.count=512,.flags=B_READ,.blkno=17,.data=out};b2l_strategy(&b);assert(b.error==EINVAL&&b.resid==512);
  map_error=ENOMEM;b=(struct buf){.dev=1,.count=512,.flags=B_READ,.data=out};b2l_strategy(&b);assert(b.error==ENOMEM&&!b.mapped&&!held);map_error=0;
- fault_call=read_calls+2;b=(struct buf){.dev=1,.count=8192,.flags=B_READ,.data=out};b2l_strategy(&b);assert(b.error==EIO&&b.resid==4096&&!b.mapped&&!held);fault_call=0;
+ fault_call=read_calls+2;b=(struct buf){.dev=1,.count=7680,.flags=B_READ,.blkno=1,.data=out};b2l_strategy(&b);assert(b.error==EIO&&b.resid==4096&&!b.mapped&&!held);fault_call=0;
  assert(b2l_open(1,FWRITE,0,NULL)==EROFS&&b2l_open(999,0,0,NULL)==ENXIO&&!b2l_open(1,0,0,NULL));
  assert(b2l_write(1,NULL,0)==EROFS);
  uint64_t value=99;assert(!b2l_ioctl_common(1,DKIOCISWRITABLE,(void*)&value,0)&&value==0);

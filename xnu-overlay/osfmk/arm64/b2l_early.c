@@ -8,13 +8,23 @@
 #include <arm64/b2l_persistent_log.h>
 #if defined(B2L)
 #include <kern/misc_protos.h>
+#include <kern/clock.h>
+#include <pexpert/pexpert.h>
 extern unsigned char iso_font[256 * 16];
 static volatile uint32_t *b2l_fb;
 static uint64_t b2l_fb_physical, b2l_fb_length;
 static unsigned b2l_width, b2l_height, b2l_stride, b2l_scale;
 static unsigned b2l_cols, b2l_rows, b2l_row, b2l_col;
-static unsigned b2l_gui;
-void b2l_early_gui_present(void){__atomic_store_n(&b2l_gui,1,__ATOMIC_RELEASE);}
+static unsigned b2l_gui, b2l_console_quiet;
+void b2l_early_console_policy(void){
+    int quiet=0;
+    (void)PE_parse_boot_argn("b2l_console_quiet",&quiet,sizeof(quiet));
+    __atomic_store_n(&b2l_console_quiet,quiet==1,__ATOMIC_RELEASE);
+}
+void b2l_early_gui_present(void){
+    __atomic_store_n(&b2l_gui,1,__ATOMIC_RELEASE);
+    b2l_boot_stage("first-iosurface-presented");
+}
 static unsigned b2l_active, b2l_panic_owner, b2l_panic_floor;
 static unsigned b2l_console_cpu(void)
 {
@@ -48,7 +58,10 @@ b2l_early_putc(char c)
 	unsigned owner = __atomic_load_n(&b2l_panic_owner, __ATOMIC_ACQUIRE);
 	if (owner && owner != b2l_console_cpu()) return;
 	b2l_log_append(c);
-	if (!b2l_active || (__atomic_load_n(&b2l_gui,__ATOMIC_ACQUIRE) && !owner)) return;
+	/* Logging always continues. Quiet startup avoids CPU rendering and
+	 * scrolling for every byte; the first panic still owns the display. */
+	if (!b2l_active || ((!owner) && (__atomic_load_n(&b2l_gui,__ATOMIC_ACQUIRE) ||
+	    __atomic_load_n(&b2l_console_quiet,__ATOMIC_ACQUIRE)))) return;
 	if (c == '\r') { b2l_col = 0; return; }
 	if (c == '\n') { b2l_newline(); return; }
 	if (b2l_col >= b2l_cols) b2l_newline();
@@ -68,6 +81,14 @@ b2l_early_putc(char c)
 }
 
 static void b2l_string(const char *s) { while (*s) b2l_early_putc(*s++); }
+
+void b2l_boot_stage(const char *stage)
+{
+    int enabled=0;
+    if(!PE_parse_boot_argn("b2l_boot_timing",&enabled,sizeof(enabled))||enabled!=1)return;
+    uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+    b2l_early_trace("B2L BOOT: ms=%llu stage=%s\n",ns/1000000,stage);
+}
 
 /* Bounded callers only: no allocation or regular printf/log locks. */
 void

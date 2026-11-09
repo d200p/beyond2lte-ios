@@ -1,0 +1,56 @@
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -68,6 +68,10 @@
+ 
+ #include <kern/clock.h>
+ #include <sys/time.h>
++#include <pexpert/arm64/board_config.h>
++#if defined(B2L)
++#include <arm64/b2l_early.h>
++#endif
+ 
+ void
+ IOKitInitializeTime( void )
+@@ -76,6 +80,15 @@
+ 
+ 	t.tv_sec = 30;
+ 	t.tv_nsec = 0;
++#if defined(B2L)
++	/* No RTC provider is registered by this board. Opt in to avoiding its
++	 * full timeout, with the native 30-second policy as the fallback. */
++	int wait_seconds = 30;
++	if (PE_parse_boot_argn("b2l_rtc_wait", &wait_seconds, sizeof(wait_seconds)) &&
++	    wait_seconds >= 0 && wait_seconds <= 30) t.tv_sec = wait_seconds;
++	b2l_early_console_policy();
++	b2l_boot_stage("iortc-wait-begin");
++#endif
+ 
+ 	IOService::waitForService(
+ 		IOService::resourceMatching("IORTC"), &t );
+@@ -84,6 +96,9 @@
+ 		IOService::resourceMatching("IONVRAM"), &t );
+ #endif
+ 
++#if defined(B2L)
++	b2l_boot_stage("iortc-wait-end");
++#endif
+ 	clock_initialize_calendar();
+ }
+ 
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1117,10 +1117,14 @@
+ 
+ 	/* HFS root is mounted and its journal replayed; no EL0 has run yet. */
+ #if defined(B2L)
++	extern void b2l_boot_stage(const char *);
++	b2l_boot_stage("root-mounted-cache-apply-begin");
+ 	extern void b2l_native_cache_before_init(void);
+ 	b2l_native_cache_before_init();
++	b2l_boot_stage("cache-apply-end");
+ 	extern void b2l_persona_before_init(void);
+ 	b2l_persona_before_init();
++	b2l_boot_stage("launchd-start");
+ #endif
+ 	load_init_program(p);
+ 	lock_trace = 1;

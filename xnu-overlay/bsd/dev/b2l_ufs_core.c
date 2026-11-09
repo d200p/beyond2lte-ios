@@ -68,6 +68,20 @@ b2l_ufs_read_bytes(struct b2l_ufs_reader *r, uint64_t offset, size_t count,
 	while (*done < count) {
 		uint64_t pos = offset + *done;
 		size_t within = (size_t)(pos % r->block_size);
+		size_t remaining = count - *done;
+		/* The native transport accepts up to 64 KiB. Only partial edge
+		 * blocks need the shared scratch buffer; read complete blocks
+		 * directly into the caller's bounded output. */
+		if (!within && remaining >= r->block_size) {
+			size_t bytes = remaining > B2L_UFS_MAX_IO_BYTES ?
+			    B2L_UFS_MAX_IO_BYTES : remaining;
+			uint32_t blocks = (uint32_t)(bytes / r->block_size);
+			error = r->read(pos / r->block_size, blocks,
+			    (unsigned char *)out + *done);
+			if (error) return error;
+			*done += (size_t)blocks * r->block_size;
+			continue;
+		}
 		size_t n = r->block_size - within;
 		if (n > count - *done) {
 			n = count - *done;

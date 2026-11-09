@@ -13,6 +13,9 @@ void b2l_early_init(const boot_args *args);
 void b2l_early_putc(char c);
 void b2l_early_gui_present(void);
 void b2l_early_trace(const char *fmt, ...);
+/* Sparse boot milestones, after the architected clock is initialized. */
+void b2l_boot_stage(const char *stage);
+void b2l_early_console_policy(void);
 void b2l_early_mark(unsigned stage, const char *label);
 void b2l_early_critical_exit(int pid, unsigned name_space, uint64_t code, int signal, int status, const char *description);
 void b2l_early_panic(const char *fmt, va_list *args);

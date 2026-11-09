@@ -34,6 +34,14 @@ def main():
 struct video { uint64_t v_baseAddr,v_display,v_rowBytes,v_width,v_height,v_depth; };
 typedef struct { struct video Video; uint64_t memSize; } boot_args;
 void b2l_early_putc(char c);
+void b2l_boot_stage(const char *);
+void b2l_early_trace(const char *,...);
+static int host_quiet_arg;
+static int PE_parse_boot_argn(const char *name,void *out,size_t size){
+ assert(size==sizeof(int));*(int*)out=!strcmp(name,"b2l_console_quiet")?host_quiet_arg:0;return 1;
+}
+static uint64_t mach_absolute_time(void){return 123000000;}
+static void absolutetime_to_nanoseconds(uint64_t ticks,uint64_t *ns){*ns=ticks;}
 static _Thread_local unsigned long long host_mpidr;
 void b2l_smp_dump(void) { b2l_early_putc('S'); b2l_early_putc('\n'); }
 static uint64_t host_log_count;static unsigned char host_log_last;
@@ -82,6 +90,14 @@ int main(void) {
  b2l_early_fault("first",0x1234,0x5678,0xabcd,4);
  b2l_early_fault("second",0,0,0,0);
  assert(b2l_first_fault.ready&&b2l_first_fault.pc==0x1234&&b2l_first_fault.lr==0x5678);
+ /* Quiet startup keeps every log byte, does not touch scanout and can be
+  * disabled. A panic below must still draw while quiet is enabled. */
+ uint8_t *quiet_copy=malloc(size);memcpy(quiet_copy,second+64,size);
+ host_quiet_arg=1;b2l_early_console_policy();logged=host_log_count;
+ b2l_early_trace("persistent log while quiet\n");
+ assert(host_log_count>logged&&!memcmp(quiet_copy,second+64,size));
+ host_quiet_arg=0;b2l_early_console_policy();assert(!b2l_console_quiet);
+ host_quiet_arg=1;b2l_early_console_policy();free(quiet_copy);
  panic_format("test %u",17U);
  canaries(second,size,width,height,stride);
  /* The first panic owns output; a second CPU cannot modify scanout or log.

@@ -382,6 +382,7 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 "b2l_arm64e_compat=1 b2l_pacga_siphash=1 b2l_pacga_pair=1 "
                 "cs_enforcement_disable=1 launchd_unsecure_cache=1 "
                 "b2l_system_log=1 b2l_native_cache=1 "
+                "b2l_rtc_wait=0 b2l_boot_timing=1 b2l_console_quiet=1 "
 #else
                 "rd=b2l-diagnostic b2l_root_rw=0 b2l_system_log=0 b2l_native_cache=0 "
 #endif

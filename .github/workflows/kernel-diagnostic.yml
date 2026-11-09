@@ -77,6 +77,8 @@ jobs:
         run: |
           set -o pipefail
           python3 tests/test_ufs_disk.py xnu --overlay
+          python3 tests/test_boot_policy.py xnu
+          python3 tests/test_early_console.py xnu
           bash scripts/test-ufs-transport.sh
           bash scripts/ci/kernel.sh build 2>&1 | tee -a out/ci-logs/kernel.log
       - name: Upload diagnostic reports
@@ -97,6 +99,8 @@ jobs:
     if: inputs.component == 'all' || inputs.component == 'firmware'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      B2L_ENABLE_TOUCH: ${{ inputs.boot_profile == 'userspace' && '1' || '0' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
