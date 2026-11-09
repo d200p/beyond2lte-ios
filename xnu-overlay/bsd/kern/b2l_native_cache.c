@@ -252,7 +252,11 @@ static void learn(struct request*q,struct cache_worker*w){
  out:vnode_put(vp);
 }
 void b2l_native_cache_observe(uint64_t pc,uint32_t insn){
- uint32_t replacement;if(!__atomic_load_n(&ready,__ATOMIC_RELAXED)||!b2l_nc_native(insn,&replacement))return;
+ uint32_t replacement;if(!__atomic_load_n(&ready,__ATOMIC_ACQUIRE)||!b2l_nc_native(insn,&replacement))return;
+ /* Observation is opportunistic. During a gesture, leave queued references
+  * intact and avoid per-trap queue locks, map references and overflow writes
+  * as well as pausing the storage workers. */
+ if(interactive_window&&b2l_cache_activity_active(&interactive_deadline,mach_absolute_time()))return;
  /* Try-lock: the exception path never waits for the worker or storage. */
  disable_preemption();
  if(__atomic_exchange_n(&queue_lock,1,__ATOMIC_ACQUIRE)){enable_preemption();__atomic_fetch_add(&dropped,1,__ATOMIC_RELAXED);return;}
