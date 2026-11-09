@@ -147,7 +147,7 @@ int main(void) {
     puts("Actual ACPM driver: disabled path has no MMIO; SRAM-only mode has no mailbox access; malformed tables/channels/indices cannot write");
 }
 '''
-assert 'b2l_dvfs=0 ' in (repo / 'uefi/XnuLoader/XnuLoader.c').read_text()
+assert 'b2l_dvfs=1 ' in (repo / 'uefi/XnuLoader/XnuLoader.c').read_text()
 with tempfile.TemporaryDirectory(prefix='b2l-acpm-') as temporary:
     root = Path(temporary)
     c = root / 'driver.c'

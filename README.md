@@ -114,11 +114,11 @@ aborted twice in QuartzCore's software renderer during glass/blur transitions
 reduce-transparency accessibility defaults (`b2l_ax_seed=1`, managed layer plus
 missing user domain file) before launchd, and the pre-userspace apply syncs the
 root once instead of per page (76 s saved per boot at current record counts).
-The loader now selects `b2l_dvfs=0` after a kernel panic on the experimental
-FVMAP SRAM-scanning build; rollback to the preceding BOOT reached Home.
-The revised decoder follows the attached DVFS plugin, uses the correct
-rate-table offset, and accepts only aligned, bounded CPU tables. A separate
-`b2l_dvfs=1` mode reads SRAM and measures clocks without mailbox access.
+The diagnostic BOOT with `b2l_dvfs=0` reached Home after a kernel panic on the
+experimental FVMAP SRAM-scanning build. The next trial selects `b2l_dvfs=1`
+to read SRAM and measure clocks without mailbox access; its phone result is
+pending. The revised decoder follows the attached DVFS plugin, uses the correct
+rate-table offset, and accepts only aligned, bounded CPU tables.
 Clock control remains experimental and is disabled in this diagnostic BOOT.
 See [ACPM diagnosis](docs/acpm-diagnostics.md) for the firmware ABI, tests and
 runtime limitations. The `B2L FRAMES` line reports compositor swaps and the

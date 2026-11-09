@@ -17,8 +17,8 @@
  * (measured with the dependent-add clock estimate of the LIVE reporter).
  *
  * Boot args:
- *   b2l_dvfs=0      disabled (loader default during panic diagnosis)
- *   b2l_dvfs=1      SRAM tables and measured core clocks only; no mailbox access
+ *   b2l_dvfs=0      disabled; confirmed reaching Home during panic diagnosis
+ *   b2l_dvfs=1      SRAM tables and measured core clocks only; no mailbox access (loader default)
  *   b2l_dvfs=2      ... and set the clusters to their FVMAP tops (or the caps below)
  *   b2l_dvfs_cl0/cl1/cl2=kHz   cap for a cluster (0: FVMAP top); a value not in the table is
  *                   rounded down to the nearest table rate

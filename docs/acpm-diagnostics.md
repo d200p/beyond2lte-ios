@@ -1,10 +1,11 @@
 # ACPM panic diagnosis and FVMAP decoding
 
-The S10+ loader selects `b2l_dvfs=0` while investigating a kernel panic on
-the SRAM-scanning build. That path starts no DVFS thread and accesses neither
-ACPM SRAM nor its mailbox. The preceding BOOT reached Home again after rollback.
-The failing boot's persistent log ended around DVFS startup, but did not retain
-the panic registers. The exact failing access remains unconfirmed.
+The diagnostic S10+ BOOT with `b2l_dvfs=0` reached Home, confirmed by the owner.
+That path starts no DVFS thread and accesses neither ACPM SRAM nor its mailbox.
+The loader now selects `b2l_dvfs=1` for the next SRAM-only trial, whose phone
+result remains pending. The older SRAM-scanning build's persistent log ended
+around DVFS startup but did not retain the panic registers. The exact failing
+access remains unconfirmed.
 
 The platform-error fallback now captures PC, LR, ESR and FAR through the typed
 first-fault recorder before the native panic. It labels synchronous and
@@ -46,10 +47,11 @@ published by LineageOS:
 
 ## Boot modes and verification
 
-- `b2l_dvfs=0`: disabled, including all ACPM MMIO. This is the current loader
-  default for the userspace diagnostic BOOT.
+- `b2l_dvfs=0`: disabled, including all ACPM MMIO. The owner confirmed that this
+  diagnostic baseline reached Home.
 - `b2l_dvfs=1`: follow SRAM descriptors, validate CPU tables, measure core clocks,
-  and return. Do not map or write the mailbox or send temperature requests.
+  and return. This is the loader default for the next trial. Do not map or write
+  the mailbox or send temperature requests.
 - `b2l_dvfs=2`: experimental clock-control path. It now requires all CPU tables
   before mapping the mailbox. Channel pointers, element alignment, interrupt
   IDs and queue indices are checked before use. This mode is not selected by
