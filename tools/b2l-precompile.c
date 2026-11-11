@@ -86,7 +86,7 @@ struct section_ref {
 };
 
 struct options {
-    int write, verify, quiet, xdev, pacga;
+    int write, verify, quiet, xdev, pacga, no_ldra;
     const char *report;
     const char **exclude;
     unsigned excludes;
@@ -132,6 +132,8 @@ static void fail(const char *path, const char *fmt, ...)
 
 static int classify(uint32_t i, uint32_t *out)
 {
+    /* --no-ldra: keep LDRAA/LDRAB on the emulator, as the fork's converter did. */
+    if (opt.no_ldra && (i & 0xff200400u) == 0xf8200400u) return CLASS_NONE;
     if (!b2l_nc_native(i, out)) return CLASS_NONE;
     if ((i & 0xffff0000u) == 0xdac10000u) return CLASS_PAC;
     if ((i & 0xffffff00u) == 0xd5032000u || (i & 0xffffff00u) == 0xd5032100u ||
@@ -1014,11 +1016,12 @@ static int process_tree(const char *root)
 static void usage(FILE *f)
 {
     fputs("usage: b2l-precompile [--write] [--verify] [--report FILE] [--exclude-text PATH]... [--quiet] [--no-xdev]\n"
-          "                      [--pacga-trampolines | --pacga-mask] PATH...\n"
+          "                      [--pacga-trampolines | --pacga-mask] [--no-ldra] PATH...\n"
           "  --pacga-trampolines routes shared-cache PACGA to keyless EL0 routines; the root then\n"
           "  requires a kernel booted with b2l_pacga_keyless=1.\n"
           "  --pacga-mask rewrites PACGA in place to AND Xd,Xn,#0xffffffff00000000 (NOP for XZR),\n"
           "  the shared converter's mask result ABI; the root then requires b2l_pacga_mask=1.\n"
+          "  --no-ldra leaves LDRAA/LDRAB unconverted (emulated), as the fork's converter did.\n"
           "  Rewrite ARM64e Mach-O and dyld shared-cache code sections with the B2L\n"
           "  allowlisted converter. Without --write, only report. --verify exits 2 when\n"
           "  convertible words remain. PATH is a prepared root, directory or file.\n"
@@ -1040,6 +1043,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--quiet")) opt.quiet = 1;
         else if (!strcmp(argv[i], "--pacga-trampolines")) opt.pacga = 1;
         else if (!strcmp(argv[i], "--pacga-mask")) b2l_nc_pacga_mask = 1;
+        else if (!strcmp(argv[i], "--no-ldra")) opt.no_ldra = 1;
         else if (!strcmp(argv[i], "--no-xdev")) opt.xdev = 0;
         else if (!strcmp(argv[i], "--report") && i + 1 < argc) opt.report = argv[++i];
         else if (!strcmp(argv[i], "--exclude-text") && i + 1 < argc) excludes[opt.excludes++] = argv[++i];

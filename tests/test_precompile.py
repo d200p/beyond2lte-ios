@@ -337,6 +337,28 @@ def keyless_asm(d, n, m):
             f'and {D}, {D}, #0xffffffff00000000']
 
 
+def check_no_ldra(exe, tmp, code, stubs, asm_words, kinds):
+    """--no-ldra leaves every LDRAA/LDRAB word for the emulator (the fork's converter)."""
+    root = tmp / 'no-ldra'
+    root.mkdir()
+    target = root / 'thin'
+    target.write_bytes(Fixture(code, stubs).image)
+    ldra = sum(1 for k in kinds if k == 'LDRA')
+    assert ldra and all(model_native(w) is not None for w, k in zip(asm_words, kinds) if k == 'LDRA')
+    run(exe, '--report', tmp / 'l0.json', target)
+    run(exe, '--no-ldra', '--report', tmp / 'l1.json', target)
+    plain, kept = summary(tmp / 'l0.json')['summary'], summary(tmp / 'l1.json')['summary']
+    assert plain['counts']['ldra'] == 0 and kept['counts']['ldra'] == ldra, (plain['counts'], kept['counts'])
+    assert kept['counts']['converted'] == plain['counts']['converted'] - ldra, (plain['counts'], kept['counts'])
+    run(exe, '--write', '--no-ldra', target)
+    written = target.read_bytes()
+    for w, k in zip(asm_words, kinds):
+        if k == 'LDRA':
+            assert w.to_bytes(4, 'little') in written, hex(w)
+    run(exe, '--verify', '--no-ldra', target)
+    print(f'no-ldra: {ldra} LDRA words left for the emulator')
+
+
 def check_pacga_mask(exe, tmp, code, stubs, asm_words, kinds):
     """--pacga-mask converts every PACGA in place, matching the mask-ABI kernel."""
     root = tmp / 'pacga-mask'
@@ -578,6 +600,7 @@ def main():
         assert 'without their main cache' in r.stderr and (bad / 'dyld_shared_cache_arm64e.01').read_bytes() == group.sub
         check_trampolines(exe, tmp, code, stubs, asm_words, kinds)
         check_pacga_mask(exe, tmp, code, stubs, asm_words, kinds)
+        check_no_ldra(exe, tmp, code, stubs, asm_words, kinds)
         print(f'precompile fixtures passed: {len(asm_words)} assembled words, {expected_converted} conversions modelled')
 
         if len(sys.argv) > 1:
