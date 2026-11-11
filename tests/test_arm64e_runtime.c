@@ -18,6 +18,9 @@
 #define PSR64_SS (1u<<21)
 static struct host_thread {struct {void *DebugData;} machine;} host_thread;
 static struct host_thread *current_thread(void){return &host_thread;}
+static int host_cpu;
+static int cpu_number(void){return host_cpu;}
+#include <stddef.h>
 #define MACH_VM_MAX_ADDRESS UINT64_C(0x1000000000)
 #define LCK_GRP_DECLARE(a,b) static int a __unused
 #define LCK_MTX_DECLARE(a,b) static pthread_mutex_t a=PTHREAD_MUTEX_INITIALIZER
@@ -32,8 +35,9 @@ static unsigned entropy_calls, atomic32_calls, atomic32_fail_at;
 static uint64_t host_ticks;
 static uint64_t mach_absolute_time(void){return __atomic_add_fetch(&host_ticks,1,__ATOMIC_RELAXED);}
 static uint8_t memory[0x4000];
-static int boot_flag, siphash_flag = -1, pair_flag = -1, mask_flag = -1;
-static bool PE_parse_boot_argn(const char *n,void *p,size_t z){assert(z==sizeof(int));if(!strcmp(n,"b2l_arm64e_compat")){memcpy(p,&boot_flag,z);return true;}if(!strcmp(n,"b2l_pacga_siphash")){if(siphash_flag<0)return false;memcpy(p,&siphash_flag,z);return true;}if(!strcmp(n,"b2l_pacga_mask")){if(mask_flag<0)return false;memcpy(p,&mask_flag,z);return true;}assert(!strcmp(n,"b2l_pacga_pair"));if(pair_flag<0)return false;memcpy(p,&pair_flag,z);return true;}
+static int boot_flag, siphash_flag = -1, pair_flag = -1, mask_flag = -1, precompiled_flag = -1, keyless_flag = -1;
+static bool flag_arg(int flag,void *p,size_t z){if(flag<0)return false;memcpy(p,&flag,z);return true;}
+static bool PE_parse_boot_argn(const char *n,void *p,size_t z){assert(z==sizeof(int));if(!strcmp(n,"b2l_arm64e_compat")){memcpy(p,&boot_flag,z);return true;}if(!strcmp(n,"b2l_pacga_siphash"))return flag_arg(siphash_flag,p,z);if(!strcmp(n,"b2l_pacga_mask"))return flag_arg(mask_flag,p,z);if(!strcmp(n,"b2l_precompiled"))return flag_arg(precompiled_flag,p,z);if(!strcmp(n,"b2l_pacga_keyless"))return flag_arg(keyless_flag,p,z);assert(!strcmp(n,"b2l_pacga_pair"));return flag_arg(pair_flag,p,z);}
 static unsigned forced_lines;
 static bool b2l_arm64e_current_task(void){return task_compat;}
 static bool is_saved_state64(arm_saved_state_t*s){return s->user64;}
@@ -105,6 +109,35 @@ static void expected_step(arm_saved_state_t *s,uint32_t op){
  if(rd==29)s->fp=v;else if(rd==30)s->lr=v;else if(rd<29)s->x[rd]=v;
  s->pc+=4;
 }
+static void precompiled_tests(void){
+ /* S10 merge: this runtime keeps range-only PC validation (no per-trap VM
+  * lookup, no VM mock here), so the fork's lookup-elision assertions do not
+  * apply. Opt-in gates, keyless PACGA and per-CPU counter sums still do. */
+ int old_mask=mask_flag;mask_flag=-1;
+ int old_boot=boot_flag;boot_flag=0;precompiled_flag=1;b2l_compat_init();assert(!b2l_arm64e_precompiled());boot_flag=old_boot;
+ for(int flag=-1;flag<=2;flag++)if(flag!=1){precompiled_flag=flag;b2l_compat_init();assert(!b2l_arm64e_precompiled());}
+ arm_saved_state_t s;
+ precompiled_flag=1;b2l_compat_init();assert(b2l_arm64e_precompiled());
+ /* Counters on different CPUs sum exactly. */
+ {uint64_t a[4],b[4];b2l_arm64e_compat_snapshot(a);host_cpu=5;s=initial();
+  assert(b2l_arm64e_compat_emulate(&s,0xd65f0fff));host_cpu=0;b2l_arm64e_compat_snapshot(b);
+  assert(b[0]==a[0]+1&&b[1]==a[1]+1);}
+ /* Keyless PACGA: only with precompiled mode, equals the shared EL0 function,
+  * draws no entropy, and is reported in the LIVE label. */
+ keyless_flag=1;precompiled_flag=-1;b2l_compat_init();assert(!b2l_compat_keyless);
+ precompiled_flag=1;keyless_flag=2;b2l_compat_init();assert(!b2l_compat_keyless);
+ keyless_flag=1;b2l_compat_init();assert(b2l_compat_keyless&&!strcmp(b2l_arm64e_pacga_name(),"keyless"));
+ {unsigned before_entropy=entropy_calls;uint64_t rnd=UINT64_C(0x9e3779b97f4a7c15);
+  for(unsigned i=0;i<4096;i++){rnd=rnd*UINT64_C(6364136223846793005)+1;uint64_t a=rnd^(rnd>>17),b=rnd*31,v=0;
+   assert(!b2l_compat_pacga(a,b,&v,NULL)&&v==b2l_pacga_keyless(a,b)&&!(v&UINT32_MAX));}
+  s=initial();assert(b2l_arm64e_compat_emulate(&s,pacga_word(0,1,2))&&s.x[0]==b2l_pacga_keyless(s.x[1],s.x[2]));
+  s=initial();assert(b2l_arm64e_compat_emulate(&s,pacga_word(0,1,31))&&s.x[0]==b2l_pacga_keyless(s.x[1],s.sp));
+  assert(entropy_calls==before_entropy);}
+ keyless_flag=-1;b2l_compat_init();assert(!b2l_compat_keyless);
+ precompiled_flag=-1;b2l_compat_init();assert(!b2l_arm64e_precompiled());
+ mask_flag=old_mask;b2l_compat_init();
+ puts("Precompiled mode: opt-in gate, keyless PACGA and per-CPU counters PASS (range-only PC checks)");
+}
 static void pair_tests(void){
  uint32_t first=0x9aca3108,second=0x9ac83008,third=pacga_word(1,0,2);
  memcpy(memory+0x1004,&second,4);memcpy(memory+0x1008,&third,4);
@@ -114,9 +147,9 @@ static void pair_tests(void){
  for(int flag=-1;flag<=2;flag++)if(flag!=1){pair_flag=flag;b2l_compat_init();assert(!b2l_compat_pair);}
  pair_flag=1;b2l_compat_init();assert(b2l_compat_pair);
  arm_saved_state_t s=initial(),want=s;expected_step(&want,first);expected_step(&want,second);
- uint64_t before=b2l_compat_perf[4];
+ uint64_t pbefore[6];b2l_arm64e_perf_snapshot(pbefore);uint64_t before=pbefore[4];
  assert(b2l_arm64e_compat_emulate(&s,first));assert(!memcmp(&s,&want,sizeof(s)));
- assert(s.pc==0x1008&&b2l_compat_perf[4]==before+1);
+ {uint64_t pafter[6];b2l_arm64e_perf_snapshot(pafter);assert(s.pc==0x1008&&pafter[4]==before+1);}
  /* Never consume a third instruction, even another PACGA. */
  assert(s.x[1]==want.x[1]);
  /* Debug state and single-step must keep the one-instruction boundary. */
@@ -218,6 +251,7 @@ int main(int argc,char **argv){
  assert(b2l_compat_read_acquire(0x2001,2,&out,NULL));assert(b2l_compat_read_acquire(0x2000,0,&out,NULL));
  assert(!b2l_user_range(0,4)&&!b2l_user_range(UINT64_MAX-1,8)&&!b2l_user_range(MACH_VM_MAX_ADDRESS,4));
  copy_fault=true;assert(b2l_compat_read_acquire(0x2000,8,&out,NULL));copy_fault=false;
+ precompiled_tests();
  pair_tests();
  /* Forced adoption: only a keyed boot can switch, exactly once, with a line. */
  if(!use_mask){

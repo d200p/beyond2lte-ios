@@ -35,6 +35,7 @@ public:
 	uint16_t bytesPerElement;
 	uint8_t  elementWidth, elementHeight;
 	uint32_t cacheMode, planeCount, parentID;
+	uint32_t purgeState;    /* last requested purgeable state; never reclaimed */
 	struct b2l_surface_plane planes[B2L_SURFACE_MAX_PLANES];
 
 	IOMemoryDescriptor       *memory;       /* pixels (buffer or physical) */

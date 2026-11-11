@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /* Bounded existence-only metadata predicates for iOS 26 operation 0x66.
- * Unsupported predicates retain the unavailable response. No trust is granted. */
+ * Unsupported predicates retain the unavailable response. No trust is granted.
+ * Operation 90 answers dyld's amfi_check_dyld_policy_self (see below). */
 #ifndef B2L_AMFI_CONSTRAINT_H
 #define B2L_AMFI_CONSTRAINT_H
 #include "b2l_lwcr.h"
@@ -40,10 +41,35 @@ b2l_amfi_constraint_reply(user64_addr_t output, uint32_t code,
     return error ? error : status;
 }
 
+/* dyld's amfi_check_dyld_policy_self(input, &output): {u64 input flags, u64 output
+ * pointer}. Without an answer dyld uses its most restrictive policy and refuses
+ * @rpath/@loader_path, so apps with embedded frameworks (MomentsUIService on
+ * 0105) die at launch with "security policy does not allow @ path expansion".
+ * Grant @-path expansion as release iOS does, except to set-user/group-ID
+ * processes. DYLD_* variables, insertion and interposing stay disallowed. */
+#define B2L_AMFI_SYSCALL_DYLD_POLICY_SELF 90
+#define B2L_AMFI_DYLD_OUTPUT_ALLOW_AT_PATH (1ull << 0)
+struct b2l_amfi_dyld_policy_args {
+    uint64_t input_flags;
+    user64_addr_t output;
+};
+_Static_assert(sizeof(struct b2l_amfi_dyld_policy_args) == 16, "AMFI dyld policy ABI");
+static int
+b2l_amfi_dyld_policy(struct proc *process, user_addr_t argument)
+{
+    struct b2l_amfi_dyld_policy_args args;
+    int error = copyin(argument, &args, sizeof(args));
+    if (error) return error;
+    if (!args.output) return EINVAL;
+    uint64_t flags = proc_issetugid(process) ? 0 : B2L_AMFI_DYLD_OUTPUT_ALLOW_AT_PATH;
+    return copyout(&flags, args.output, sizeof(flags));
+}
+
 static int
 b2l_amfi_constraint_syscall(struct proc *process, int operation, user_addr_t argument)
 {
     if (!b2l_amfi_active() || !proc_is64bit(process)) return ENOPOLICY;
+    if (operation == B2L_AMFI_SYSCALL_DYLD_POLICY_SELF) return b2l_amfi_dyld_policy(process, argument);
     if (operation != 0x66) return ENOTSUP;
     struct b2l_amfi_constraint_args args;
     int error = copyin(argument, &args, sizeof(args));

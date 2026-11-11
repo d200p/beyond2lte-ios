@@ -3,8 +3,10 @@
 #define B2L_AMFI_METADATA_H
 #include <stddef.h>
 #include <stdint.h>
-#define B2L_AMFI_XML_MAX 65536u
-#define B2L_AMFI_DER_MAX 65536u
+/* Settings (Preferences) carries a 75,435-byte XML and 52,207-byte DER slot in
+ * iOS 26.6.2; 64 KiB rejected its whole signature, so it had no entitlements. */
+#define B2L_AMFI_XML_MAX (256u * 1024u)
+#define B2L_AMFI_DER_MAX (256u * 1024u)
 #define B2L_AMFI_IDENTITY_MAX 1024u
 #define B2L_AMFI_SIGNATURE_MAX (2u * 1024u * 1024u)
 struct b2l_amfi_reader {

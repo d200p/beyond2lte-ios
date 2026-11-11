@@ -85,7 +85,9 @@ void b2l_native_cache_input_activity(void){
 }
 
 
-static int enabled(void){int v=0;return b2l_arm64e_compat_enabled()&&PE_parse_boot_argn("b2l_native_cache",&v,sizeof(v))&&v==1;}
+/* A root rewritten by tools/b2l-precompile.c leaves nothing for the learner. */
+static int precompiled_root(void){return b2l_arm64e_compat_enabled()&&b2l_arm64e_precompiled();}
+static int enabled(void){int v=0;return b2l_arm64e_compat_enabled()&&!precompiled_root()&&PE_parse_boot_argn("b2l_native_cache",&v,sizeof(v))&&v==1;}
 void b2l_native_cache_storage(const struct b2l_io*io,const uint8_t id[12]){
  if(!io||!io->read||!io->write||!io->sync||io->bytes<B2L_NC_HEADER+B2L_NC_CELL)return;
  cache_io=*io;memcpy(root_identity,id,12);storage_ready=1;
@@ -346,6 +348,7 @@ static void worker(void*arg,wait_result_t why __unused){
  }
 }
 void b2l_native_cache_before_init(void){
+ if(precompiled_root()){printf("B2L NCACHE: precompiled root; pre-init apply, learning and workers skipped\n");return;}
  if(!enabled()||!storage_ready){printf("B2L NCACHE: unavailable; emulation retained\n");return;}
  /* Index with the widest accepted conversion set so durable PACGA rewrites
   * are recognized rather than treated as corruption. Generation follows the

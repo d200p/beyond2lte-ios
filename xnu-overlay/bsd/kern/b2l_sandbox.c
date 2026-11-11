@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /* Built-in development policy for the explicitly unsigned B2L port.
  * This registers the name queried by libsystem_sandbox; it does not implement
- * production profile enforcement or container paths. Private development
+ * production profile enforcement. Container paths are reported, not enforced
+ * (b2l_sandbox_container.h, b2l_sandbox_identity.h). Private development
  * extension capabilities have separate bounded lifetime bookkeeping. */
 #if defined(ARM64_BOARD_CONFIG_B2L) && CONFIG_MACF
 #include <sys/types.h>
@@ -21,6 +22,9 @@
 #include <kern/mach_filter.h>
 #include <arm64/b2l_arm64e_compat.h>
 #include <arm64/b2l_diag.h>
+#include <sys/proc_internal.h>
+#include <sys/vnode.h>
+#include "b2l_amfi.h"
 
 void b2l_sandbox_register(void);
 
@@ -38,6 +42,20 @@ b2l_sandbox_development_enabled(void)
 }
 
 #include "b2l_sandbox_extensions.h"
+static LCK_GRP_DECLARE(b2l_sandbox_container_group, "b2l_sandbox_container");
+static LCK_SPIN_DECLARE(b2l_sandbox_container_lock, &b2l_sandbox_container_group);
+#define B2L_SANDBOX_CONTAINER_LOCK() lck_spin_lock(&b2l_sandbox_container_lock)
+#define B2L_SANDBOX_CONTAINER_UNLOCK() lck_spin_unlock(&b2l_sandbox_container_lock)
+#include "b2l_sandbox_container.h"
+/* At most 32 container lines per boot: sizes and sources only, never paths. */
+static _Atomic uint32_t b2l_sandbox_container_traces;
+#define B2L_SANDBOX_TRACE(...) do { \
+    if (os_atomic_inc_orig(&b2l_sandbox_container_traces, relaxed) < 32) printf(__VA_ARGS__); \
+} while (0)
+#define B2L_PROC_UNIQUEID(p) proc_uniqueid(p)
+#define B2L_PROC_ARGSLEN(p) ((size_t)(p)->p_argslen)
+#define B2L_PROC_USER_STACK(p) ((p)->user_stack)
+#include "b2l_sandbox_identity.h"
 #include "b2l_mach_filter.h"
 
 /* At most129 operation and65 privilege lines per boot, regardless of callers.
@@ -87,8 +105,10 @@ b2l_sandbox_syscall(struct proc *process, int operation, user_addr_t argument)
     }
     b2l_sandbox_log_operation(operation);
     switch (operation) {
-    case 4: /* container-path query: no fabricated path */
-        return ENOENT;
+    case 2: /* sandbox_check: identity only for sandbox-entitled processes */
+        return b2l_sandbox_check_query(process, argument);
+    case 4: /* container path: the caller's spawn container, else HOME if entitled */
+        return b2l_sandbox_container_path(process, argument);
     case 5: case 6: case 7: case 0x50:
         return b2l_extension_syscall(process, operation, argument);
     case 0x43:
@@ -115,10 +135,36 @@ b2l_sandbox_priv_grant(kauth_cred_t credential __unused, int privilege)
     return privilege == PRIV_WORK_INTERVAL ? 0 : EPERM;
 }
 
+/* Record the container launchd passed in the Sandbox spawn attributes.
+ * Never refuses a launch. */
+static int
+b2l_sandbox_launch(proc_t process, pid_t parent __unused, pid_t responsible __unused,
+    void *attr, size_t length, launch_constraint_data_t constraints __unused,
+    char **failure __unused, size_t *failure_length __unused)
+{
+    if (!b2l_sandbox_development_enabled() || process == NULL) return 0;
+    b2l_sandbox_container_record(proc_uniqueid(process), attr, length);
+    if (attr != NULL) {
+        const char *path;
+        size_t len = b2l_sandbox_spawn_container(attr, length, &path);
+        B2L_SANDBOX_TRACE("B2L Sandbox: spawn attributes %zu bytes, container %s (%zu bytes)\n",
+            length, len ? "recorded" : "absent", len ? len + 1 : 0);
+    }
+    return 0;
+}
+
+static void
+b2l_sandbox_process_exit(proc_t process)
+{
+    b2l_sandbox_container_forget(proc_uniqueid(process));
+    b2l_extension_process_exit(process);
+}
+
 static const struct mac_policy_ops b2l_sandbox_ops = {
     .mpo_policy_syscall = b2l_sandbox_syscall,
     .mpo_priv_grant = b2l_sandbox_priv_grant,
-    .mpo_proc_notify_exit = b2l_extension_process_exit,
+    .mpo_proc_notify_exit = b2l_sandbox_process_exit,
+    .mpo_proc_check_launch_constraints = b2l_sandbox_launch,
 };
 
 static struct mac_policy_conf b2l_sandbox_conf = {

@@ -8,6 +8,10 @@ struct arm_saved_state;
 extern "C" {
 #endif
 bool b2l_arm64e_compat_enabled(void);
+/* b2l_precompiled=1 with the enabled runtime: the root was rewritten offline. */
+bool b2l_arm64e_precompiled(void);
+/* elided same-page execute checks, VM execute lookups performed */
+void b2l_arm64e_precompiled_snapshot(uint64_t values[2]);
 /* Boot-stable algorithm label; contains no key or operand data. */
 const char *b2l_arm64e_pacga_name(void);
 /* True when PACGA yields Xn & 0xffffffff00000000 (cache-rewritable ABI). */

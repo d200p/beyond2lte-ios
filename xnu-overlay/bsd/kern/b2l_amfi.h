@@ -14,6 +14,7 @@ bool b2l_amfi_is_platform(struct proc *);
 bool b2l_amfi_cache_entitled(struct proc *);
 bool b2l_amfi_vnode_is_platform(struct vnode *);
 int b2l_amfi_proc_copy_dict(struct proc *, void **);
+int b2l_amfi_proc_copy_ent(struct proc *, void **);
 int b2l_amfi_vnode_copy_dict(struct vnode *, int64_t, void **);
 bool b2l_amfi_vnode_has_cdhash(struct vnode *, int64_t);
 int b2l_amfi_proc_copy_cdhash(struct proc *, uint8_t[20], uint8_t*);

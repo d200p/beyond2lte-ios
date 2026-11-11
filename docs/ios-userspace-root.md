@@ -40,7 +40,10 @@ python3 scripts/prepare-ios-root.py /path/to/mounted/root --verify
 The script reads the product and build versions from the copied root. It writes
 A5-derived Setup completion and migration preferences, prepares log/runtime
 directories with the accounts in that root, and supplies cryptex fallback links.
-It does not patch Apple executables or disable unrelated daemons.
+It does not patch Apple executables or disable unrelated daemons. The separate
+[offline precompiler](arm64e-precompile.md) is the one step that does rewrite
+executable code: run it over the still-mounted root after this script, then
+verify, unmount and hash the image.
 
 Setup preferences do not themselves activate iOS. The EFI device tree supplies
 the development-board `/chosen` tuple used by the native local Hactivation path:

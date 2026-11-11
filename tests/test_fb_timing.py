@@ -9,8 +9,10 @@ import tempfile
 repo = Path(__file__).resolve().parents[1]
 source = (repo / 'xnu-overlay/iokit/Kernel/arm/B2LFramebuffer.cpp').read_text()
 start = source.index('static uint64_t b2l_fb_swap_count')
-body = source[start:source.index('/* Copy each enabled layer', start)]
-assert 'if (shown) b2l_fb_copy_note(mach_absolute_time() - copy_began);' in source
+body = source[start:source.index('static uint64_t\nb2l_probe_hash', start)]
+# The fork's runCopy times the whole queued job once; the S10 merge feeds that
+# elapsed time to the same B2L FRAMES copy counters.
+assert 'if (copies) b2l_fb_copy_note(ticks);' in source
 pre = r'''
 #include <cassert>
 #include <cstdint>

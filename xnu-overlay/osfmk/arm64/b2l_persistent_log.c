@@ -46,17 +46,24 @@ void b2l_log_append(char c){b2l_log_ring_append(&console_ring,(uint8_t)c);}
 void b2l_log_append_bytes(const void*p,size_t n){b2l_log_ring_append_bytes(&console_ring,p,n);}
 static void b2l_log_worker(void*argument __unused,wait_result_t result __unused)
 {
-    unsigned reports=0;
+    unsigned reports=0,ticks=0;
     for(;;){
+        /* For the first 300 s, drain every second and leave a TICK line, so
+         * the last line on disk dates a stall to within about one second. */
+        uint64_t up=0;absolutetime_to_nanoseconds(mach_absolute_time(),&up);up/=NSEC_PER_SEC;
+        bool early=up<300;
+        if(early)b2l_early_trace("B2L TICK sec=%llu\n",up);
         int err=b2l_log_writer_drain(&disk_writer,&console_ring,128);
         if(err){__atomic_fetch_add(&flush_failures,1,__ATOMIC_RELAXED);__atomic_store_n(&last_error,err,__ATOMIC_RELAXED);}
         /* Outside every storage lock/callback. One bounded progress line per
          * ~30s distinguishes an awake scheduler from silent EL0 execution. */
+        if(early){if(++ticks<5)goto sleep;ticks=0;}
         if(++reports==6){
             uint64_t v[4];b2l_arm64e_compat_snapshot(v);reports=0;
             uint64_t perf[6];b2l_arm64e_perf_snapshot(perf);
-            b2l_early_trace("B2L EMU PERF: samples=%llu wrapper_ns=%llu vm_ns=%llu hash_ns=%llu paired=%llu pair_fallback=%llu\n",
-                perf[0],perf[1],perf[2],perf[3],perf[4],perf[5]);
+            uint64_t elided[2];b2l_arm64e_precompiled_snapshot(elided);
+            b2l_early_trace("B2L EMU PERF: samples=%llu wrapper_ns=%llu vm_ns=%llu hash_ns=%llu paired=%llu pair_fallback=%llu elided=%llu lookups=%llu\n",
+                perf[0],perf[1],perf[2],perf[3],perf[4],perf[5],elided[0],elided[1]);
             b2l_diag_progress();
             uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
             unsigned cpu=0;uint64_t mhz=b2l_cpu_mhz_sample(&cpu);
@@ -71,7 +78,8 @@ static void b2l_log_worker(void*argument __unused,wait_result_t result __unused)
                 swaps[0],gap_ns/1000000,swaps[2],temps[0],temps[1],temps[2],temps[3],sent[0]/1000,sent[1]/1000,sent[2]/1000,swaps[4],copy_total_ns/1000000,copy_max_ns/1000000);
             b2l_iokit_busy_report();
         }
-        assert_wait_timeout((event_t)&disk_writer,THREAD_UNINT,5,NSEC_PER_SEC);
+sleep:
+        assert_wait_timeout((event_t)&disk_writer,THREAD_UNINT,early?1:5,NSEC_PER_SEC);
         thread_block(THREAD_CONTINUE_NULL);
     }
 }
