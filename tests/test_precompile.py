@@ -64,7 +64,25 @@ def model_native(i):
         return (0xD63F0000 if i & 0x200000 else 0xD61F0000) | (rn << 5)
     if (i & 0x3FFFFC00) == 0x38BFC000:
         return (i & 0xC00003FF) | 0x08DFFC00
+    if (i & 0xFF200400) == 0xF8200400:  # LDRAA/LDRAB: S10 tree's ordinary-load rule
+        rn, rd, wb = (i >> 5) & 31, i & 31, (i >> 11) & 1
+        imm = ((i >> 12) & 511) | ((i >> 13) & 512)
+        offset = (imm - 1024 if imm >= 512 else imm) * 8
+        if rn == 31 or (wb and rn == rd):
+            return None
+        if not wb and offset >= 0:
+            return 0xF9400000 | ((offset // 8) << 10) | (rn << 5) | rd
+        if -256 <= offset <= 255:
+            return 0xF8400000 | ((offset & 511) << 12) | (0xC00 if wb else 0) | (rn << 5) | rd
     return None
+
+
+def model_pacga_mask(i):
+    """PACGA under the mask result ABI: AND Xd,Xn,#0xffffffff00000000, NOP for XZR."""
+    if (i & 0xFFE0FC00) != 0x9AC03000:
+        return None
+    rn, rd = (i >> 5) & 31, i & 31
+    return 0xD503201F if rd == 31 else 0x92607C00 | (rn << 5) | rd
 
 
 def assemble(lines):
@@ -319,6 +337,30 @@ def keyless_asm(d, n, m):
             f'and {D}, {D}, #0xffffffff00000000']
 
 
+def check_pacga_mask(exe, tmp, code, stubs, asm_words, kinds):
+    """--pacga-mask converts every PACGA in place, matching the mask-ABI kernel."""
+    root = tmp / 'pacga-mask'
+    root.mkdir()
+    target = root / 'thin'
+    target.write_bytes(Fixture(code, stubs).image)
+    original = target.read_bytes()
+    pacga = sum(1 for k in kinds if k == 'PACGA')
+    run(exe, '--report', tmp / 'm0.json', target)
+    run(exe, '--pacga-mask', '--report', tmp / 'm1.json', target)
+    plain, masked = summary(tmp / 'm0.json')['summary'], summary(tmp / 'm1.json')['summary']
+    assert plain['counts']['pacga'] == pacga and masked['counts']['pacga'] == 0, (plain['counts'], masked['counts'])
+    assert masked['counts']['converted'] == plain['counts']['converted'] + pacga, (plain['counts'], masked['counts'])
+    assert target.read_bytes() == original
+    run(exe, '--pacga-trampolines', '--pacga-mask', target, expect=1)
+    run(exe, '--write', '--pacga-mask', '--report', tmp / 'm2.json', target)
+    written = target.read_bytes()
+    want = {model_pacga_mask(w) for w, k in zip(asm_words, kinds) if k == 'PACGA'}
+    have = {int.from_bytes(written[i:i + 4], 'little') for i in range(0, len(written) - 3, 4)}
+    assert want <= have, (sorted(map(hex, want)), 'missing from written image')
+    run(exe, '--verify', '--pacga-mask', target)
+    print(f'pacga mask: {pacga} PACGA words converted in place, none left trapping')
+
+
 def check_trampolines(exe, tmp, code, stubs, asm_words, kinds):
     """Route PACGA to keyless routines in a flagged stub island; check placement, branches and limits."""
     root = tmp / 'pacga'
@@ -410,7 +452,7 @@ def main():
     kinds = [k for _, k in ASM]
     for word, kind in zip(asm_words, kinds):
         native = model_native(word)
-        assert (native is not None) == (kind in ('HINT', 'RET', 'BRANCH', 'LDAPR', 'PAC')), (hex(word), kind)
+        assert (native is not None) == (kind in ('HINT', 'RET', 'BRANCH', 'LDAPR', 'PAC', 'LDRA')), (hex(word), kind)
     code = words_bytes(asm_words)
     stubs = words_bytes([w for w, k in zip(asm_words, kinds) if k == 'BRANCH'] * 3)
     global STUB_REGION
@@ -418,7 +460,8 @@ def main():
     convertible = sum(1 for w in asm_words if model_native(w) is not None)
     stub_region_sites = sum(1 for w in assemble(STUB_ASM) if model_native(w) is not None) * 20
     pacga = sum(1 for k in kinds if k == 'PACGA')
-    ldra = sum(1 for k in kinds if k == 'LDRA')
+    # LDRA words the converter leaves to the emulator (none of the fixture's forms).
+    ldra = sum(1 for w, k in zip(asm_words, kinds) if k == 'LDRA' and model_native(w) is None)
 
     with tempfile.TemporaryDirectory(prefix='b2l-precompile.') as tmpname:
         tmp = pathlib.Path(tmpname)
@@ -534,6 +577,7 @@ def main():
         r = run(exe, '--write', bad / 'dyld_shared_cache_arm64e.01')
         assert 'without their main cache' in r.stderr and (bad / 'dyld_shared_cache_arm64e.01').read_bytes() == group.sub
         check_trampolines(exe, tmp, code, stubs, asm_words, kinds)
+        check_pacga_mask(exe, tmp, code, stubs, asm_words, kinds)
         print(f'precompile fixtures passed: {len(asm_words)} assembled words, {expected_converted} conversions modelled')
 
         if len(sys.argv) > 1:

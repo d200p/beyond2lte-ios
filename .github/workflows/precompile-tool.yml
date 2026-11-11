@@ -1,0 +1,49 @@
+name: B2L ARM64e precompiler tool
+
+# Builds tools/b2l-precompile as a universal macOS binary for the host that
+# prepares the iOS root (an x86_64 macOS VM for the S10). No Apple payload is
+# read or published here: only the repository's own sources and synthetic
+# fixtures are used.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [s10-phase2]
+    paths:
+      - tools/b2l-precompile.c
+      - common/cache/**
+      - tests/test_precompile.py
+      - scripts/test-precompile.sh
+      - .github/workflows/precompile-tool.yml
+
+permissions:
+  contents: read
+
+jobs:
+  precompile-tool:
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Converter vectors and precompiler fixtures (ASan/UBSan)
+        shell: bash
+        run: bash scripts/test-precompile.sh
+      - name: Build universal binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out/precompile
+          clang -O2 -std=c11 -Wall -Wextra -Werror -arch x86_64 -arch arm64 -mmacosx-version-min=13.0 \
+            -Icommon/cache -Ixnu-overlay/osfmk/arm64 \
+            tools/b2l-precompile.c common/cache/b2l_cache_core.c common/cache/CacheSha.c \
+            -o out/precompile/b2l-precompile
+          lipo -info out/precompile/b2l-precompile
+          out/precompile/b2l-precompile --help
+          git rev-parse HEAD > out/precompile/SOURCE-COMMIT.txt
+          (cd out/precompile && shasum -a 256 b2l-precompile > SHA256SUMS)
+          cat out/precompile/SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: b2l-precompile-macos
+          path: out/precompile/
+          if-no-files-found: error

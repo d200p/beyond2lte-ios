@@ -1014,9 +1014,11 @@ static int process_tree(const char *root)
 static void usage(FILE *f)
 {
     fputs("usage: b2l-precompile [--write] [--verify] [--report FILE] [--exclude-text PATH]... [--quiet] [--no-xdev]\n"
-          "                      [--pacga-trampolines] PATH...\n"
+          "                      [--pacga-trampolines | --pacga-mask] PATH...\n"
           "  --pacga-trampolines routes shared-cache PACGA to keyless EL0 routines; the root then\n"
           "  requires a kernel booted with b2l_pacga_keyless=1.\n"
+          "  --pacga-mask rewrites PACGA in place to AND Xd,Xn,#0xffffffff00000000 (NOP for XZR),\n"
+          "  the shared converter's mask result ABI; the root then requires b2l_pacga_mask=1.\n"
           "  Rewrite ARM64e Mach-O and dyld shared-cache code sections with the B2L\n"
           "  allowlisted converter. Without --write, only report. --verify exits 2 when\n"
           "  convertible words remain. PATH is a prepared root, directory or file.\n"
@@ -1037,6 +1039,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--verify")) opt.verify = 1;
         else if (!strcmp(argv[i], "--quiet")) opt.quiet = 1;
         else if (!strcmp(argv[i], "--pacga-trampolines")) opt.pacga = 1;
+        else if (!strcmp(argv[i], "--pacga-mask")) b2l_nc_pacga_mask = 1;
         else if (!strcmp(argv[i], "--no-xdev")) opt.xdev = 0;
         else if (!strcmp(argv[i], "--report") && i + 1 < argc) opt.report = argv[++i];
         else if (!strcmp(argv[i], "--exclude-text") && i + 1 < argc) excludes[opt.excludes++] = argv[++i];
@@ -1044,6 +1047,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(stdout); return 0; }
         else if (argv[i][0] == '-' && argv[i][1]) { usage(stderr); return 1; }
         else paths[npaths++] = argv[i];
+    }
+    if (b2l_nc_pacga_mask && opt.pacga) {
+        fputs("error: --pacga-mask and --pacga-trampolines select different PACGA ABIs\n", stderr);
+        return 1;
     }
     if (opt.excludes == (unsigned)-1) opt.excludes = 0;
     else if (!opt.excludes) { excludes[0] = default_exclude[0]; opt.excludes = 1; }
@@ -1086,6 +1093,8 @@ int main(int argc, char **argv)
            totals.c.words, opt.write ? "converted" : "convertible", totals.c.converted, totals.c.by_class[CLASS_PAC], totals.c.by_class[CLASS_HINT],
            totals.c.by_class[CLASS_RET], totals.c.by_class[CLASS_BRANCH], totals.c.by_class[CLASS_LDAPR], totals.c.excluded,
            totals.c.pacga, totals.c.ldra, totals.written_bytes, totals.errors);
+    if (b2l_nc_pacga_mask)
+        printf("  pacga mask ABI: PACGA converted in place (counted under branch); boot with b2l_pacga_mask=1\n");
     if (opt.pacga)
         printf("  pacga %s=%" PRIu64 " nop=%" PRIu64 " kept_trapping=%" PRIu64 " caves=%" PRIu64 "\n",
                opt.write ? "routed" : "routable", totals.pacga_routed, totals.pacga_nop, totals.pacga_kept, totals.caves);
