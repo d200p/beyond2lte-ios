@@ -388,10 +388,8 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 /* b2l_ax_seed=0: clear the seeded managed accessibility file,
                  * so Reduce Motion/Transparency and cross-fades follow Settings. */
                 "b2l_cache_interactive=1 b2l_ax_seed=0 b2l_dvfs=0 "
-                /* Test: backboardd without the GPU translation library (boot
-                 * 20 showed diagonal stripes in glass/material bars); B2LMali
-                 * still runs its self test and the ACPM clocks. */
-                "b2l_gpu_ui=0 "
+                /* The GPU translation library is back in backboardd: boot 21,
+                 * without it, showed the same glass-bar stripes. */
                 /* Fork build 0148 scanout from surfaces is untested: copy path. */
                 "b2l_scanout=0 "
                 /* The fork keeps 136 black rows for the S10+ camera pill; the

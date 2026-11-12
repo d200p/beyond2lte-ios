@@ -17,6 +17,7 @@
 #include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <libkern/OSCacheControl.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -108,6 +109,9 @@ extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
 #ifndef B2L_GPU_JOIN
 #define B2L_GPU_JOIN 0          /* S10: fork build 0148 batch joining, see draw_hook */
 #endif
+#ifndef B2L_GPU_BLUR
+#define B2L_GPU_BLUR 1          /* S10: gaussian_blur on the GPU, see gpu_blur */
+#endif
 #ifndef B2L_GPU_BATCH
 #define B2L_GPU_BATCH 0         /* S10: fork build 0146 open batches, see draw_hook */
 #endif
@@ -121,6 +125,27 @@ uint64_t b2l_draw_resume;
 __asm__(".text\n.p2align 2\n.globl _b2l_draw_original\n_b2l_draw_original:\n"
     " nop\n stp d9, d8, [sp, #-0x70]!\n stp x28, x27, [sp, #0x10]\n stp x26, x25, [sp, #0x20]\n"
     " adrp x16, _b2l_draw_resume@PAGE\n ldr x16, [x16, _b2l_draw_resume@PAGEOFF]\n br x16\n");
+
+/*
+ * S10: Core Animation's CPU Gaussian blur (three box filters per axis), both
+ * overloads in the 23G90 cache: (data, rowbytes, width, height, sigma_x,
+ * sigma_y, bytes per pixel), which tail-calls the one-sigma form when the two
+ * are equal. Each entry jumps to a hook that blurs on the GPU or runs the
+ * displaced words here and the original body.
+ */
+#define BLUR2_ENTRY 0x1840ae1b8ull
+#define BLUR1_ENTRY 0x18403cf08ull
+static const uint32_t BLUR2_WORDS[4] = { 0xd503201f, 0x6db82beb, 0x6d0123e9, 0xa9026ffc };
+static const uint32_t BLUR1_WORDS[4] = { 0xd503201f, 0x6db923e9, 0xa9016ffc, 0xa90267fa };
+void b2l_blur2_original(uint8_t *data, long rowbytes, int width, int height, float sx, float sy, unsigned bpp);
+void b2l_blur1_original(uint8_t *data, long rowbytes, int width, int height, float sigma, unsigned bpp);
+uint64_t b2l_blur2_resume, b2l_blur1_resume;
+__asm__(".text\n.p2align 2\n.globl _b2l_blur2_original\n_b2l_blur2_original:\n"
+    " nop\n stp d11, d10, [sp, #-0x80]!\n stp d9, d8, [sp, #0x10]\n stp x28, x27, [sp, #0x20]\n"
+    " adrp x16, _b2l_blur2_resume@PAGE\n ldr x16, [x16, _b2l_blur2_resume@PAGEOFF]\n br x16\n"
+    ".p2align 2\n.globl _b2l_blur1_original\n_b2l_blur1_original:\n"
+    " nop\n stp d9, d8, [sp, #-0x70]!\n stp x28, x27, [sp, #0x10]\n stp x26, x25, [sp, #0x20]\n"
+    " adrp x16, _b2l_blur1_resume@PAGE\n ldr x16, [x16, _b2l_blur1_resume@PAGEOFF]\n br x16\n");
 
 /*
  * Places where Core Animation reads or writes a destination on the CPU outside
@@ -201,6 +226,8 @@ static io_connect_t connection;
 
 /* Per pre-hook (index 5..10): calls, ticks, longest call, for the H line. */
 static struct { uint64_t calls, ticks, max; } hook_times[11];
+/* S10: GPU and CPU Gaussian blurs per window, for the H line (see gpu_blur). */
+static struct { uint64_t gpu, gpu_ticks, cpu, cpu_ticks, failed; } blur_stats;
 static unsigned blur_samples;
 static void log_line(const char *format, ...);
 
@@ -356,6 +383,14 @@ report(uint64_t now)
 			uint64_t max = __atomic_exchange_n(&hook_times[i].max, 0, __ATOMIC_RELAXED);
 			used += snprintf(line + used, sizeof(line) - (size_t)used, " %s=%llu/%lluus/max%lluus",
 			    names[i - 5], calls, to_us(ticks), to_us(max));
+		}
+		uint64_t gpu = __atomic_exchange_n(&blur_stats.gpu, 0, __ATOMIC_RELAXED);
+		uint64_t gpu_ticks = __atomic_exchange_n(&blur_stats.gpu_ticks, 0, __ATOMIC_RELAXED);
+		uint64_t cpu = __atomic_exchange_n(&blur_stats.cpu, 0, __ATOMIC_RELAXED);
+		uint64_t cpu_ticks = __atomic_exchange_n(&blur_stats.cpu_ticks, 0, __ATOMIC_RELAXED);
+		if (used > 0 && (size_t)used < sizeof(line)) {
+			snprintf(line + used, sizeof(line) - (size_t)used, " gblur_gpu=%llu/%lluus gblur_cpu=%llu/%lluus",
+			    gpu, to_us(gpu_ticks), cpu, to_us(cpu_ticks));
 		}
 		log_line("%s", line);
 	}
@@ -1275,6 +1310,181 @@ draw_hook(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 	}
 }
 
+/*
+ * S10: the blur on the GPU, for 4-byte pixels. The image is copied into an
+ * aligned scratch level, halved `levels` times with bilinear filtering, then
+ * doubled back the same way into level 0 and copied home: one textured copy
+ * pass per step. Not bit-identical to the CPU's box filters, the same kind of
+ * soft blur. One-byte masks, odd sizes or any GPU failure run the original
+ * on the CPU, on data the GPU path has not touched.
+ */
+#define BLUR_SCRATCH_BYTES (24u << 20)
+#define BLUR_MAX_LEVELS 6
+static uint64_t blur_va;
+static uint8_t *blur_cpu;
+static int blur_state;                  /* 0 untried, 1 ready, -1 no scratch */
+static unsigned blur_logged;
+
+static int
+blur_pass(uint64_t target_va, uint32_t tw, uint32_t th, uint32_t tstride,
+    uint64_t texture_va, uint32_t sw, uint32_t sh, uint32_t sstride)
+{
+	struct b2l_mali_target rt = { target_va, tw, th, tstride, 0, B2L_RT_BGRA, heap_va, heap_bytes };
+	struct b2l_mali_pass pass;
+	b2l_mali_pass_begin(&pass, pass_cpu, pass_va, &rt);
+	b2l_mali_pass_bounds(&pass, 0, 0, tw, th);
+	float zero = 0.0f, one = 1.0f;
+	struct b2l_mali_quad q = {
+		b2l_int_float(0), b2l_int_float(0), b2l_int_float(tw), b2l_int_float(th), 0, 0, 0, 0, { 0, 0, 0, 0 },
+		code_va + SHADER_TEXTURED, texture_va, sw, sh, sstride, B2L_FORMAT_BGRA8_UNORM, B2L_EQ_COPY, 0, 1, 1, 0,
+	};
+	memcpy(&q.u0, &zero, 4);
+	memcpy(&q.v0, &zero, 4);
+	memcpy(&q.u1, &one, 4);
+	memcpy(&q.v1, &one, 4);
+	b2l_mali_pass_add(&pass, &q);
+	struct b2l_mali_submit request = { pass_va + B2L_MALI_PASS_DRAWS, pass_va + B2L_MALI_PASS_FRAGMENT,
+		pass_type, B2L_MALI_PASS_BYTES(pass.draws), 0, 0, { 0 } };
+	uint64_t result[3] = { 0, 0, 0 };
+	uint32_t out_count = 3;
+	kern_return_t kr = IOConnectCallMethod(connection, kB2LMaliSubmit, NULL, 0, &request, sizeof(request),
+	    result, &out_count, NULL, NULL);
+	if (kr || result[0] != B2L_MALI_STATUS_DONE) {
+		log_line("gpu: blur pass kr=0x%x status=%llu %ux%u, stopping", kr, result[0], tw, th);
+		shadow_disabled = 1;
+		return 0;
+	}
+	return 1;
+}
+
+static int
+gpu_blur(uint8_t *data, long rowbytes, int width, int height, float sx, float sy, unsigned bpp, int *levels_out)
+{
+	float sigma = sx > sy ? sx : sy;
+	if (bpp != 4 || width < 16 || height < 16 || width > 4096 || height > 4096 || rowbytes < (long)width * 4 ||
+	    !(sigma >= 1.0f) || sigma > 4096.0f || !shadow_ready || shadow_disabled || connection == MACH_PORT_NULL) {
+		return 0;
+	}
+	/* Each halving and doubling widens the blur about twofold. */
+	int levels = (int)lroundf(log2f(sigma / 0.6f));
+	levels = levels < 1 ? 1 : levels > BLUR_MAX_LEVELS ? BLUR_MAX_LEVELS : levels;
+	while (levels > 1 && ((width >> levels) < 2 || (height >> levels) < 2)) {
+		levels--;
+	}
+	uint64_t offset[BLUR_MAX_LEVELS + 1], at = 0;
+	uint32_t lw[BLUR_MAX_LEVELS + 1], lh[BLUR_MAX_LEVELS + 1], ls[BLUR_MAX_LEVELS + 1];
+	for (int i = 0; i <= levels; i++) {
+		lw[i] = (uint32_t)((width + (1 << i) - 1) >> i);
+		lh[i] = (uint32_t)((height + (1 << i) - 1) >> i);
+		ls[i] = (lw[i] * 4 + 63) & ~63u;
+		offset[i] = at;
+		at = (at + (uint64_t)ls[i] * lh[i] + 63) & ~63ull;
+	}
+	if (at > BLUR_SCRATCH_BYTES) {
+		return 0;
+	}
+	*levels_out = levels;
+	while (__atomic_exchange_n(&shadow_busy, 1, __ATOMIC_ACQUIRE)) {
+	}
+	int ok = 0;
+	if (blur_state == 0) {
+		uint32_t type;
+		blur_state = create_buffer(BLUR_SCRATCH_BYTES, 0, &blur_va, &type, &blur_cpu) ? 1 : -1;
+		log_line("blur: scratch %s", blur_state == 1 ? "ready" : "failed");
+	}
+	if (blur_state == 1 && !shadow_disabled) {
+		batch_commit();
+		for (int y = 0; y < height; y++) {
+			memcpy(blur_cpu + offset[0] + (size_t)y * ls[0], data + (size_t)y * (size_t)rowbytes, (size_t)width * 4);
+		}
+		struct flush_rect level0 = { blur_cpu + offset[0], ls[0], (size_t)width * 4, (unsigned)height };
+		cache_flush(&level0);
+		ok = 1;
+		for (int i = 1; ok && i <= levels; i++) {
+			ok = blur_pass(blur_va + offset[i], lw[i], lh[i], ls[i], blur_va + offset[i - 1], lw[i - 1], lh[i - 1], ls[i - 1]);
+		}
+		for (int i = levels - 1; ok && i >= 0; i--) {
+			ok = blur_pass(blur_va + offset[i], lw[i], lh[i], ls[i], blur_va + offset[i + 1], lw[i + 1], lh[i + 1], ls[i + 1]);
+		}
+		if (ok) {
+			cache_flush(&level0);   /* drop lines from before the GPU wrote */
+			for (int y = 0; y < height; y++) {
+				memcpy(data + (size_t)y * (size_t)rowbytes, blur_cpu + offset[0] + (size_t)y * ls[0], (size_t)width * 4);
+			}
+		}
+	}
+	__atomic_store_n(&shadow_busy, 0, __ATOMIC_RELEASE);
+	return ok;
+}
+
+static void
+blur_note(int width, int height, long rowbytes, float sx, float sy, unsigned bpp, int gpu, int levels, uint64_t ticks)
+{
+	if (gpu) {
+		__atomic_fetch_add(&blur_stats.gpu, 1, __ATOMIC_RELAXED);
+		__atomic_fetch_add(&blur_stats.gpu_ticks, ticks, __ATOMIC_RELAXED);
+	} else {
+		__atomic_fetch_add(&blur_stats.cpu, 1, __ATOMIC_RELAXED);
+		__atomic_fetch_add(&blur_stats.cpu_ticks, ticks, __ATOMIC_RELAXED);
+	}
+	if (__atomic_fetch_add(&blur_logged, 1, __ATOMIC_RELAXED) < 24) {
+		log_line("GB %dx%d rb=%ld sigma=%g,%g bpp=%u gpu=%d levels=%d us=%llu", width, height, rowbytes, sx, sy, bpp,
+		    gpu, levels, to_us(ticks));
+	}
+}
+
+static void
+blur2_hook(uint8_t *data, long rowbytes, int width, int height, float sx, float sy, unsigned bpp)
+{
+	uint64_t start = mach_absolute_time();
+	int levels = 0;
+	if (B2L_GPU_BLUR && gpu_blur(data, rowbytes, width, height, sx, sy, bpp, &levels)) {
+		blur_note(width, height, rowbytes, sx, sy, bpp, 1, levels, mach_absolute_time() - start);
+		return;
+	}
+	if (sx == sy) {
+		b2l_blur1_original(data, rowbytes, width, height, sx, bpp);
+	} else {
+		b2l_blur2_original(data, rowbytes, width, height, sx, sy, bpp);
+	}
+	blur_note(width, height, rowbytes, sx, sy, bpp, 0, 0, mach_absolute_time() - start);
+}
+
+static void
+blur1_hook(uint8_t *data, long rowbytes, int width, int height, float sigma, unsigned bpp)
+{
+	uint64_t start = mach_absolute_time();
+	int levels = 0;
+	if (B2L_GPU_BLUR && gpu_blur(data, rowbytes, width, height, sigma, sigma, bpp, &levels)) {
+		blur_note(width, height, rowbytes, sigma, sigma, bpp, 1, levels, mach_absolute_time() - start);
+		return;
+	}
+	b2l_blur1_original(data, rowbytes, width, height, sigma, bpp);
+	blur_note(width, height, rowbytes, sigma, sigma, bpp, 0, 0, mach_absolute_time() - start);
+}
+
+/* Patch one blur entry; a mismatch leaves it alone. */
+static void
+install_blur_hook(uint64_t slide, uint64_t address, const uint32_t *words, uint64_t *resume, void *hook, const char *name)
+{
+	uint32_t *at = (uint32_t *)(address + slide);
+	if (memcmp(at, words, 16)) {
+		log_line("hook: %s entry bytes differ %08x %08x", name, at[0], at[1]);
+		return;
+	}
+	vm_address_t p = (vm_address_t)at & ~(vm_address_t)(vm_page_size - 1);
+	*resume = (uint64_t)(at + 4);
+	if (vm_protect(mach_task_self(), p, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY)) {
+		log_line("hook: %s not writable", name);
+		return;
+	}
+	struct { uint32_t ldr, br; uint64_t address; } patch = { 0x58000050, 0xd61f0200, (uint64_t)hook };
+	memcpy(at, &patch, sizeof(patch));
+	sys_icache_invalidate(at, sizeof(patch));
+	vm_protect(mach_task_self(), p, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+	log_line("hook: %s on the GPU", name);
+}
+
 static uint64_t
 quartzcore_slide(void)
 {
@@ -1340,6 +1550,8 @@ install_hook(void)
 		vm_protect(mach_task_self(), p, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
 	}
 	log_line("hook: %u pre-hooks installed", (unsigned)(sizeof(prehooks) / sizeof(prehooks[0])));
+	install_blur_hook(slide, BLUR1_ENTRY, BLUR1_WORDS, &b2l_blur1_resume, (void *)blur1_hook, "gaussian_blur");
+	install_blur_hook(slide, BLUR2_ENTRY, BLUR2_WORDS, &b2l_blur2_resume, (void *)blur2_hook, "gaussian_blur2");
 	return 1;
 }
 
