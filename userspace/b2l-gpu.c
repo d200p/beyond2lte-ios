@@ -1318,6 +1318,7 @@ draw_hook(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
  * soft blur. One-byte masks, odd sizes or any GPU failure run the original
  * on the CPU, on data the GPU path has not touched.
  */
+static int create_buffer(uint64_t bytes, uint64_t flags, uint64_t *va, uint32_t *type, uint8_t **cpu);
 #define BLUR_SCRATCH_BYTES (24u << 20)
 #define BLUR_MAX_LEVELS 6
 static uint64_t blur_va;
