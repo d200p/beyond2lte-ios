@@ -105,6 +105,9 @@ extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
 #define MAX_QUADS 48
 #define PASS_DRAWS (MAX_QUADS + 1)
 #define TOLERANCE 2
+#ifndef B2L_GPU_JOIN
+#define B2L_GPU_JOIN 0          /* S10: fork build 0148 batch joining, see draw_hook */
+#endif
 
 static const uint32_t ENTRY_WORDS[4] = { 0xd503201f, 0x6db923e9, 0xa9016ffc, 0xa90267fa };
 
@@ -1111,7 +1114,10 @@ draw_hook(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 	 * small draw, still joins an open batch to its own destination: inside a pass
 	 * it costs no flush, and it keeps the batch alive.
 	 */
-	int may_join = pending && stat != NULL && stat->compared >= LIVE_SAMPLES && stat->wrong == 0 &&
+	/* S10: off by default. On the S10 (boot 15, 0148 library) joined batches
+	 * left black one-pixel outlines around rectangles in Phone, Notes and the
+	 * keyboard. Build with -DB2L_GPU_JOIN=1 to try it again. */
+	int may_join = B2L_GPU_JOIN && pending && stat != NULL && stat->compared >= LIVE_SAMPLES && stat->wrong == 0 &&
 	    (live_kind(&key) || (key.kind == 0 && key.unit0 == 0 && key.blend == BLEND_SOVER));
 	if (shadow_ready && !shadow_disabled && (want_shadow || may_go_live || may_join) &&
 	    (owner || !__atomic_exchange_n(&shadow_busy, 1, __ATOMIC_ACQUIRE))) {
