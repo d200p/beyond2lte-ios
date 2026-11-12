@@ -108,6 +108,9 @@ extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
 #ifndef B2L_GPU_JOIN
 #define B2L_GPU_JOIN 0          /* S10: fork build 0148 batch joining, see draw_hook */
 #endif
+#ifndef B2L_GPU_BATCH
+#define B2L_GPU_BATCH 0         /* S10: fork build 0146 open batches, see draw_hook */
+#endif
 
 static const uint32_t ENTRY_WORDS[4] = { 0xd503201f, 0x6db923e9, 0xa9016ffc, 0xa90267fa };
 
@@ -1132,6 +1135,17 @@ draw_hook(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 			batch_commit();
 		} else if (joins || (may_go_live && (t.x1 - t.x0) * (t.y1 - t.y0) >= LIVE_MIN_PIXELS && live_worthwhile(&key, &t))) {
 			uint64_t ticks = batch_append(&t);
+#if !B2L_GPU_BATCH
+			if (ticks) {
+				/* S10: run the pass now, one draw per pass as in fork build 0145.
+				 * With batches left open (0146+) the S10 showed thin black and
+				 * dashed lines along rectangles: the stale-pixel case 0146
+				 * describes, a CPU read of an open batch's destination. */
+				uint64_t committing = mach_absolute_time();
+				batch_commit();
+				ticks += mach_absolute_time() - committing;
+			}
+#endif
 			if (ticks) {
 				/* What the CPU path does after drawing. */
 				marked_destination_function(ctx);

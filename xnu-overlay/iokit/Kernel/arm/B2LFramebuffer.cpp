@@ -66,6 +66,7 @@ enum {
  * leaves 1440x2904, exactly 480x968 points at 3x, and keeps every row start
  * 64-byte aligned. Boot argument b2l_fb_top_inset overrides it. */
 #define B2L_FB_TOP_INSET              136
+#define B2L_FB_SEL_DISPLAY_POWER      12      /* S10 port: one scalar, 0 off / 1 on */
 
 class IOMobileFramebuffer : public IOService {
 	OSDeclareDefaultStructors(IOMobileFramebuffer);
@@ -120,6 +121,21 @@ public:
 	thread_call_t fCopyCall;
 	uint8_t      *fShadow;          /* cached copy of what the panel shows */
 	bool          fShadowValid;     /* set once a copy covered the whole panel */
+	/* S10 port: rendering below panel resolution (boot argument
+	 * b2l_fb_render_width). iOS draws fWidth x fHeight (GetDisplaySize); the
+	 * shadow holds that frame, and each changed span is scaled up (nearest
+	 * texel) into fOutWidth x fOutHeight panel pixels. Unscaled, fOut* equal
+	 * fWidth/fHeight and fShadowStride equals fRowBytes. */
+	bool          fScaled;
+	uint32_t      fOutWidth, fOutHeight, fShadowStride, fDotPitch;
+	uint16_t     *fXMap;            /* source column of each panel column */
+	uint16_t     *fYFirst;          /* first panel row of each source row */
+	uint8_t      *fYCount;          /* panel rows of each source row */
+	bool scaledSetup(uint32_t renderWidth);
+	void presentSpan(uint32_t sy, uint32_t sx0, uint32_t sx1);
+	void presentAll(void);
+	int copyScaled(B2LSurface *s, const Layer *l, bool shadowValid, uint64_t *written,
+	    uint64_t *pixels, bool *covered);
 	/* S10 port: display off. This port has no panel power control, so iOS's
 	 * "display off" left the last frame lit (Always-On could not be turned
 	 * off). Off shows black, which an OLED pixel does not emit, and frames go
@@ -231,7 +247,26 @@ AppleCLCD::start(IOService *provider)
 	 * b2l_fb_dirty=0 restores full-frame copies. */
 	uint32_t dirty = 1;
 	PE_parse_boot_argn("b2l_fb_dirty", &dirty, sizeof(dirty));
-	fShadow = dirty ? (uint8_t *)IOMallocData((vm_size_t)fRowBytes * fHeight) : NULL;
+	fOutWidth = fWidth;
+	fOutHeight = fHeight;
+	fShadowStride = fRowBytes;
+	fDotPitch = B2L_FB_DOT_PITCH;
+	uint32_t renderWidth = 0;
+	PE_parse_boot_argn("b2l_fb_render_width", &renderWidth, sizeof(renderWidth));
+	if (dirty && renderWidth >= 320 && renderWidth < fWidth && !scaledSetup(renderWidth)) {
+		IOLog("B2L FB: rendering at %u wide unavailable, full resolution\n", renderWidth);
+	}
+	fShadow = dirty ? (uint8_t *)IOMallocData((vm_size_t)fShadowStride * fHeight) : NULL;
+	if (fScaled && fShadow == NULL) {
+		/* The scaled path draws only from the shadow: without one, full size. */
+		fScaled = false;
+		fWidth = fOutWidth;
+		fHeight = fOutHeight;
+		fShadowStride = fRowBytes;
+		fDotPitch = B2L_FB_DOT_PITCH;
+	}
+	IOLog("B2L FB: iOS renders %ux%u, panel %ux%u%s, dot pitch %u\n", fWidth, fHeight, fOutWidth, fOutHeight,
+	    fScaled ? " (scaled up)" : "", fDotPitch);
 	uint32_t probe = 0;
 	PE_parse_boot_argn("b2l_fb_probe", &probe, sizeof(probe));
 	if (probe) probeStart();
@@ -241,7 +276,7 @@ AppleCLCD::start(IOService *provider)
 	 * path stays, unused, behind fCopyCall). */
 	fCopyCall = NULL;
 	IOLog("B2L FB: present shadow %s, copy worker %s\n", fShadow ? "on" : "off", fCopyCall ? "on" : "off");
-	/* S10 port: display off from the power key (B2LInput). b2l_fb_blank=0 disables it. */
+	/* S10 port: display off from iOS (selector 12). b2l_fb_blank=0 disables it. */
 	uint32_t blank = 1;
 	PE_parse_boot_argn("b2l_fb_blank", &blank, sizeof(blank));
 	fBlankCall = blank ? thread_call_allocate(&AppleCLCD::blankWorker, this) : NULL;
@@ -508,8 +543,9 @@ AppleCLCD::copyWorker(thread_call_param_t owner, thread_call_param_t unused __un
 	((AppleCLCD *)owner)->runCopy();
 }
 
-/* S10 port: display off/on, see fBlanked. Called from the input poll: only
- * records the wish; the panel is rewritten on a thread call. */
+/* S10 port: display off/on, see fBlanked. Called from iOS's display power
+ * request (selector 12): only records the wish; the panel is rewritten on a
+ * thread call. */
 extern "C" void
 b2l_fb_display_power(int on)
 {
@@ -546,7 +582,7 @@ AppleCLCD::applyBlank(void)
 	uint64_t start = mach_absolute_time();
 	if (off) {
 		/* Whole rows, so every write is 64-byte aligned like all other panel writes. */
-		for (uint32_t y = 0; y < fHeight; y++) {
+		for (uint32_t y = 0; y < fOutHeight; y++) {
 			volatile uint64_t *row = (volatile uint64_t *)(fPixels + (uintptr_t)y * fRowBytes);
 			for (uint32_t x = 0; x < fRowBytes / 8; x++) row[x] = 0xff000000ff000000ull;
 		}
@@ -597,9 +633,14 @@ AppleCLCD::restoreAfterWake(void)
 	fBusy = true;
 	IOLockUnlock(fLock);
 	const uint64_t panelBytes = (uint64_t)fRowBytes * fHeight;
-	bool restored = b2l_blit((void *)fPixels, panelBytes, fWidth, fHeight, fRowBytes,
-	    fShadow, panelBytes, fWidth, fHeight, fRowBytes, 0, 0, 0, 0, 0,
-	    (int32_t)fWidth, (int32_t)fHeight) != 0;
+	bool restored = true;
+	if (fScaled) {
+		presentAll();
+	} else {
+		restored = b2l_blit((void *)fPixels, panelBytes, fWidth, fHeight, fRowBytes,
+		    fShadow, panelBytes, fWidth, fHeight, fRowBytes, 0, 0, 0, 0, 0,
+		    (int32_t)fWidth, (int32_t)fHeight) != 0;
+	}
 	__asm__ volatile("dsb sy":::"memory");
 	IOLockLock(fLock);
 	if (restored) fShadowValid = true;
@@ -607,6 +648,111 @@ AppleCLCD::restoreAfterWake(void)
 	IOLockWakeup(fLock, &fBusy, false);
 	IOLockUnlock(fLock);
 	b2l_diag_record("B2L FB: display on, no frame in 1 s, shadow %s\n", restored ? "restored" : "not restored");
+}
+
+/* S10 port: geometry for rendering renderWidth wide. The height keeps the
+ * panel's aspect and is a whole number of points at 3x. */
+bool
+AppleCLCD::scaledSetup(uint32_t renderWidth)
+{
+	uint32_t renderHeight = (uint32_t)(((uint64_t)fOutHeight * renderWidth + fOutWidth / 2) / fOutWidth);
+	renderHeight += (3 - renderHeight % 3) % 3;
+	if (renderHeight == 0 || renderHeight >= fOutHeight || fOutWidth > 65535 || fOutHeight > 65535) {
+		return false;
+	}
+	uint16_t *xmap = (uint16_t *)IOMallocData(fOutWidth * sizeof(uint16_t));
+	uint16_t *yfirst = (uint16_t *)IOMallocData(renderHeight * sizeof(uint16_t));
+	uint8_t *ycount = (uint8_t *)IOMallocData(renderHeight);
+	if (xmap == NULL || yfirst == NULL || ycount == NULL) {
+		if (xmap) IOFreeData(xmap, fOutWidth * sizeof(uint16_t));
+		if (yfirst) IOFreeData(yfirst, renderHeight * sizeof(uint16_t));
+		if (ycount) IOFreeData(ycount, renderHeight);
+		return false;
+	}
+	for (uint32_t x = 0; x < fOutWidth; x++) {
+		xmap[x] = (uint16_t)((uint64_t)x * renderWidth / fOutWidth);
+	}
+	memset(ycount, 0, renderHeight);
+	for (uint32_t y = 0; y < fOutHeight; y++) {
+		uint32_t sy = (uint32_t)((uint64_t)y * renderHeight / fOutHeight);
+		if (ycount[sy] == 0) yfirst[sy] = (uint16_t)y;
+		ycount[sy]++;
+	}
+	fXMap = xmap;
+	fYFirst = yfirst;
+	fYCount = ycount;
+	fWidth = renderWidth;
+	fHeight = renderHeight;
+	fShadowStride = (renderWidth * 4 + 63) & ~63u;
+	fDotPitch = (uint32_t)((uint64_t)B2L_FB_DOT_PITCH * renderWidth / fOutWidth);
+	fScaled = true;
+	return true;
+}
+
+/* Shadow row sy, columns [sx0, sx1), to the panel rows it covers. Panel spans
+ * are widened to 64-byte boundaries like every other panel write. */
+void
+AppleCLCD::presentSpan(uint32_t sy, uint32_t sx0, uint32_t sx1)
+{
+	const uint32_t *row = (const uint32_t *)(fShadow + (size_t)sy * fShadowStride);
+	uint32_t dx0 = (uint32_t)(((uint64_t)sx0 * fOutWidth + fWidth - 1) / fWidth);
+	uint32_t dx1 = (uint32_t)(((uint64_t)sx1 * fOutWidth + fWidth - 1) / fWidth);
+	dx0 &= ~15u;
+	dx1 = (dx1 + 15) & ~15u;
+	if (dx1 > fOutWidth) dx1 = fOutWidth;
+	for (uint32_t k = 0; k < fYCount[sy]; k++) {
+		uintptr_t base = fPixels + (uintptr_t)(fYFirst[sy] + k) * fRowBytes;
+		volatile uint64_t *out = (volatile uint64_t *)base;
+		uint32_t dx = dx0;
+		for (; dx + 1 < dx1; dx += 2) {
+			out[dx / 2] = (uint64_t)row[fXMap[dx]] | ((uint64_t)row[fXMap[dx + 1]] << 32);
+		}
+		if (dx < dx1) ((volatile uint32_t *)base)[dx] = row[fXMap[dx]];
+	}
+}
+
+void
+AppleCLCD::presentAll(void)
+{
+	for (uint32_t sy = 0; sy < fHeight; sy++) presentSpan(sy, 0, fWidth);
+}
+
+/* One layer into the shadow; every changed row span is presented scaled.
+ * Returns 1 when the layer was shown. */
+int
+AppleCLCD::copyScaled(B2LSurface *s, const Layer *l, bool shadowValid, uint64_t *written,
+    uint64_t *pixels, bool *covered)
+{
+	uintptr_t src = s->kernelAddress();
+	if (!src || !s->memory || s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1 ||
+	    s->pixelFormat != B2L_FB_FORMAT_BGRA || fShadow == NULL) {
+		return 0;
+	}
+	int32_t w = l->w, h = l->h;
+	if (w <= 0 || h <= 0) { w = (int32_t)s->width; h = (int32_t)s->height; }
+	const uint64_t shadowBytes = (uint64_t)fShadowStride * fHeight;
+	struct b2l_blit_rect r;
+	if (!b2l_blit_clip(shadowBytes, fWidth, fHeight, fShadowStride, s->memory->getLength(),
+	    s->width, s->height, s->bytesPerRow, s->offset, l->sx, l->sy, l->dx, l->dy, w, h, &r)) {
+		return 0;
+	}
+	uint32_t dy = (uint32_t)(r.dst / fShadowStride), dx = (uint32_t)((r.dst % fShadowStride) / 4);
+	for (uint32_t y = 0; y < r.h; y++) {
+		const uint32_t *in = (const uint32_t *)(src + r.src + (uint64_t)y * s->bytesPerRow);
+		uint32_t *shadow = (uint32_t *)(fShadow + (uint64_t)(dy + y) * fShadowStride + (uint64_t)dx * 4);
+		uint32_t first = 0, last = r.w;
+		if (shadowValid) {
+			while (first < r.w && in[first] == shadow[first]) first++;
+			if (first == r.w) continue;
+			while (last > first && in[last - 1] == shadow[last - 1]) last--;
+		}
+		memcpy(shadow + first, in + first, (size_t)(last - first) * 4);
+		presentSpan(dy + y, dx + first, dx + last);
+		*written += (uint64_t)(last - first) * 4 * fYCount[dy + y];
+	}
+	*pixels += (uint64_t)r.w * r.h;
+	*covered = r.w == fWidth && r.h == fHeight;
+	return 1;
 }
 
 void
@@ -736,7 +882,7 @@ AppleCLCD::runCopy(void)
 
 	if (blanked) {
 		/* S10 port, display off: keep the shadow current, leave the panel black. */
-		const uint64_t shadowBytes = (uint64_t)fRowBytes * fHeight;
+		const uint64_t shadowBytes = (uint64_t)fShadowStride * fHeight;
 		bool full = false;
 		for (uint32_t i = 0; i < job.count; i++) {
 			Layer *l = &job.layer[i];
@@ -747,9 +893,9 @@ AppleCLCD::runCopy(void)
 				int32_t w = l->w, h = l->h;
 				if (w <= 0 || h <= 0) { w = (int32_t)s->width; h = (int32_t)s->height; }
 				struct b2l_blit_rect r;
-				if (b2l_blit_clip(shadowBytes, fWidth, fHeight, fRowBytes, s->memory->getLength(),
+				if (b2l_blit_clip(shadowBytes, fWidth, fHeight, fShadowStride, s->memory->getLength(),
 				    s->width, s->height, s->bytesPerRow, s->offset, l->sx, l->sy, l->dx, l->dy, w, h, &r) &&
-				    b2l_blit(fShadow, shadowBytes, fWidth, fHeight, fRowBytes,
+				    b2l_blit(fShadow, shadowBytes, fWidth, fHeight, fShadowStride,
 				    (const void *)src, s->memory->getLength(), s->width, s->height, s->bytesPerRow, s->offset,
 				    l->sx, l->sy, l->dx, l->dy, w, h) &&
 				    r.w == fWidth && r.h == fHeight) {
@@ -778,6 +924,39 @@ AppleCLCD::runCopy(void)
 			for (uint32_t x = 0; x < fRowBytes / 8; x++) row[x] = 0xff000000ff000000ull;
 		}
 		IOLog("B2L FB: first IOSurface frame copied to physical scanout\n");
+	}
+	if (fScaled) {
+		uint64_t scaledStart = mach_absolute_time(), scaledWritten = 0, scaledPixels = 0;
+		uint32_t scaledCopies = 0, scaledFull = 0;
+		bool valid = shadowValid, coveredAll = false;
+		for (uint32_t i = 0; i < job.count; i++) {
+			uint64_t n = 0, px = 0;
+			bool cov = false;
+			if (copyScaled(job.layer[i].s, &job.layer[i], valid, &n, &px, &cov)) {
+				scaledCopies++;
+				scaledWritten += n;
+				scaledPixels += px;
+				if (cov) { scaledFull++; valid = true; coveredAll = true; }
+			}
+			job.layer[i].s->release();
+		}
+		__asm__ volatile("dsb sy":::"memory");
+		uint64_t scaledTicks = mach_absolute_time() - scaledStart;
+		if (scaledCopies) b2l_fb_copy_note(scaledTicks);
+		IOLockLock(fLock);
+		if (coveredAll) fShadowValid = true;
+		fPerfCopies += scaledCopies;
+		fPerfFull += scaledFull;
+		fPerfPixels += scaledPixels;
+		fPerfWritten += scaledWritten;
+		if (scaledCopies) {
+			fPerfTicks += scaledTicks;
+			if (scaledTicks > fPerfMaxTicks) fPerfMaxTicks = scaledTicks;
+		}
+		fBusy = false;
+		IOLockWakeup(fLock, &fBusy, false);
+		IOLockUnlock(fLock);
+		return;
 	}
 	if (job.count == 1 && flipTo(job.layer[0].s, &job.layer[0])) {
 		job.layer[0].s->release();
@@ -1131,7 +1310,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		outCount = 1;
 		break;
 	case kB2LFBGetDotPitch:
-		out[0] = B2L_FB_DOT_PITCH;
+		out[0] = fFB->fDotPitch;
 		outCount = 1;
 		break;
 	case kB2LFBNotifications:
@@ -1149,6 +1328,16 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		break;
 	case kB2LFBSwapWait:
 		fFB->waitIdle();
+		break;
+	case B2L_FB_SEL_DISPLAY_POWER:
+		/* S10 port: iOS's display power request. Boot 16: backboardd sends
+		 * selector 25 then 12 with 0 when the display goes off (power key,
+		 * auto-lock) and 1 when it comes on. Still answered Unsupported, as
+		 * before, so iOS behaves as it did; the panel now follows it. */
+		if (args->scalarInputCount == 1 && args->scalarInput != NULL) {
+			b2l_fb_display_power(args->scalarInput[0] != 0);
+		}
+		ret = kIOReturnUnsupported;
 		break;
     default:
 		ret = kIOReturnUnsupported;
