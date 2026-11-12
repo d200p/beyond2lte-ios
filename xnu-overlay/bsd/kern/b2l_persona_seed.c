@@ -233,6 +233,43 @@ static void b2l_accessibility_before_init(vfs_context_t ctx)
     printf("B2L AXSEED: reduce motion/transparency defaults managed=%d user=%d sync=%d (0 seeded, %d preserved different file)\n",
         managed,user,error,EEXIST);
 }
+/* S10 port, b2l_mg_refresh=1: MobileGestalt keeps what it computed once, so a
+ * new device-tree value (display-corner-radius) is only read after its cache
+ * is rebuilt. The cache is renamed once to .b2l-before-corner-v1.plist in the
+ * same folder; MobileGestalt then recreates it natively. Once the backup
+ * exists nothing more happens. Returns 0 renamed, EEXIST already done. */
+static const char mg_cache_path[]="/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist";
+static const char mg_cache_backup[]="/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.b2l-before-corner-v1.plist";
+static int b2l_mg_cache_refresh(vfs_context_t ctx)
+{
+    vnode_t saved=NULLVP;
+    int error=vnode_lookup(mg_cache_backup,0,&saved,ctx);
+    if(!error){vnode_put(saved);return EEXIST;}
+    if(error!=ENOENT)return error;
+    struct nameidata from,to;bool have_to=false;
+    NDINIT(&from,DELETE,OP_UNLINK,WANTPARENT,UIO_SYSSPACE,CAST_USER_ADDR_T(mg_cache_path),ctx);
+    error=namei(&from);if(error)return error;
+    if(!root_type(from.ni_vp,VREG)||!root_type(from.ni_dvp,VDIR)){error=EINVAL;goto done;}
+    NDINIT(&to,RENAME,OP_RENAME,WANTPARENT,UIO_SYSSPACE,CAST_USER_ADDR_T(mg_cache_backup),ctx);
+    error=namei(&to);if(error)goto done;have_to=true;
+    if(to.ni_vp){error=EEXIST;goto done;}
+    if(to.ni_dvp!=from.ni_dvp){error=EXDEV;goto done;}
+    error=vn_rename(from.ni_dvp,&from.ni_vp,&from.ni_cnd,NULL,to.ni_dvp,&to.ni_vp,&to.ni_cnd,NULL,VFS_RENAME_EXCL,ctx);
+    if(!error)error=VNOP_FSYNC(from.ni_dvp,MNT_WAIT,ctx);
+done:
+    if(have_to)lookup_done(&to);
+    lookup_done(&from);
+    return error;
+}
+static void b2l_mg_before_init(vfs_context_t ctx)
+{
+    int refresh=0;
+    if(!PE_parse_boot_argn("b2l_mg_refresh",&refresh,sizeof(refresh))||refresh!=1)return;
+    int error=b2l_mg_cache_refresh(ctx);
+    int sync=error?0:VFS_SYNC(vnode_mount(rootvnode),MNT_WAIT,ctx);
+    printf("B2L MG: MobileGestalt cache refresh error=%d sync=%d (0 moved aside, %d already done, %d no cache)\n",
+        error,sync,EEXIST,ENOENT);
+}
 #endif
 #ifndef B2L_PERSONA_HOST_TEST
 extern void b2l_acpm_dvfs_start(void);
@@ -245,8 +282,10 @@ void b2l_persona_before_init(void)
     b2l_acpm_dvfs_start();
     b2l_wifi_diag_start();
     if(rootvnode&&!vfs_isrdonly(vnode_mount(rootvnode))&&
-       !strcmp(vfs_statfs(vnode_mount(rootvnode))->f_fstypename,"hfs"))
+       !strcmp(vfs_statfs(vnode_mount(rootvnode))->f_fstypename,"hfs")){
         b2l_accessibility_before_init(vfs_context_current());
+        b2l_mg_before_init(vfs_context_current());
+    }
 #endif
     if(!b2l_amfi_active()||!rootvnode||vfs_isrdonly(vnode_mount(rootvnode))||
        strcmp(vfs_statfs(vnode_mount(rootvnode))->f_fstypename,"hfs"))return;

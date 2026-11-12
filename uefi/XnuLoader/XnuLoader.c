@@ -388,6 +388,9 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 /* b2l_ax_seed=0: clear the seeded managed accessibility file,
                  * so Reduce Motion/Transparency and cross-fades follow Settings. */
                 "b2l_cache_interactive=1 b2l_ax_seed=0 b2l_dvfs=0 "
+                /* Rebuild MobileGestalt's cache once (the old one is kept), so
+                 * the new /product display-corner-radius is read. */
+                "b2l_mg_refresh=1 "
                 /* The GPU translation library is back in backboardd: boot 21,
                  * without it, showed the same glass-bar stripes. The GPU runs
                  * at its 702 MHz top when busy (fork default 433); B2LMali
