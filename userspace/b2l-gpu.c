@@ -19,6 +19,7 @@
 #include <libkern/OSCacheControl.h>
 #include <math.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -233,6 +234,64 @@ static const struct {
 
 static io_connect_t connection;
 
+/*
+ * S10: a live GPU pass loads whole 16x16 tiles of the destination and writes
+ * them back. Core Animation renders on several threads (backboardd used up to
+ * 3.7 cores in boot 26), so a CPU draw on another thread could land in those
+ * tiles between the load and the write-back and be overwritten with what was
+ * there before, often the cleared surface: the thin black, dashed lines along
+ * rectangles of boots 15, 16 and 27 (the shadow compare runs on a private copy
+ * and never sees it). CPU draws and the pre-hooked functions are readers and
+ * run together; a live pass is the writer: it stops new readers and waits for
+ * the running ones. A thread already inside a hooked function (depth > 0)
+ * never becomes the writer, so the two cannot wait on each other.
+ */
+static int draw_readers, draw_writer;
+static __thread int draw_depth;
+
+static void
+draw_read_enter(void)
+{
+	if (draw_depth++ > 0) {
+		return;
+	}
+	for (;;) {
+		while (__atomic_load_n(&draw_writer, __ATOMIC_SEQ_CST)) {
+			sched_yield();
+		}
+		__atomic_fetch_add(&draw_readers, 1, __ATOMIC_SEQ_CST);
+		if (!__atomic_load_n(&draw_writer, __ATOMIC_SEQ_CST)) {
+			return;
+		}
+		__atomic_fetch_sub(&draw_readers, 1, __ATOMIC_SEQ_CST);
+	}
+}
+
+static void
+draw_read_exit(void)
+{
+	if (--draw_depth == 0) {
+		__atomic_fetch_sub(&draw_readers, 1, __ATOMIC_SEQ_CST);
+	}
+}
+
+static void
+draw_write_enter(void)
+{
+	while (__atomic_exchange_n(&draw_writer, 1, __ATOMIC_SEQ_CST)) {
+		sched_yield();
+	}
+	while (__atomic_load_n(&draw_readers, __ATOMIC_SEQ_CST)) {
+		sched_yield();
+	}
+}
+
+static void
+draw_write_exit(void)
+{
+	__atomic_store_n(&draw_writer, 0, __ATOMIC_SEQ_CST);
+}
+
 /* Per pre-hook (index 5..10): calls, ticks, longest call, for the H line. */
 static struct { uint64_t calls, ticks, max; } hook_times[11];
 /* S10: GPU and CPU Gaussian blurs per window, for the H line (see gpu_blur). */
@@ -255,6 +314,7 @@ b2l_hook_enter(uint64_t which, const uint64_t *x, const uint64_t *q)
 		log_line("BLUR x0=%llx x1=%llx x2=%llx x3=%llx x4=%llx x5=%llx f=%g,%g,%g,%g d=%g,%g,%g,%g",
 		    x[0], x[1], x[2], x[3], x[4], x[5], f[0], f[1], f[2], f[3], d[0], d[1], d[2], d[3]);
 	}
+	draw_read_enter();
 	return mach_absolute_time();
 }
 
@@ -265,6 +325,7 @@ b2l_hook_timed(uint64_t which, uint64_t start)
 		return;
 	}
 	uint64_t ticks = mach_absolute_time() - start;
+	draw_read_exit();
 	__atomic_fetch_add(&hook_times[which].calls, 1, __ATOMIC_RELAXED);
 	__atomic_fetch_add(&hook_times[which].ticks, ticks, __ATOMIC_RELAXED);
 	uint64_t max = __atomic_load_n(&hook_times[which].max, __ATOMIC_RELAXED);
@@ -1220,7 +1281,8 @@ draw_hook(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 
 	/* Render threads share the pass and shadow buffers: one at a time. */
 	int want_shadow = stat != NULL && compared_in_window < SHADOW_PER_WINDOW && stat->compared < SHADOW_PER_KEY;
-	int may_go_live = stat != NULL && live_kind(&key) && stat->compared >= LIVE_SAMPLES && stat->wrong == 0;
+	int may_go_live = stat != NULL && live_kind(&key) && stat->compared >= LIVE_SAMPLES && stat->wrong == 0 &&
+	    draw_depth == 0;
 	int pending = __atomic_load_n(&batch.active, __ATOMIC_ACQUIRE);
 	if (pending) {
 		/* A batch is open: this draw either joins it or ends it before it touches memory. */
@@ -1251,6 +1313,7 @@ draw_hook(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 			stat->why = why;
 			batch_commit();
 		} else if (joins || (may_go_live && (t.x1 - t.x0) * (t.y1 - t.y0) >= LIVE_MIN_PIXELS && live_worthwhile(&key, &t))) {
+			draw_write_enter();
 			uint64_t ticks = batch_append(&t);
 #if !B2L_GPU_BATCH
 			if (ticks) {
@@ -1263,6 +1326,7 @@ draw_hook(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 				ticks += mach_absolute_time() - committing;
 			}
 #endif
+			draw_write_exit();
 			if (ticks) {
 				/* What the CPU path does after drawing. */
 				marked_destination_function(ctx);
@@ -1291,7 +1355,9 @@ draw_hook(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 		batch_commit();
 	}
 	uint64_t begin = mach_absolute_time();
+	draw_read_enter();
 	b2l_draw_original(ctx, mode, count, indices, vertices, a, b, clip);
+	draw_read_exit();
 	uint64_t end = mach_absolute_time();
 	ticks_in_draws += end - begin;
 	draws_total++;
@@ -1394,7 +1460,10 @@ gpu_blur(uint8_t *data, long rowbytes, int width, int height, float sx, float sy
 		return 0;
 	}
 	*levels_out = levels;
-	while (__atomic_exchange_n(&shadow_busy, 1, __ATOMIC_ACQUIRE)) {
+	/* Inside blur_surface, a reader: waiting here could wait on a writer that
+	 * waits on us. Busy means the CPU blurs this one. */
+	if (__atomic_exchange_n(&shadow_busy, 1, __ATOMIC_ACQUIRE)) {
+		return 0;
 	}
 	int ok = 0;
 	if (blur_state == 0) {
