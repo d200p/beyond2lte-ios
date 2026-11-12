@@ -12,6 +12,7 @@
 #include <kern/task.h>
 #include <kern/processor.h>
 #include <kern/recount.h>
+#include <arm64/proc_reg.h>
 #include <string.h>
 #include "b2l_cpu_clock.h"
 #include "b2l_task_dump.h"
@@ -103,6 +104,88 @@ static void b2l_cputop_report(void)
     }
     b2l_early_trace("%s\n", line);
 }
+/*
+ * S10 port diagnostic: where backboardd's CPU time goes. The timer interrupt
+ * (sleh_irq, patch 0068) passes the interrupted state; when it interrupted a
+ * backboardd thread, that PC is counted in a 64-byte bucket, user and kernel
+ * alike (kernel PCs are slid: anchor, on the header line, is where
+ * b2l_pcs_report itself was loaded). Each report
+ * window prints the busiest buckets and starts a new table:
+ *   B2L PCS: samples=N user=N kernel=N lost=N buckets=N shown=N kept=N anchor=0x...
+ *   B2L PCS: pc=count ... (eight per line, busiest first)
+ */
+#define B2L_PCS_SLOTS 4096u     /* power of two */
+#define B2L_PCS_PROBE 32u
+#define B2L_PCS_SHOW  192u
+struct b2l_pcs_slot { uint64_t pc; uint32_t count; uint32_t unused; };
+static struct b2l_pcs_slot b2l_pcs[2][B2L_PCS_SLOTS];
+static struct b2l_pcs_slot b2l_pcs_top[B2L_PCS_SHOW];
+static uint64_t b2l_pcs_samples[2], b2l_pcs_user[2], b2l_pcs_lost[2];
+static uint32_t b2l_pcs_set;
+void b2l_pc_sample(arm_saved_state_t *state);
+void b2l_pc_sample(arm_saved_state_t *state)
+{
+    task_t task = current_task();
+    if (state == NULL || task == TASK_NULL || task == kernel_task) return;
+    void *p = get_bsdtask_info(task);
+    const char *name = p ? proc_name_address((struct proc *)p) : NULL;
+    if (name == NULL || strncmp(name, "backboardd", 11) != 0) return;
+    unsigned set = __atomic_load_n(&b2l_pcs_set, __ATOMIC_ACQUIRE) & 1u;
+    uint64_t key = (uint64_t)get_saved_state_pc(state) & ~63ull;
+    __atomic_fetch_add(&b2l_pcs_samples[set], 1, __ATOMIC_RELAXED);
+    if (PSR64_IS_USER64(get_saved_state_cpsr(state))) __atomic_fetch_add(&b2l_pcs_user[set], 1, __ATOMIC_RELAXED);
+    unsigned h = (unsigned)(((key >> 6) * 0x9E3779B97F4A7C15ull) >> 52);
+    for (unsigned i = 0; key != 0 && i < B2L_PCS_PROBE; i++) {
+        struct b2l_pcs_slot *slot = &b2l_pcs[set][(h + i) & (B2L_PCS_SLOTS - 1)];
+        uint64_t seen = __atomic_load_n(&slot->pc, __ATOMIC_RELAXED);
+        if (seen == 0) {
+            uint64_t expected = 0;
+            seen = __atomic_compare_exchange_n(&slot->pc, &expected, key, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED) ? key : expected;
+        }
+        if (seen == key) { __atomic_fetch_add(&slot->count, 1, __ATOMIC_RELAXED); return; }
+    }
+    __atomic_fetch_add(&b2l_pcs_lost[set], 1, __ATOMIC_RELAXED);
+}
+static void b2l_pcs_report(void)
+{
+    unsigned set = __atomic_load_n(&b2l_pcs_set, __ATOMIC_ACQUIRE) & 1u;
+    __atomic_store_n(&b2l_pcs_set, set ^ 1u, __ATOMIC_RELEASE);
+    delay(200);     /* an interrupt that still holds the old set is long done */
+    struct b2l_pcs_slot *table = b2l_pcs[set];
+    unsigned shown = 0, buckets = 0;
+    uint64_t kept = 0;
+    for (unsigned i = 0; i < B2L_PCS_SLOTS; i++) {
+        uint32_t count = table[i].count;
+        if (table[i].pc == 0 || count == 0) continue;
+        buckets++;
+        if (shown == B2L_PCS_SHOW && count <= b2l_pcs_top[B2L_PCS_SHOW - 1].count) continue;
+        unsigned at = shown < B2L_PCS_SHOW ? shown : B2L_PCS_SHOW - 1;
+        while (at > 0 && b2l_pcs_top[at - 1].count < count) { b2l_pcs_top[at] = b2l_pcs_top[at - 1]; at--; }
+        b2l_pcs_top[at].pc = table[i].pc;
+        b2l_pcs_top[at].count = count;
+        if (shown < B2L_PCS_SHOW) shown++;
+    }
+    uint64_t samples = b2l_pcs_samples[set], user = b2l_pcs_user[set], lost = b2l_pcs_lost[set];
+    for (unsigned i = 0; i < shown; i++) kept += b2l_pcs_top[i].count;
+    if (samples) {
+        b2l_early_trace("B2L PCS: samples=%llu user=%llu kernel=%llu lost=%llu buckets=%u shown=%u kept=%llu anchor=0x%llx\n",
+            samples, user, samples - user, lost, buckets, shown, kept,
+            (unsigned long long)(uintptr_t)&b2l_pcs_report);
+        char line[256];
+        int used = 0;
+        for (unsigned i = 0; i < shown; i++) {
+            int n = snprintf(line + used, sizeof(line) - (size_t)used, " %llx=%u",
+                (unsigned long long)b2l_pcs_top[i].pc, b2l_pcs_top[i].count);
+            if (n > 0) used += n;
+            if ((i & 7u) == 7u || i + 1 == shown || (size_t)used > sizeof(line) - 40) {
+                b2l_early_trace("B2L PCS:%s\n", line);
+                used = 0;
+            }
+        }
+    }
+    memset(table, 0, sizeof(b2l_pcs[0]));
+    b2l_pcs_samples[set] = b2l_pcs_user[set] = b2l_pcs_lost[set] = 0;
+}
 /* Estimate the current CPU's core clock from a dependent add chain of
  * 1,048,576 single-cycle instructions timed by the generic timer. No PMU or
  * clock-management register is touched. The value is the clock of whichever
@@ -171,6 +254,7 @@ static void b2l_log_worker(void*argument __unused,wait_result_t result __unused)
                 swaps[0],gap_ns/1000000,swaps[2],temps[0],temps[1],temps[2],temps[3],sent[0]/1000,sent[1]/1000,sent[2]/1000,swaps[4],copy_total_ns/1000000,copy_max_ns/1000000);
             b2l_iokit_busy_report();
             b2l_cputop_report();
+            b2l_pcs_report();
         }
 sleep:
         assert_wait_timeout((event_t)&disk_writer,THREAD_UNINT,early?1:5,NSEC_PER_SEC);

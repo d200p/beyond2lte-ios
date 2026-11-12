@@ -125,6 +125,31 @@ extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
 #ifndef B2L_GPU_BATCH
 #define B2L_GPU_BATCH 0         /* S10: fork build 0146 open batches, see draw_hook */
 #endif
+/*
+ * S10: draws translated one at a time (shadow compare, then live). 0 leaves
+ * every draw to the CPU and only times it for the K lines.
+ */
+#ifndef B2L_GPU_DRAWS
+#define B2L_GPU_DRAWS 1
+#endif
+/*
+ * S10: one-byte masks (format 9) drawn live. Off: the thin dashed black lines
+ * along rectangles came in exactly the boots where these went live (15, 16, 27
+ * and 28; 2 in boot 25, which had none), and the draw lock of boot 28 did not
+ * remove them. In boot 28 a shadow compare of one caught the GPU reading
+ * pixels older than the CPU's, 16 at a time. They stay in shadow mode.
+ */
+#ifndef B2L_GPU_LIVE_MASKS
+#define B2L_GPU_LIVE_MASKS 0
+#endif
+/*
+ * S10: the cross-thread draw lock of boot 28 (see draw_read_enter). Off: it
+ * did not remove the lines, and while a live pass runs it makes every other
+ * render thread wait.
+ */
+#ifndef B2L_GPU_DRAW_LOCK
+#define B2L_GPU_DRAW_LOCK 0
+#endif
 
 static const uint32_t ENTRY_WORDS[4] = { 0xd503201f, 0x6db923e9, 0xa9016ffc, 0xa90267fa };
 
@@ -252,7 +277,7 @@ static __thread int draw_depth;
 static void
 draw_read_enter(void)
 {
-	if (draw_depth++ > 0) {
+	if (draw_depth++ > 0 || !B2L_GPU_DRAW_LOCK) {
 		return;
 	}
 	for (;;) {
@@ -270,7 +295,7 @@ draw_read_enter(void)
 static void
 draw_read_exit(void)
 {
-	if (--draw_depth == 0) {
+	if (--draw_depth == 0 && B2L_GPU_DRAW_LOCK) {
 		__atomic_fetch_sub(&draw_readers, 1, __ATOMIC_SEQ_CST);
 	}
 }
@@ -278,6 +303,9 @@ draw_read_exit(void)
 static void
 draw_write_enter(void)
 {
+	if (!B2L_GPU_DRAW_LOCK) {
+		return;
+	}
 	while (__atomic_exchange_n(&draw_writer, 1, __ATOMIC_SEQ_CST)) {
 		sched_yield();
 	}
@@ -289,6 +317,9 @@ draw_write_enter(void)
 static void
 draw_write_exit(void)
 {
+	if (!B2L_GPU_DRAW_LOCK) {
+		return;
+	}
 	__atomic_store_n(&draw_writer, 0, __ATOMIC_SEQ_CST);
 }
 
@@ -1183,7 +1214,7 @@ live_kind(const struct draw_key *key)
 {
 	/* Image formats 1, 11, 13: no wrong pixels in 0143. Format 9 masks: 65 of 66 in 0144. */
 	int image = (key->unit0 == 1 || key->unit0 == 2) && (key->format == 1 || key->format == IMAGE_FORMAT_RGBA8 ||
-	    key->format == IMAGE_FORMAT_RGBA16F || key->format == IMAGE_FORMAT_MASK);
+	    key->format == IMAGE_FORMAT_RGBA16F || (B2L_GPU_LIVE_MASKS && key->format == IMAGE_FORMAT_MASK));
 	int source = key->unit0 == UNIT_SURFACE || image;
 	if (!source || key->unit1 != 0 || key->image != IMAGE_IDENTITY) {
 		return 0;
@@ -1195,7 +1226,7 @@ live_kind(const struct draw_key *key)
 		return 1;
 	}
 	/* Masks arrive with the Sover blend and other flag bits set. */
-	return key->format == IMAGE_FORMAT_MASK && key->blend == BLEND_SOVER && (key->blend_on & 1);
+	return B2L_GPU_LIVE_MASKS && key->format == IMAGE_FORMAT_MASK && key->blend == BLEND_SOVER && (key->blend_on & 1);
 }
 
 /* A plain copy is only worth the GPU when it has to filter. */
@@ -1280,8 +1311,9 @@ draw_hook(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 	int sampled = 0, owner = 0;
 
 	/* Render threads share the pass and shadow buffers: one at a time. */
-	int want_shadow = stat != NULL && compared_in_window < SHADOW_PER_WINDOW && stat->compared < SHADOW_PER_KEY;
-	int may_go_live = stat != NULL && live_kind(&key) && stat->compared >= LIVE_SAMPLES && stat->wrong == 0 &&
+	int want_shadow = B2L_GPU_DRAWS && stat != NULL && compared_in_window < SHADOW_PER_WINDOW &&
+	    stat->compared < SHADOW_PER_KEY;
+	int may_go_live = B2L_GPU_DRAWS && stat != NULL && live_kind(&key) && stat->compared >= LIVE_SAMPLES && stat->wrong == 0 &&
 	    draw_depth == 0;
 	int pending = __atomic_load_n(&batch.active, __ATOMIC_ACQUIRE);
 	if (pending) {

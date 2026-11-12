@@ -32,8 +32,10 @@
 #include <IOKit/IOUserClient.h>
 #include <IOKit/IOKitKeys.h>
 #include <kern/clock.h>
+#include <kern/sched_prim.h>
 #include <kern/thread.h>
 #include <kern/thread_call.h>
+#include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
 #include <arm64/b2l_diag.h>
 #include "b2l_mali_core.h"
@@ -66,6 +68,7 @@ static const uint32_t b2l_big_steps[] = { 2080000, 1820000, 1560000, 1378000 };
 
 extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 extern "C" int proc_selfpid(void);
+extern "C" int get_preemption_level(void);
 extern "C" ppnum_t pmap_find_phys(pmap_t map, addr64_t va);
 extern "C" pmap_t get_task_pmap(task_t task);
 
@@ -165,6 +168,7 @@ class B2LMali : public IOService {
 	static uint32_t ioRead(void *ctx, uint32_t offset);
 	static void ioWrite(void *ctx, uint32_t offset, uint32_t value);
 	static void ioDelay(void *ctx, uint32_t us);
+	static void acpmDelay(void *ctx, uint32_t us);
 	static void threadMain(void *owner, wait_result_t result);
 	static void clusterMain(void *owner, wait_result_t result);
 	static uint64_t nowNS();
@@ -266,8 +270,34 @@ B2LMali::ioWrite(void *ctx, uint32_t offset, uint32_t value)
 	__builtin_arm_dsb(15);
 }
 
+/*
+ * S10: a GPU job takes milliseconds, and the thread waiting for it used to
+ * spin in 10 us steps for all of it: the GPU's work still cost a CPU core.
+ * From a thread that may block, the wait between two reads of the GPU's
+ * status now sleeps for B2L_GPU_POLL_US, so that core runs other work (Core
+ * Animation's other render threads, apps). Where blocking is not allowed
+ * (interrupts off, preemption disabled) it spins as before. A wait only gets
+ * longer, never shorter. b2l_gpu_poll_sleep=0 restores the spin.
+ */
+#define B2L_GPU_POLL_US 50
+static int gB2LGpuPollSleep = 1;
+
 void
 B2LMali::ioDelay(void *ctx __unused, uint32_t us)
+{
+	if (gB2LGpuPollSleep && ml_get_interrupts_enabled() && get_preemption_level() == 0) {
+		uint64_t deadline = 0;
+		clock_interval_to_deadline(us > B2L_GPU_POLL_US ? us : B2L_GPU_POLL_US, NSEC_PER_USEC, &deadline);
+		assert_wait_deadline((event_t)&gB2LGpuPollSleep, THREAD_UNINT, deadline);
+		thread_block(THREAD_CONTINUE_NULL);
+		return;
+	}
+	IODelay(us);
+}
+
+/* ACPM mailbox waits: short, keep spinning. */
+void
+B2LMali::acpmDelay(void *ctx __unused, uint32_t us)
 {
 	IODelay(us);
 }
@@ -954,7 +984,7 @@ B2LMali::acpmStart()
 	}
 	acpmMailboxBase = (volatile uint32_t *)acpmMailbox->getVirtualAddress();
 	acpmSramBase = (volatile uint32_t *)acpmSram->getVirtualAddress();
-	acpm = { this, acpmRead, acpmWrite, acpmMailboxWrite, ioDelay };
+	acpm = { this, acpmRead, acpmWrite, acpmMailboxWrite, acpmDelay };
 
 	b2l_diag_record("B2L ACPM: reading channel table\n");
 	IOSleep(B2L_GPU_LOG_DRAIN_MS);
@@ -1661,6 +1691,8 @@ B2LMali::start(IOService *provider)
 		b2l_diag_record("B2L GPU: disabled by boot argument\n");
 		return false;
 	}
+	PE_parse_boot_argn("b2l_gpu_poll_sleep", &gB2LGpuPollSleep, sizeof(gB2LGpuPollSleep));
+	b2l_diag_record("B2L GPU: waits for jobs %s\n", gB2LGpuPollSleep ? "sleep between polls" : "spin");
 	runtimeLock = IOLockAlloc();
 	if (runtimeLock == NULL) {
 		return false;
