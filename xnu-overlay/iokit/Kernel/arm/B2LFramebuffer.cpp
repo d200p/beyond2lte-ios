@@ -651,12 +651,20 @@ AppleCLCD::restoreAfterWake(void)
 }
 
 /* S10 port: geometry for rendering renderWidth wide. The height keeps the
- * panel's aspect and is a whole number of points at 3x. */
+ * panel's aspect and is a whole number of points at 3x, unless the boot
+ * argument b2l_fb_render_height names one: boot 17 at 1125x2376 (375x792
+ * points, no real iPhone) got UIKit's red "rdar:45025538" fallback status
+ * bar, so the loader asks for a real iPhone geometry instead. */
 bool
 AppleCLCD::scaledSetup(uint32_t renderWidth)
 {
 	uint32_t renderHeight = (uint32_t)(((uint64_t)fOutHeight * renderWidth + fOutWidth / 2) / fOutWidth);
 	renderHeight += (3 - renderHeight % 3) % 3;
+	uint32_t requestedHeight = 0;
+	if (PE_parse_boot_argn("b2l_fb_render_height", &requestedHeight, sizeof(requestedHeight)) &&
+	    requestedHeight >= 480) {
+		renderHeight = requestedHeight;
+	}
 	if (renderHeight == 0 || renderHeight >= fOutHeight || fOutWidth > 65535 || fOutHeight > 65535) {
 		return false;
 	}

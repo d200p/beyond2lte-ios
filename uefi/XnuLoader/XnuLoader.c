@@ -391,9 +391,11 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 /* The fork keeps 136 black rows for the S10+ camera pill; the
                  * S10 hole is small, so iOS keeps the whole panel. */
                 "b2l_fb_top_inset=0 "
-                /* iOS draws 1125x2376 (375x792 points at 3x, 39% fewer
-                 * pixels than the panel); the framebuffer copy scales it up. */
-                "b2l_fb_render_width=1125 "
+                /* iOS draws 1179x2556, the iPhone 15/16 geometry (393x852
+                 * points at 3x, 31% fewer pixels than the panel); the
+                 * framebuffer copy scales it up. 375x792 points, no real
+                 * iPhone, got UIKit's red fallback status bar. */
+                "b2l_fb_render_width=1179 b2l_fb_render_height=2556 "
                 "b2l_wifi_diag=5 "
 #else
                 "rd=b2l-diagnostic b2l_root_rw=0 b2l_system_log=0 b2l_native_cache=0 "
