@@ -123,12 +123,19 @@ public:
 	/* S10 port: display off. This port has no panel power control, so iOS's
 	 * "display off" left the last frame lit (Always-On could not be turned
 	 * off). Off shows black, which an OLED pixel does not emit, and frames go
-	 * to the shadow only; on writes the shadow back. Guarded by fLock + fBusy. */
+	 * to the shadow only. On, the panel stays black for iOS's next frame (the
+	 * shadow then still holds the frame from before off, shown for about a
+	 * second in boot 16); only if none comes within a second is the shadow
+	 * written back. Guarded by fLock + fBusy. */
 	bool          fBlanked;
 	int           fBlankWanted;     /* atomic: 1 off, 0 on */
-	thread_call_t fBlankCall;
+	thread_call_t fBlankCall, fRestoreCall;
+	bool          fWakeRestore;     /* the shadow may be shown if no frame comes */
+	uint64_t      fWakeCopies;      /* fPerfCopies when the display came on */
 	void applyBlank(void);
+	void restoreAfterWake(void);
 	static void blankWorker(thread_call_param_t owner, thread_call_param_t unused);
+	static void restoreWorker(thread_call_param_t owner, thread_call_param_t unused);
 
 	/* Scanout straight from a surface: DECON_F window 5, DMA channel 0, as the
 	 * boot chain set them up for the panel memory (0147 dump). */
@@ -238,6 +245,7 @@ AppleCLCD::start(IOService *provider)
 	uint32_t blank = 1;
 	PE_parse_boot_argn("b2l_fb_blank", &blank, sizeof(blank));
 	fBlankCall = blank ? thread_call_allocate(&AppleCLCD::blankWorker, this) : NULL;
+	fRestoreCall = fBlankCall ? thread_call_allocate(&AppleCLCD::restoreWorker, this) : NULL;
 	if (fBlankCall != NULL) gB2LCLCD = this;
 	IOLog("B2L FB: display off by blanking %s\n", fBlankCall ? "on" : "off");
 	IOMemoryDescriptor *regs = IOMemoryDescriptor::withPhysicalAddress(B2L_DECON_BASE, B2L_DECON_BYTES, kIODirectionInOut);
@@ -536,31 +544,69 @@ AppleCLCD::applyBlank(void)
 	bool shadowValid = fShadowValid;
 	IOLockUnlock(fLock);
 	uint64_t start = mach_absolute_time();
-	const uint64_t panelBytes = (uint64_t)fRowBytes * fHeight;
-	bool restored = false;
 	if (off) {
 		/* Whole rows, so every write is 64-byte aligned like all other panel writes. */
 		for (uint32_t y = 0; y < fHeight; y++) {
 			volatile uint64_t *row = (volatile uint64_t *)(fPixels + (uintptr_t)y * fRowBytes);
 			for (uint32_t x = 0; x < fRowBytes / 8; x++) row[x] = 0xff000000ff000000ull;
 		}
-	} else if (fShadow != NULL && shadowValid) {
-		/* Frames that arrived while off are in the shadow: show the latest. */
-		restored = b2l_blit((void *)fPixels, panelBytes, fWidth, fHeight, fRowBytes,
-		    fShadow, panelBytes, fWidth, fHeight, fRowBytes, 0, 0, 0, 0, 0,
-		    (int32_t)fWidth, (int32_t)fHeight) != 0;
 	}
 	__asm__ volatile("dsb sy":::"memory");
 	uint64_t ns = 0;
 	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
 
 	IOLockLock(fLock);
-	if (!off && !restored) fShadowValid = false;    /* the next frame fills the panel */
+	if (!off) {
+		/* Stay black for iOS's next frame, which then fills the whole panel. */
+		fWakeRestore = fShadow != NULL && shadowValid;
+		fWakeCopies = fPerfCopies;
+		fShadowValid = false;
+	}
 	fBusy = false;
 	IOLockWakeup(fLock, &fBusy, false);
 	IOLockUnlock(fLock);
+	if (!off && fRestoreCall != NULL) {
+		uint64_t deadline;
+		clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
+		thread_call_enter_delayed(fRestoreCall, deadline);
+	}
 	b2l_diag_record("B2L FB: display %s, panel %s in %llu us\n", off ? "off" : "on",
-	    off ? "blanked" : (restored ? "restored from shadow" : "left for the next frame"), ns / 1000);
+	    off ? "blanked" : "black until the next frame", ns / 1000);
+}
+
+void
+AppleCLCD::restoreWorker(thread_call_param_t owner, thread_call_param_t unused __unused)
+{
+	((AppleCLCD *)owner)->restoreAfterWake();
+}
+
+/* A second after the display came on: if iOS sent no frame, show the shadow. */
+void
+AppleCLCD::restoreAfterWake(void)
+{
+	IOLockLock(fLock);
+	while (fBusy) IOLockSleep(fLock, &fBusy, THREAD_UNINT);
+	if (fBlanked || !fWakeRestore || fPerfCopies != fWakeCopies || fShadow == NULL) {
+		bool copied = fPerfCopies != fWakeCopies;
+		fWakeRestore = false;
+		IOLockUnlock(fLock);
+		b2l_diag_record("B2L FB: display on, %s\n", copied ? "new frame shown" : "nothing to restore");
+		return;
+	}
+	fWakeRestore = false;
+	fBusy = true;
+	IOLockUnlock(fLock);
+	const uint64_t panelBytes = (uint64_t)fRowBytes * fHeight;
+	bool restored = b2l_blit((void *)fPixels, panelBytes, fWidth, fHeight, fRowBytes,
+	    fShadow, panelBytes, fWidth, fHeight, fRowBytes, 0, 0, 0, 0, 0,
+	    (int32_t)fWidth, (int32_t)fHeight) != 0;
+	__asm__ volatile("dsb sy":::"memory");
+	IOLockLock(fLock);
+	if (restored) fShadowValid = true;
+	fBusy = false;
+	IOLockWakeup(fLock, &fBusy, false);
+	IOLockUnlock(fLock);
+	b2l_diag_record("B2L FB: display on, no frame in 1 s, shadow %s\n", restored ? "restored" : "not restored");
 }
 
 void
