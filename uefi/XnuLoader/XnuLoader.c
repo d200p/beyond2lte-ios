@@ -385,7 +385,9 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 "b2l_rtc_wait=0 b2l_boot_timing=1 b2l_console_quiet=1 "
                 /* b2l_dvfs=0: the Mali driver (B2LMali) owns the ACPM mailbox
                  * for GPU, memory and CPU clocks; two clients would race. */
-                "b2l_cache_interactive=1 b2l_ax_seed=1 b2l_dvfs=0 "
+                /* b2l_ax_seed=0: clear the seeded managed accessibility file,
+                 * so Reduce Motion/Transparency and cross-fades follow Settings. */
+                "b2l_cache_interactive=1 b2l_ax_seed=0 b2l_dvfs=0 "
                 /* Fork build 0148 scanout from surfaces is untested: copy path. */
                 "b2l_scanout=0 "
                 /* The fork keeps 136 black rows for the S10+ camera pill; the

@@ -175,10 +175,54 @@ close:
     {int close_error=vnode_close(vp,FREAD|FWRITE,ctx);if(!error)error=close_error;}
     return error;
 }
+/* S10 port, b2l_ax_seed=0: the managed layer forces its values over Settings,
+ * so Reduce Motion, Reduce Transparency and cross-fade transitions could not be
+ * turned off. When the managed file is exactly the seeded one, it is rewritten
+ * as an empty dictionary: nothing forced, Settings decides. Any other content
+ * is left alone. Returns 0 cleared, ENOENT absent, EEXIST not ours, or an error. */
+static const char ax_empty_plist[]=
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+    "<plist version=\"1.0\"><dict/></plist>\n";
+static int ax_unseed(const char *path,vfs_context_t ctx)
+{
+    const size_t n=sizeof(ax_plist)-1,e=sizeof(ax_empty_plist)-1;static char verify[sizeof(ax_plist)];
+    struct vnode_attr va;vnode_t vp=NULL;int resid=0;
+    int error=vnode_open(path,FREAD|FWRITE,0,VNODE_LOOKUP_NOFOLLOW_ANY,&vp,ctx);
+    if(error)return error;
+    if(!root_type(vp,VREG)){error=EINVAL;goto close;}
+    VATTR_INIT(&va);VATTR_WANTED(&va,va_data_size);VATTR_WANTED(&va,va_nlink);
+    error=vnode_getattr(vp,&va,ctx);if(error)goto close;
+    if(!VATTR_IS_SUPPORTED(&va,va_data_size)||!VATTR_IS_SUPPORTED(&va,va_nlink)||
+       va.va_nlink!=1||va.va_data_size!=(off_t)n){error=EEXIST;goto close;}
+    error=vn_rdwr(UIO_READ,vp,verify,(int)n,0,UIO_SYSSPACE,0,kauth_cred_get(),&resid,current_proc());
+    if(error)goto close;
+    if(resid||memcmp(verify,ax_plist,n)){error=EEXIST;goto close;}
+    VATTR_INIT(&va);VATTR_SET(&va,va_data_size,0);
+    error=vnode_setattr(vp,&va,ctx);if(error)goto close;
+    error=vn_rdwr(UIO_WRITE,vp,(caddr_t)ax_empty_plist,(int)e,0,UIO_SYSSPACE,IO_SYNC,
+        kauth_cred_get(),&resid,current_proc());
+    if(!error&&resid)error=EIO;
+    if(error)goto close;
+    error=VNOP_FSYNC(vp,MNT_WAIT,ctx);if(error)goto close;
+    error=vn_rdwr(UIO_READ,vp,verify,(int)e,0,UIO_SYSSPACE,0,kauth_cred_get(),&resid,current_proc());
+    if(!error&&(resid||memcmp(verify,ax_empty_plist,e)))error=EIO;
+close:
+    {int close_error=vnode_close(vp,FREAD|FWRITE,ctx);if(!error)error=close_error;}
+    return error;
+}
 static void b2l_accessibility_before_init(vfs_context_t ctx)
 {
     int seed=0;
-    if(!PE_parse_boot_argn("b2l_ax_seed",&seed,sizeof(seed))||seed!=1){
+    bool given=PE_parse_boot_argn("b2l_ax_seed",&seed,sizeof(seed));
+    if(given&&seed==0){
+        int cleared=ax_unseed(ax_managed_path,ctx);
+        int error=cleared?0:VFS_SYNC(vnode_mount(rootvnode),MNT_WAIT,ctx);
+        printf("B2L AXSEED: managed accessibility defaults cleared=%d sync=%d (0 cleared, %d absent, %d not ours); Settings decides\n",
+            cleared,error,ENOENT,EEXIST);
+        return;
+    }
+    if(!given||seed!=1){
         printf("B2L AXSEED: disabled; accessibility defaults untouched\n");return;
     }
     int managed=ax_directory(ax_managed_dir,0,0,0755,ctx);
