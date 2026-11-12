@@ -388,6 +388,9 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 "b2l_cache_interactive=1 b2l_ax_seed=1 b2l_dvfs=0 "
                 /* Fork build 0148 scanout from surfaces is untested: copy path. */
                 "b2l_scanout=0 "
+                /* The fork keeps 136 black rows for the S10+ camera pill; the
+                 * S10 hole is small, so iOS keeps the whole panel. */
+                "b2l_fb_top_inset=0 "
                 "b2l_wifi_diag=5 "
 #else
                 "rd=b2l-diagnostic b2l_root_rw=0 b2l_system_log=0 b2l_native_cache=0 "
