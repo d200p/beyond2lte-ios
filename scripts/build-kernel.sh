@@ -21,7 +21,15 @@ cd "$xnu_path"
 # runs); without it, or without ccache, the build is exactly as before.
 compiler_args=()
 if [[ "${B2L_CCACHE:-0}" == 1 ]] && command -v ccache >/dev/null; then
-  compiler_args=(CC="ccache $(xcrun -sdk macosx -find clang)" CXX="ccache $(xcrun -sdk macosx -find clang++)")
+  # MIG runs $(CC) as a single path, so CC must not contain a space: small
+  # wrapper scripts call ccache with the real compilers.
+  wrap_dir="$build_root/ccache-bin"
+  mkdir -p "$wrap_dir"
+  for tool in clang clang++; do
+    printf '#!/bin/sh\nexec ccache %s "$@"\n' "$(xcrun -sdk macosx -find "$tool")" > "$wrap_dir/$tool"
+    chmod +x "$wrap_dir/$tool"
+  done
+  compiler_args=(CC="$wrap_dir/clang" CXX="$wrap_dir/clang++")
   ccache --zero-stats >/dev/null || true
   echo "Compiling through ccache ($(ccache --version | head -1))"
 fi
