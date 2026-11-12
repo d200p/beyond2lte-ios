@@ -128,20 +128,42 @@ __asm__(".text\n.p2align 2\n.globl _b2l_draw_original\n_b2l_draw_original:\n"
  * runs the displaced entry instructions, as draw_elements does. Every argument
  * register is saved around the call, since the signatures differ.
  */
+/*
+ * S10: each pre-hook is now a full wrapper, so the function's own time is
+ * known: it commits as before, calls the original through its displaced entry
+ * words, and records calls and ticks (boot 18: is blur worth the GPU?). The
+ * caller's first eight stack slots are copied below the wrapper frame, so
+ * arguments passed on the stack sit where the original expects them; x0-x1 and
+ * q0-q3 are kept across the timing call on the way out.
+ */
 #define PREHOOK(name, index, address, w1, w2, w3, i1, i2, i3) \
 	uint64_t b2l_resume_##name; \
 	void b2l_prehook_##name(void); \
+	void b2l_original_##name(void); \
 	static const uint32_t name##_WORDS[4] = { 0xd503201f, w1, w2, w3 }; \
-	__asm__(".text\n.p2align 2\n.globl _b2l_prehook_" #name "\n_b2l_prehook_" #name ":\n" \
-	    " stp x29, x30, [sp, #-0xe0]!\n stp x0, x1, [sp, #0x10]\n stp x2, x3, [sp, #0x20]\n" \
-	    " stp x4, x5, [sp, #0x30]\n stp x6, x7, [sp, #0x40]\n str x8, [sp, #0x50]\n" \
-	    " stp q0, q1, [sp, #0x60]\n stp q2, q3, [sp, #0x80]\n stp q4, q5, [sp, #0xa0]\n stp q6, q7, [sp, #0xc0]\n" \
-	    " mov x0, #" #index "\n bl _b2l_batch_commit_hook\n" \
-	    " ldp q6, q7, [sp, #0xc0]\n ldp q4, q5, [sp, #0xa0]\n ldp q2, q3, [sp, #0x80]\n ldp q0, q1, [sp, #0x60]\n" \
-	    " ldr x8, [sp, #0x50]\n ldp x6, x7, [sp, #0x40]\n ldp x4, x5, [sp, #0x30]\n ldp x2, x3, [sp, #0x20]\n" \
-	    " ldp x0, x1, [sp, #0x10]\n ldp x29, x30, [sp], #0xe0\n" \
+	__asm__(".text\n.p2align 2\n.globl _b2l_original_" #name "\n_b2l_original_" #name ":\n" \
 	    " nop\n " i1 "\n " i2 "\n " i3 "\n" \
-	    " adrp x16, _b2l_resume_" #name "@PAGE\n ldr x16, [x16, _b2l_resume_" #name "@PAGEOFF]\n br x16\n");
+	    " adrp x16, _b2l_resume_" #name "@PAGE\n ldr x16, [x16, _b2l_resume_" #name "@PAGEOFF]\n br x16\n" \
+	    ".p2align 2\n.globl _b2l_prehook_" #name "\n_b2l_prehook_" #name ":\n" \
+	    " mov x9, sp\n sub sp, sp, #0x130\n stp x29, x30, [sp, #0x40]\n add x29, sp, #0x40\n" \
+	    " stp x0, x1, [sp, #0x50]\n stp x2, x3, [sp, #0x60]\n stp x4, x5, [sp, #0x70]\n" \
+	    " stp x6, x7, [sp, #0x80]\n str x8, [sp, #0x90]\n" \
+	    " stp q0, q1, [sp, #0xa0]\n stp q2, q3, [sp, #0xc0]\n stp q4, q5, [sp, #0xe0]\n stp q6, q7, [sp, #0x100]\n" \
+	    " ldp x10, x11, [x9]\n stp x10, x11, [sp]\n ldp x10, x11, [x9, #0x10]\n stp x10, x11, [sp, #0x10]\n" \
+	    " ldp x10, x11, [x9, #0x20]\n stp x10, x11, [sp, #0x20]\n ldp x10, x11, [x9, #0x30]\n stp x10, x11, [sp, #0x30]\n" \
+	    " mov x0, #" #index "\n bl _b2l_batch_commit_hook\n" \
+	    " mov x0, #" #index "\n add x1, sp, #0x50\n add x2, sp, #0xa0\n bl _b2l_hook_enter\n str x0, [sp, #0x120]\n" \
+	    " ldp q6, q7, [sp, #0x100]\n ldp q4, q5, [sp, #0xe0]\n ldp q2, q3, [sp, #0xc0]\n ldp q0, q1, [sp, #0xa0]\n" \
+	    " ldr x8, [sp, #0x90]\n ldp x6, x7, [sp, #0x80]\n ldp x4, x5, [sp, #0x70]\n ldp x2, x3, [sp, #0x60]\n" \
+	    " ldp x0, x1, [sp, #0x50]\n" \
+	    " bl _b2l_original_" #name "\n" \
+	    " stp x0, x1, [sp, #0x50]\n stp q0, q1, [sp, #0xa0]\n stp q2, q3, [sp, #0xc0]\n" \
+	    " mov x0, #" #index "\n ldr x1, [sp, #0x120]\n bl _b2l_hook_timed\n" \
+	    " ldp q2, q3, [sp, #0xc0]\n ldp q0, q1, [sp, #0xa0]\n ldp x0, x1, [sp, #0x50]\n" \
+	    " ldp x29, x30, [sp, #0x40]\n add sp, sp, #0x130\n ret\n");
+
+uint64_t b2l_hook_enter(uint64_t which, const uint64_t *x, const uint64_t *q);
+void b2l_hook_timed(uint64_t which, uint64_t start);
 
 void b2l_batch_commit_hook(uint64_t which);
 PREHOOK(clear_region, 5, 0x18410c740ull, 0xd10283ff, 0x6d0423e9, 0xa90567fa,
@@ -176,6 +198,44 @@ static const struct {
 };
 
 static io_connect_t connection;
+
+/* Per pre-hook (index 5..10): calls, ticks, longest call, for the H line. */
+static struct { uint64_t calls, ticks, max; } hook_times[11];
+static unsigned blur_samples;
+static void log_line(const char *format, ...);
+
+uint64_t
+b2l_hook_enter(uint64_t which, const uint64_t *x, const uint64_t *q)
+{
+	/* The first blur calls' arguments: registers, and the low lane of each
+	 * vector register as a float and a double, to learn the signature. */
+	if (which == 6 && __atomic_fetch_add(&blur_samples, 1, __ATOMIC_RELAXED) < 40) {
+		float f[4];
+		double d[4];
+		for (unsigned i = 0; i < 4; i++) {
+			memcpy(&f[i], &q[2 * i], sizeof(float));
+			memcpy(&d[i], &q[2 * i], sizeof(double));
+		}
+		log_line("BLUR x0=%llx x1=%llx x2=%llx x3=%llx x4=%llx x5=%llx f=%g,%g,%g,%g d=%g,%g,%g,%g",
+		    x[0], x[1], x[2], x[3], x[4], x[5], f[0], f[1], f[2], f[3], d[0], d[1], d[2], d[3]);
+	}
+	return mach_absolute_time();
+}
+
+void
+b2l_hook_timed(uint64_t which, uint64_t start)
+{
+	if (which >= sizeof(hook_times) / sizeof(hook_times[0])) {
+		return;
+	}
+	uint64_t ticks = mach_absolute_time() - start;
+	__atomic_fetch_add(&hook_times[which].calls, 1, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&hook_times[which].ticks, ticks, __ATOMIC_RELAXED);
+	uint64_t max = __atomic_load_n(&hook_times[which].max, __ATOMIC_RELAXED);
+	while (ticks > max && !__atomic_compare_exchange_n(&hook_times[which].max, &max, ticks, 0,
+	    __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+	}
+}
 
 static void
 log_line(const char *format, ...)
@@ -285,6 +345,19 @@ report(uint64_t now)
 			    s->live_pixels / 1000);
 		}
 		memset(&s->draws, 0, sizeof(*s) - offsetof(struct draw_stat, draws));
+	}
+	{
+		static const char *const names[] = { "clear", "blur", "copy", "current", "finalize", "swap" };
+		char line[400];
+		int used = snprintf(line, sizeof(line), "H");
+		for (unsigned i = 5; i <= 10 && used > 0 && (size_t)used < sizeof(line); i++) {
+			uint64_t calls = __atomic_exchange_n(&hook_times[i].calls, 0, __ATOMIC_RELAXED);
+			uint64_t ticks = __atomic_exchange_n(&hook_times[i].ticks, 0, __ATOMIC_RELAXED);
+			uint64_t max = __atomic_exchange_n(&hook_times[i].max, 0, __ATOMIC_RELAXED);
+			used += snprintf(line + used, sizeof(line) - (size_t)used, " %s=%llu/%lluus/max%lluus",
+			    names[i - 5], calls, to_us(ticks), to_us(max));
+		}
+		log_line("%s", line);
 	}
 	log_line("R %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u %u", rejects[1], rejects[2], rejects[3], rejects[4], rejects[5],
 	    rejects[6], rejects[7], rejects[8], rejects[9], rejects[10], rejects[11], rejects[12], rejects[13], rejects[14],
