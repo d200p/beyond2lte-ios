@@ -17,6 +17,8 @@ extern "C" {
 }
 extern "C" void b2l_hid_key(int,int);
 extern "C" void b2l_power_request_recovery(void);
+/* S10 port: B2LFramebuffer shows black while the display is off. */
+extern "C" void b2l_fb_display_power(int on);
 extern "C" void b2l_hid_touch(int,int,int,int);
 extern "C" void b2l_native_cache_input_activity(void);
 class B2LInput : public IOService {
@@ -33,6 +35,7 @@ class B2LInput : public IOService {
     uint64_t nextInitUS;
     uint64_t pollCount,eventCount,updateCount,bulkCount,transferFailures;
     uint64_t lastPollStart,lastDiagnostic,maxPollGapUS,maxPollWorkUS,chordStart;
+    bool displayOff;
     unsigned maxPending;
     uint64_t transferTimeUS,maxTransferUS;
     static uint64_t uptimeUS(){uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000;}
@@ -181,6 +184,12 @@ void B2LInput::poll(OSObject *owner,IOTimerEventSource *sender){
         else if(s->debounce[k]<2)++s->debounce[k];
         if(s->debounce[k]==2&&down!=s->stable[k]){
             s->stable[k]=down;b2l_hid_key((int)k,down);
+            /* S10 port: the power key turns the display off and on, as on an
+             * iPhone; Bixby (Home) only wakes it. Touch also wakes it, below. */
+            if(down&&(k==0||(k==3&&s->displayOff))){
+                s->displayOff=k==0&&!s->displayOff;
+                b2l_fb_display_power(!s->displayOff);
+            }
             if(s->keyLogs++<32)IOLog("B2L INPUT: key=%u down=%d\n",k,down);
         }
     }
@@ -190,6 +199,7 @@ void B2LInput::poll(OSObject *owner,IOTimerEventSource *sender){
         else if(begin-s->chordStart>=3000000)b2l_power_request_recovery();
     }else s->chordStart=0;
     if(s->initPending && begin>=s->nextInitUS)s->initializeTouch();
+    uint64_t updatesBefore=s->updateCount;
     if(s->touch){
         /* Same bounded READ_ONE / READ_ALL sequence as B2LTouchDxe. Read
          * up to 32 FIFO records per tick instead of four individual commands.
@@ -228,6 +238,7 @@ void B2LInput::poll(OSObject *owner,IOTimerEventSource *sender){
             IOLog("B2L INPUT: sec_ts disabled after 3 transfer failures; GPIO remains active\n");
         }
     }
+    if(s->displayOff&&s->updateCount!=updatesBefore){s->displayOff=false;b2l_fb_display_power(1);}
     uint64_t end=uptimeUS(),work=end-begin;
     if(work>s->maxPollWorkUS)s->maxPollWorkUS=work;
     if(end-s->lastDiagnostic>=10000000){

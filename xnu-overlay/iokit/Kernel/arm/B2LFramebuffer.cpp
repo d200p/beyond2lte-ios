@@ -120,6 +120,15 @@ public:
 	thread_call_t fCopyCall;
 	uint8_t      *fShadow;          /* cached copy of what the panel shows */
 	bool          fShadowValid;     /* set once a copy covered the whole panel */
+	/* S10 port: display off. This port has no panel power control, so iOS's
+	 * "display off" left the last frame lit (Always-On could not be turned
+	 * off). Off shows black, which an OLED pixel does not emit, and frames go
+	 * to the shadow only; on writes the shadow back. Guarded by fLock + fBusy. */
+	bool          fBlanked;
+	int           fBlankWanted;     /* atomic: 1 off, 0 on */
+	thread_call_t fBlankCall;
+	void applyBlank(void);
+	static void blankWorker(thread_call_param_t owner, thread_call_param_t unused);
 
 	/* Scanout straight from a surface: DECON_F window 5, DMA channel 0, as the
 	 * boot chain set them up for the panel memory (0147 dump). */
@@ -144,6 +153,7 @@ public:
 };
 
 OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+static AppleCLCD *gB2LCLCD;     /* S10 port: target of b2l_fb_display_power */
 
 class IOMobileFramebufferUserClient : public IOUserClient {
 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
@@ -224,6 +234,12 @@ AppleCLCD::start(IOService *provider)
 	 * path stays, unused, behind fCopyCall). */
 	fCopyCall = NULL;
 	IOLog("B2L FB: present shadow %s, copy worker %s\n", fShadow ? "on" : "off", fCopyCall ? "on" : "off");
+	/* S10 port: display off from the power key (B2LInput). b2l_fb_blank=0 disables it. */
+	uint32_t blank = 1;
+	PE_parse_boot_argn("b2l_fb_blank", &blank, sizeof(blank));
+	fBlankCall = blank ? thread_call_allocate(&AppleCLCD::blankWorker, this) : NULL;
+	if (fBlankCall != NULL) gB2LCLCD = this;
+	IOLog("B2L FB: display off by blanking %s\n", fBlankCall ? "on" : "off");
 	IOMemoryDescriptor *regs = IOMemoryDescriptor::withPhysicalAddress(B2L_DECON_BASE, B2L_DECON_BYTES, kIODirectionInOut);
 	fDeconMap = regs ? regs->map(kIOMapInhibitCache) : NULL;
 	OSSafeReleaseNULL(regs);
@@ -484,6 +500,69 @@ AppleCLCD::copyWorker(thread_call_param_t owner, thread_call_param_t unused __un
 	((AppleCLCD *)owner)->runCopy();
 }
 
+/* S10 port: display off/on, see fBlanked. Called from the input poll: only
+ * records the wish; the panel is rewritten on a thread call. */
+extern "C" void
+b2l_fb_display_power(int on)
+{
+	AppleCLCD *fb = gB2LCLCD;
+	if (fb == NULL || fb->fBlankCall == NULL) return;
+	__atomic_store_n(&fb->fBlankWanted, on ? 0 : 1, __ATOMIC_RELEASE);
+	thread_call_enter(fb->fBlankCall);
+}
+
+void
+AppleCLCD::blankWorker(thread_call_param_t owner, thread_call_param_t unused __unused)
+{
+	((AppleCLCD *)owner)->applyBlank();
+}
+
+void
+AppleCLCD::applyBlank(void)
+{
+	bool off = __atomic_load_n(&fBlankWanted, __ATOMIC_ACQUIRE) == 1;
+	IOLockLock(fLock);
+	while (fBusy) IOLockSleep(fLock, &fBusy, THREAD_UNINT);
+	if (off == fBlanked) {
+		IOLockUnlock(fLock);
+		return;
+	}
+	fBlanked = off;
+	fBusy = true;           /* no copy runs while the panel is rewritten */
+	IOLockUnlock(fLock);
+
+	pointAtPanel();         /* a flipped channel would keep showing its surface */
+	IOLockLock(fLock);
+	bool shadowValid = fShadowValid;
+	IOLockUnlock(fLock);
+	uint64_t start = mach_absolute_time();
+	const uint64_t panelBytes = (uint64_t)fRowBytes * fHeight;
+	bool restored = false;
+	if (off) {
+		/* Whole rows, so every write is 64-byte aligned like all other panel writes. */
+		for (uint32_t y = 0; y < fHeight; y++) {
+			volatile uint64_t *row = (volatile uint64_t *)(fPixels + (uintptr_t)y * fRowBytes);
+			for (uint32_t x = 0; x < fRowBytes / 8; x++) row[x] = 0xff000000ff000000ull;
+		}
+	} else if (fShadow != NULL && shadowValid) {
+		/* Frames that arrived while off are in the shadow: show the latest. */
+		restored = b2l_blit((void *)fPixels, panelBytes, fWidth, fHeight, fRowBytes,
+		    fShadow, panelBytes, fWidth, fHeight, fRowBytes, 0, 0, 0, 0, 0,
+		    (int32_t)fWidth, (int32_t)fHeight) != 0;
+	}
+	__asm__ volatile("dsb sy":::"memory");
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+
+	IOLockLock(fLock);
+	if (!off && !restored) fShadowValid = false;    /* the next frame fills the panel */
+	fBusy = false;
+	IOLockWakeup(fLock, &fBusy, false);
+	IOLockUnlock(fLock);
+	b2l_diag_record("B2L FB: display %s, panel %s in %llu us\n", off ? "off" : "on",
+	    off ? "blanked" : (restored ? "restored from shadow" : "left for the next frame"), ns / 1000);
+}
+
 void
 AppleCLCD::deconDumpMain(void *owner, wait_result_t result __unused)
 {
@@ -606,7 +685,40 @@ AppleCLCD::runCopy(void)
 	job = fJob;
 	fJob.count = 0;
 	bool shadowValid = fShadowValid;
+	bool blanked = fBlanked;
 	IOLockUnlock(fLock);
+
+	if (blanked) {
+		/* S10 port, display off: keep the shadow current, leave the panel black. */
+		const uint64_t shadowBytes = (uint64_t)fRowBytes * fHeight;
+		bool full = false;
+		for (uint32_t i = 0; i < job.count; i++) {
+			Layer *l = &job.layer[i];
+			B2LSurface *s = l->s;
+			uintptr_t src = s->kernelAddress();
+			if (fShadow != NULL && src && s->memory && s->bytesPerElement == 4 && s->elementWidth == 1 &&
+			    s->elementHeight == 1 && s->pixelFormat == B2L_FB_FORMAT_BGRA) {
+				int32_t w = l->w, h = l->h;
+				if (w <= 0 || h <= 0) { w = (int32_t)s->width; h = (int32_t)s->height; }
+				struct b2l_blit_rect r;
+				if (b2l_blit_clip(shadowBytes, fWidth, fHeight, fRowBytes, s->memory->getLength(),
+				    s->width, s->height, s->bytesPerRow, s->offset, l->sx, l->sy, l->dx, l->dy, w, h, &r) &&
+				    b2l_blit(fShadow, shadowBytes, fWidth, fHeight, fRowBytes,
+				    (const void *)src, s->memory->getLength(), s->width, s->height, s->bytesPerRow, s->offset,
+				    l->sx, l->sy, l->dx, l->dy, w, h) &&
+				    r.w == fWidth && r.h == fHeight) {
+					full = true;
+				}
+			}
+			s->release();
+		}
+		IOLockLock(fLock);
+		if (full) fShadowValid = true;
+		fBusy = false;
+		IOLockWakeup(fLock, &fBusy, false);
+		IOLockUnlock(fLock);
+		return;
+	}
 
 	/* Stop console drawing before the first copy, so nothing can draw on
 	 * the panel between the copy and the shadow becoming valid. */
@@ -992,7 +1104,24 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	case kB2LFBSwapWait:
 		fFB->waitIdle();
 		break;
-    default: ret=kIOReturnUnsupported;break;
+    default:
+		ret = kIOReturnUnsupported;
+		/* S10 port: up to 24 calls per unsupported scalar-only selector, with
+		 * their values and time, to find iOS's display power request. */
+		if (selector < 128 && args->structureInputSize == 0 && args->structureOutputSize == 0 &&
+		    args->structureInputDescriptor == NULL && args->structureOutputDescriptor == NULL) {
+			static uint32_t powerSamples[128];
+			if (__atomic_load_n(&powerSamples[selector], __ATOMIC_RELAXED) < 24 &&
+			    __atomic_fetch_add(&powerSamples[selector], 1, __ATOMIC_RELAXED) < 24) {
+				uint64_t v[2] = { 0, 0 }, ns = 0;
+				for (unsigned i = 0; args->scalarInput != NULL && i < args->scalarInputCount && i < 2; ++i)
+					v[i] = args->scalarInput[i];
+				absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+				b2l_diag_record("B2L FB SEL: pid=%d selector=%u n=%u values=0x%llx,0x%llx ms=%llu\n",
+				    proc_selfpid(), selector, args->scalarInputCount, v[0], v[1], ns / 1000000);
+			}
+		}
+		break;
 	}
 
     if(outCount && (args->scalarOutputCount<outCount || !args->scalarOutput))return kIOReturnNoSpace;

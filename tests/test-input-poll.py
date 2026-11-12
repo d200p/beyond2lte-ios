@@ -25,6 +25,8 @@ void b2l_native_cache_input_activity(){activity_hints++;}
 void b2l_hid_key(int,int){}
 static unsigned recovery_requests;
 void b2l_power_request_recovery(){recovery_requests++;}
+static std::vector<int> display_requests;
+void b2l_fb_display_power(int on){display_requests.push_back(on);}
 void b2l_hid_touch(int f,int d,int x,int y){delivered.emplace_back(f,d,x,y);}
 void IOLog(const char*,...){}
 void b2l_diag_record(const char*,...){}
@@ -41,6 +43,7 @@ public:
  B2L_SEC_TS_POINTER pointer={};
  uint64_t pollCount=0,eventCount=0,updateCount=0,bulkCount=0,transferFailures=0;
  uint64_t lastPollStart=0,lastDiagnostic=0,maxPollGapUS=0,maxPollWorkUS=0,chordStart=0;
+ bool displayOff=false;
  unsigned maxPending=0,quiesced=0;
  unsigned initAttempts=0,initCalls=0;bool initPending=false;uint64_t nextInitUS=0;
  uint64_t transferTimeUS=0,maxTransferUS=0;
