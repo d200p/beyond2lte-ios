@@ -86,6 +86,80 @@ static int hfs_b2l_unencrypted_setclass(struct vnode_attr *vap)
     (destination / 'b2l-provider.json').write_text(json.dumps(data, indent=2, sort_keys=True) + '\n')
 
 
+def upgrade_class_noop(destination, data):
+    """Revision 3 (S10 port): acknowledge requested protection classes without encryption.
+
+    iOS 26 services (Biome streams, Spotlight) create and re-class files with
+    classes A..C. Revision 2 answered ENOTSUP, which left Biome segment files at
+    0 bytes and kept dasd/coreduetd/searchd retrying. With boot-arg
+    b2l_hfs_class_noop (default 1) classes 1..7 are accepted on setattr and on
+    create, nothing is encrypted or persisted, and getattr still reports
+    PROTECTION_CLASS_D. b2l_hfs_class_noop=0 restores revision 2 behaviour.
+    """
+    if data.get('unencrypted_getattr_revision', 0) >= 3:
+        return
+    if data.get('unencrypted_getattr_revision') != 2:
+        raise SystemExit('Class no-op needs the revision 2 HFS staging first')
+    path = destination / 'core/hfs_vnops.c'
+    text = path.read_text()
+    old_helper = """static int hfs_b2l_unencrypted_setclass(struct vnode_attr *vap)
+{
+    if (!VATTR_IS_ACTIVE(vap, va_dataprotect_class)) return 0;
+    if (vap->va_dataprotect_class != PROTECTION_CLASS_D) return ENOTSUP;
+    VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
+    return 0;
+}
+"""
+    new_helper = """static int hfs_b2l_class_noop(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        int value = 1;
+        PE_parse_boot_argn("b2l_hfs_class_noop", &value, sizeof(value));
+        cached = value ? 1 : 0;
+    }
+    return cached;
+}
+
+/* accept_all (revision 3): acknowledge classes 1..7 without encrypting or
+ * persisting them; the volume stays explicitly unencrypted (getattr: None). */
+static int hfs_b2l_unencrypted_setclass(struct vnode_attr *vap, int accept_all)
+{
+    if (!VATTR_IS_ACTIVE(vap, va_dataprotect_class)) return 0;
+    if (vap->va_dataprotect_class != PROTECTION_CLASS_D &&
+        !(accept_all && vap->va_dataprotect_class >= 1 && vap->va_dataprotect_class <= 7)) return ENOTSUP;
+    VATTR_SET_SUPPORTED(vap, va_dataprotect_class);
+    return 0;
+}
+"""
+    old_call = 'int class_error = hfs_b2l_unencrypted_setclass(vap);'
+    new_call = 'int class_error = hfs_b2l_unencrypted_setclass(vap, hfs_b2l_class_noop());'
+    lock = '\tif ((error = hfs_lock(VTOC(dvp), HFS_EXCLUSIVE_LOCK, HFS_LOCK_DEFAULT)))'
+    include = '#include <sys/content_protection.h>\n'
+    if (text.count(old_helper) != 1 or text.count(old_call) != 1 or text.count(lock) != 1 or
+            text.count(include) != 1 or text.count('\nhfs_makenode(struct vnode *dvp') != 1):
+        raise SystemExit('Pinned B2L revision 2 HFS class code changed')
+    text = text.replace(old_helper, new_helper).replace(old_call, new_call)
+    text = text.replace(include, include + '#include <pexpert/pexpert.h>\n', 1)
+    maker = text.index('\nhfs_makenode(struct vnode *dvp')
+    at = text.index(lock, maker)
+    create = """#if defined(ARM64_BOARD_CONFIG_B2L) && !CONFIG_PROTECT
+\t/* Revision 3: a create that names a class gets the same unencrypted answer
+\t * as setattr, so VFS does not fail it after the file already exists. */
+\tif (VATTR_IS_ACTIVE(vap, va_dataprotect_class)) {
+\t\tint class_error = hfs_b2l_unencrypted_setclass(vap, hfs_b2l_class_noop());
+\t\tif (class_error) return class_error;
+\t}
+#endif
+
+"""
+    text = text[:at] + create + text[at:]
+    path.write_text(text)
+    data['unencrypted_getattr_revision'] = 3
+    data['files'] = hashes(destination)
+    (destination / 'b2l-provider.json').write_text(json.dumps(data, indent=2, sort_keys=True) + '\n')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('xnu', type=Path)
@@ -105,6 +179,7 @@ def main():
                 data.get('files') != hashes(destination)):
             raise SystemExit('Staged HFS sources were modified or have an unexpected revision')
         upgrade_unencrypted_getattr(destination, data)
+        upgrade_class_noop(destination, data)
         print('Pinned HFS source already staged and verified')
         return
     source = args.source
@@ -144,6 +219,7 @@ def main():
         data = {'format': 1, 'release': RELEASE, 'source_commit': COMMIT,
                 'upstream': UPSTREAM, 'files': hashes(staged)}
         upgrade_unencrypted_getattr(staged, data)
+        upgrade_class_noop(staged, data)
         staged.rename(destination)
     print(f'Staged {RELEASE} @ {COMMIT} for unencrypted HFS')
 

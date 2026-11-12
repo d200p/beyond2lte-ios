@@ -94,9 +94,9 @@ class B2LBattery : public IOService {
 	IOWorkLoop *loop;
 	IOTimerEventSource *timer;
 	AppleSmartBattery *battery;
-	unsigned failures, logs, transferLogs;
+	unsigned failures, logs, transferLogs, keepAliveLogs;
 	struct b2l_battery_state last;
-	bool published;
+	bool published, keepAlive;
 
 	uint32_t r(unsigned off) { uint32_t v = *(volatile uint32_t *)(i2c + off); __asm__ volatile("dmb oshld" ::: "memory"); return v; }
 	void w(unsigned off, uint32_t v) { *(volatile uint32_t *)(i2c + off) = v; __asm__ volatile("dsb oshst" ::: "memory"); }
@@ -107,6 +107,8 @@ class B2LBattery : public IOService {
 	bool message(uint8_t addr, uint8_t *buf, unsigned n, bool read);
 	bool readRegs(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned n);
 	bool readFG(uint8_t reg, uint16_t *out);
+	bool writeReg(uint8_t addr, uint8_t reg, uint8_t value);
+	void chargerKeepAlive(uint8_t int_ok, uint8_t details01);
 	const char *bringUpBus();
 	void sample();
 	static void poll(OSObject *owner, IOTimerEventSource *sender);
@@ -170,6 +172,34 @@ bool
 B2LBattery::readRegs(uint8_t addr, uint8_t reg, uint8_t *buf, unsigned n)
 {
 	return message(addr, &reg, 1, false) && message(addr, buf, n, true);
+}
+
+bool
+B2LBattery::writeReg(uint8_t addr, uint8_t reg, uint8_t value)
+{
+	uint8_t b[2] = { reg, value };
+	return message(addr, b, 2, false);
+}
+
+/* S10 port: kick the MAX77705 charger watchdog on every poll (Android's battery
+ * monitor does the same) and restart charging if it already expired. */
+void
+B2LBattery::chargerKeepAlive(uint8_t int_ok, uint8_t details01)
+{
+	uint8_t cnfg06 = 0, cnfg00 = 0;
+	bool kicked = readRegs(B2L_CHG_ADDR, B2L_CHG_CNFG_06, &cnfg06, 1) &&
+	    writeReg(B2L_CHG_ADDR, B2L_CHG_CNFG_06, b2l_chg_kick_value(cnfg06));
+	if (!kicked) {
+		if (keepAliveLogs++ < 8) b2l_diag_record("B2L BATTERY: charger watchdog kick failed\n");
+		return;
+	}
+	if (!b2l_chg_needs_restart(int_ok, details01)) return;
+	bool restarted = readRegs(B2L_CHG_ADDR, B2L_CHG_CNFG_00, &cnfg00, 1) &&
+	    writeReg(B2L_CHG_ADDR, B2L_CHG_CNFG_00, b2l_chg_charge_mode_value(cnfg00));
+	if (keepAliveLogs++ < 64) {
+		b2l_diag_record("B2L BATTERY: charger watchdog had expired (dtls=0x%x), charge mode 0x%x -> 0x%x %s\n",
+		    details01 & 0x0F, cnfg00, b2l_chg_charge_mode_value(cnfg00), restarted ? "restored" : "write failed");
+	}
 }
 
 bool
@@ -238,6 +268,7 @@ B2LBattery::sample()
 		if (readRegs(B2L_CHG_ADDR, B2L_CHG_INT_OK, c, 3)) {
 			raw.charger_ok = true;
 			raw.int_ok = c[0]; raw.details00 = c[1]; raw.details01 = c[2];
+			if (keepAlive) chargerKeepAlive(c[0], c[2]);
 		}
 	}
 	struct b2l_battery_state s;
@@ -285,8 +316,11 @@ B2LBattery::start(IOService *provider)
 		b2l_diag_record("B2L BATTERY: disabled by boot argument\n");
 		return false;
 	}
+	int kick = 1;
+	PE_parse_boot_argn("b2l_charge_keepalive", &kick, sizeof(kick));
+	keepAlive = kick != 0;
 	const char *bus = bringUpBus();
-	b2l_diag_record("B2L BATTERY: HSI2C45 %s\n", bus);
+	b2l_diag_record("B2L BATTERY: HSI2C45 %s, charger watchdog keep-alive %s\n", bus, keepAlive ? "on" : "off");
 	if (!i2c) return false;
 	battery = OSTypeAlloc(AppleSmartBattery);
 	if (!battery || !battery->init() || !battery->attach(this) || !battery->start(this)) {

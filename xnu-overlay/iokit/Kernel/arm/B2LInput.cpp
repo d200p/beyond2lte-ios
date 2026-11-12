@@ -16,6 +16,7 @@ extern "C" {
 #include "B2LSecTsParser.h"
 }
 extern "C" void b2l_hid_key(int,int);
+extern "C" void b2l_power_request_recovery(void);
 extern "C" void b2l_hid_touch(int,int,int,int);
 extern "C" void b2l_native_cache_input_activity(void);
 class B2LInput : public IOService {
@@ -31,7 +32,7 @@ class B2LInput : public IOService {
     bool initPending;
     uint64_t nextInitUS;
     uint64_t pollCount,eventCount,updateCount,bulkCount,transferFailures;
-    uint64_t lastPollStart,lastDiagnostic,maxPollGapUS,maxPollWorkUS;
+    uint64_t lastPollStart,lastDiagnostic,maxPollGapUS,maxPollWorkUS,chordStart;
     unsigned maxPending;
     uint64_t transferTimeUS,maxTransferUS;
     static uint64_t uptimeUS(){uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000;}
@@ -183,6 +184,11 @@ void B2LInput::poll(OSObject *owner,IOTimerEventSource *sender){
             if(s->keyLogs++<32)IOLog("B2L INPUT: key=%u down=%d\n",k,down);
         }
     }
+    /* Both volume keys for 3 s: sync and restart into recovery (B2LPower.cpp, fork). */
+    if(s->stable[1]&&s->stable[2]){
+        if(!s->chordStart)s->chordStart=begin;
+        else if(begin-s->chordStart>=3000000)b2l_power_request_recovery();
+    }else s->chordStart=0;
     if(s->initPending && begin>=s->nextInitUS)s->initializeTouch();
     if(s->touch){
         /* Same bounded READ_ONE / READ_ALL sequence as B2LTouchDxe. Read

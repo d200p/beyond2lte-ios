@@ -91,6 +91,8 @@ jobs:
           python3 tests/test_wifi_gen1.py
           python3 tests/test_fb_timing.py
           python3 tests/test_platform_uuid.py
+          python3 tests/test_battery_model.py
+          python3 tests/test_power.py
           python3 tests/test-input-poll.py
           bash scripts/test-native-cache.sh
           python3 tests/test-native-cache-workers.py

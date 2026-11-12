@@ -36,6 +36,41 @@
 #define B2L_CHG_DETAILS_01   0xB4
 #define B2L_FG_RESISTOR      2      /* stock fuelgauge,fg_resistor */
 
+/* MAX77705 charger watchdog (Samsung beyondlte kernel, max77705_charger.c/.h):
+ * the charger stops when nothing writes WDTCLR in time and then reports
+ * CHG_DTLS 0x0B in DETAILS_01[3:0]. Android kicks it from its battery monitor. */
+#define B2L_CHG_CNFG_00          0xB7
+#define B2L_CHG_CNFG_00_MODE     0x0F
+#define B2L_CHG_MODE_BUCK_CHG_ON 0x05        /* MAX77705_MODE_5_BUCK_CHG_ON */
+#define B2L_CHG_CNFG_06          0xBD
+#define B2L_CHG_WDTCLR_MASK      0x03
+#define B2L_CHG_WDTCLR           0x01
+#define B2L_CHG_CHGIN_OK         0x40        /* INT_OK bit 6 */
+#define B2L_CHG_DTLS_OFF         0x08
+#define B2L_CHG_DTLS_WDT_EXPIRED 0x0B
+
+/* Kick value for CNFG_06: only the WDTCLR field changes. */
+static inline uint8_t
+b2l_chg_kick_value(uint8_t cnfg06)
+{
+    return (uint8_t)((cnfg06 & ~B2L_CHG_WDTCLR_MASK) | B2L_CHG_WDTCLR);
+}
+
+/* After a kick, a present charger that the watchdog switched off needs its
+ * MODE set back to buck + charge, as max77705_get_charging_health() does. */
+static inline int
+b2l_chg_needs_restart(uint8_t int_ok, uint8_t details01)
+{
+    uint8_t dtls = details01 & 0x0F;
+    return (int_ok & B2L_CHG_CHGIN_OK) && dtls == B2L_CHG_DTLS_WDT_EXPIRED;
+}
+
+static inline uint8_t
+b2l_chg_charge_mode_value(uint8_t cnfg00)
+{
+    return (uint8_t)((cnfg00 & ~B2L_CHG_CNFG_00_MODE) | B2L_CHG_MODE_BUCK_CHG_ON);
+}
+
 struct b2l_battery_raw {
     uint16_t repcap, repsoc, vcell, fullcaprep, designcap, cycles, tte, ttf;
     int16_t current, avgcurrent, temp;

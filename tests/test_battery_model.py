@@ -62,7 +62,12 @@ int main(void){
  r.temp=-2560;s=run(r);assert(s.temp_valid&&s.temp_centi_c==-1000);
  r.current=(int16_t)0x8000;s=run(r);assert(s.milliamps==-10240);
  assert(b2l_fg_minutes(0)==-1&&b2l_fg_minutes(0xFFFF)==-1&&b2l_fg_minutes(0xFFFE)==6143);
- puts("Battery model: UEFI fast-mode timing, MAX77705 units/rounding, charger states, fallback and plausibility PASS");
+ /* S10 charger watchdog keep-alive: only WDTCLR / MODE fields change. */
+ assert(b2l_chg_kick_value(0xFC)==0xFD && b2l_chg_kick_value(0x0F)==0x0D && b2l_chg_kick_value(0x00)==0x01);
+ assert(b2l_chg_needs_restart(0xCF,0x4B) && b2l_chg_needs_restart(0x40,0x0B));
+ assert(!b2l_chg_needs_restart(0x8F,0x4B) && !b2l_chg_needs_restart(0xCF,0x31) && !b2l_chg_needs_restart(0xCF,0x48));
+ assert(b2l_chg_charge_mode_value(0x14)==0x15 && b2l_chg_charge_mode_value(0x10)==0x15 && b2l_chg_charge_mode_value(0xF4)==0xF5);
+ puts("Battery model: UEFI fast-mode timing, MAX77705 units/rounding, charger states, fallback and plausibility charger watchdog keep-alive PASS");
  return 0;
 }
 '''

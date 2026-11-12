@@ -47,8 +47,20 @@ public:
 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
+	int haltRestart(unsigned int type) APPLE_KEXT_OVERRIDE;
 };
 OSDefineMetaClassAndStructors(B2LPlatformExpert, IODTPlatformExpert);
+
+/* From StachowiakDawid/beyond2lte-ios (B2LPower.cpp): real power-off and restart
+ * through the PMU instead of "CPU halted" / "Halt/Restart Timed Out". */
+extern "C" void b2l_power_init(void);
+extern "C" bool b2l_power_halt_restart(unsigned int type);
+
+int
+B2LPlatformExpert::haltRestart(unsigned int type)
+{
+	return b2l_power_halt_restart(type) ? 0 : IODTPlatformExpert::haltRestart(type);
+}
 
 /*
  * From StachowiakDawid/beyond2lte-ios build 0142.
@@ -84,6 +96,7 @@ B2LPlatformExpert::start(IOService *provider)
 	if (!IODTPlatformExpert::start(provider)) {
 		return false;
 	}
+	b2l_power_init();
     IORegistryEntry *chosen=IORegistryEntry::fromPath("/chosen",gIODTPlane);
     OSData *wifi=chosen?OSDynamicCast(OSData,chosen->getProperty("mac-address-wifi0")):nullptr;
     bool wifiPresent=wifi&&wifi->getLength()==6;
