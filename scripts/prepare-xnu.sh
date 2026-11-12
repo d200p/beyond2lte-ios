@@ -75,7 +75,9 @@ python3 "$repo_root/scripts/apply-board-patches.py" "$xnu_path" \
   "$repo_root/patches/0060-b2l-bounded-rtc-wait-and-boot-timing.patch" \
   "$repo_root/patches/0061-b2l-acpm-dvfs.patch" \
   "$repo_root/patches/0062-b2l-platform-error-fault-detail.patch" \
-  "$repo_root/patches/0063-b2l-wifi-shared-block-diagnostic.patch"
+  "$repo_root/patches/0063-b2l-wifi-shared-block-diagnostic.patch" \
+  "$repo_root/patches/0064-b2l-max77705-battery.patch" \
+  "$repo_root/patches/0065-b2l-power.patch"
 # New files have separate provenance and are kept as an overlay.
 while IFS= read -r -d '' source_file; do
   relative="${source_file#"$repo_root/xnu-overlay/"}"

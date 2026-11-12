@@ -10,7 +10,10 @@
  *   6 wait; 7 display id; 8 dimensions; 18 main; 28 dot pitch;
  *   72 notification control. Unsupported selectors return Unsupported.
  *
- * BGRA layers are copied without resizing. A 60 Hz software timer supplies
+ * BGRA layers are copied without resizing, inside SwapEnd: each layer is
+ * compared with a cached shadow of the panel and only the changed span of
+ * each row, widened to 64-byte boundaries, is written to the uncached panel
+ * memory. A 60 Hz software timer supplies
  * notification type 5, not hardware scanout synchronization. After the first
  * accepted copy only console drawing is suppressed; persistent logging and
  * panic drawing remain active. GPU acceleration is not provided.
@@ -30,6 +33,7 @@
 #include <IOKit/system.h>
 #include <pexpert/pexpert.h>
 #include <kern/clock.h>
+#include <kern/thread_call.h>
 #include <sys/proc.h>
 #include <arm64/b2l_early.h>
 
@@ -72,6 +76,16 @@ class AppleCLCD : public IOMobileFramebuffer {
 	uint64_t            fVsyncCount;
 
 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+	/* b2l_fb_probe=1: a panel-sized buffer that is never presented. Its
+	 * physical runs are logged, per-page hashes are checked every 5 s to
+	 * catch writes from outside the kernel, and at 60 s uptime it is filled
+	 * with a pattern, as the dirty copy's first fill would. */
+	uint8_t      *fProbe;
+	uint64_t     *fProbeHash;
+	uint32_t      fProbePages, fProbeReports;
+	bool          fProbeFilled;
+	void probeStart(void);
+	void probeTick(void);
 
 public:
 	uint64_t      fPhys;
@@ -83,11 +97,26 @@ public:
 	OSArray      *fClients;
 	uint32_t      fSwapID;
 	bool          fConsolePaused;
+	/* Present-path counters, reported every 10 s for the first 60 reports;
+	 * guarded by fLock. */
+	uint32_t      fPerfSwaps, fPerfCopies, fPerfFull, fPerfReports, fPerfWaits, fCopyLogs;
+	uint64_t      fPerfPixels, fPerfTicks, fPerfMaxTicks, fPerfWritten, fPerfWaitTicks;
+	/* One queued presentation (guarded by fLock) and the copy worker. */
+	struct Layer { B2LSurface *s; int32_t sx, sy, dx, dy, w, h; };
+	struct Job { uint32_t count; Layer layer[B2L_FB_LAYERS]; };
+	Job           fJob;
+	bool          fBusy;            /* a job is queued or being copied */
+	thread_call_t fCopyCall;
+	uint8_t      *fShadow;          /* cached copy of what the panel shows */
+	bool          fShadowValid;     /* set once a copy covered the whole panel */
 
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 	void addClient(IOMobileFramebufferUserClient *client);
 	void removeClient(IOMobileFramebufferUserClient *client);
 	void swap(const uint8_t *rec);
+	void waitIdle(void);
+	void runCopy(void);
+	static void copyWorker(thread_call_param_t owner, thread_call_param_t unused);
 };
 
 OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
@@ -144,6 +173,22 @@ AppleCLCD::start(IOService *provider)
 		OSSafeReleaseNULL(fWorkLoop);
 		return false;
 	}
+	/* Without a shadow every copy is a full write; without the thread call it
+	 * runs in SwapEnd as before. Both are allowed to fail. */
+	/* Dirty-span copy (64-byte aligned spans, see B2LBlit.h); boot argument
+	 * b2l_fb_dirty=0 restores full-frame copies. */
+	uint32_t dirty = 1;
+	PE_parse_boot_argn("b2l_fb_dirty", &dirty, sizeof(dirty));
+	fShadow = dirty ? (uint8_t *)IOMallocData((vm_size_t)fRowBytes * fHeight) : NULL;
+	uint32_t probe = 0;
+	PE_parse_boot_argn("b2l_fb_probe", &probe, sizeof(probe));
+	if (probe) probeStart();
+	/* 0109 copied on a worker thread and SwapEnd returned before the copy;
+	 * backboardd then presented almost nothing and the screen stayed dark.
+	 * Until that contract is understood, copy inside SwapEnd (the worker
+	 * path stays, unused, behind fCopyCall). */
+	fCopyCall = NULL;
+	IOLog("B2L FB: present shadow %s, copy worker %s\n", fShadow ? "on" : "off", fCopyCall ? "on" : "off");
 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
 		IOLog("B2L FB: no vsync timer\n");
@@ -172,7 +217,21 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 		0, 0,
 	};
 
+	if (fb->fProbe != NULL && count % 300 == 0) fb->probeTick();
 	IOLockLock(fb->fLock);
+	if (count % 600 == 0 && fb->fPerfReports < 60) {
+		uint64_t total_ns, max_ns;
+		absolutetime_to_nanoseconds(fb->fPerfTicks, &total_ns);
+		absolutetime_to_nanoseconds(fb->fPerfMaxTicks, &max_ns);
+		fb->fPerfReports++;
+		uint64_t wait_ns;
+		absolutetime_to_nanoseconds(fb->fPerfWaitTicks, &wait_ns);
+		IOLog("B2L FB PERF: vsync=%llu swaps=%u copies=%u full=%u kpix=%llu written_kb=%llu copy_ms=%llu max_copy_us=%llu waits=%u wait_ms=%llu\n",
+		    count, fb->fPerfSwaps, fb->fPerfCopies, fb->fPerfFull, fb->fPerfPixels / 1000,
+		    fb->fPerfWritten / 1024, total_ns / 1000000, max_ns / 1000, fb->fPerfWaits, wait_ns / 1000000);
+		fb->fPerfSwaps = fb->fPerfCopies = fb->fPerfFull = fb->fPerfWaits = 0;
+		fb->fPerfPixels = fb->fPerfTicks = fb->fPerfMaxTicks = fb->fPerfWritten = fb->fPerfWaitTicks = 0;
+	}
 	for (unsigned int i = 0; i < fb->fClients->getCount(); i++) {
 		IOMobileFramebufferUserClient *client =
 		    (IOMobileFramebufferUserClient *)fb->fClients->getObject(i);
@@ -247,7 +306,226 @@ b2l_fb_swap_note(void)
 	}
 }
 
-/* Copy each enabled layer's surface into the panel memory (no scaling). */
+static uint64_t
+b2l_probe_hash(const uint8_t *p, uint32_t n)
+{
+	uint64_t h = 0xcbf29ce484222325ull, v;
+	for (uint32_t i = 0; i + 8 <= n; i += 8) { memcpy(&v, p + i, 8); h = (h ^ v) * 0x100000001b3ull; }
+	return h;
+}
+
+static uint64_t
+b2l_probe_uptime(void)
+{
+	uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / NSEC_PER_SEC;
+}
+
+void
+AppleCLCD::probeStart(void)
+{
+	uint32_t bytes = fRowBytes * fHeight;
+	fProbePages = (uint32_t)((bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+	fProbe = (uint8_t *)IOMallocData(bytes);
+	fProbeHash = (uint64_t *)IOMallocData(fProbePages * sizeof(uint64_t));
+	if (fProbe == NULL || fProbeHash == NULL) {
+		IOLog("B2L FB PROBE: allocation failed\n");
+		fProbe = NULL;
+		return;
+	}
+	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange((mach_vm_address_t)fProbe, bytes,
+	    kIODirectionNone, kernel_task);
+	if (md != NULL && md->prepare() == kIOReturnSuccess) {
+		unsigned runs = 0;
+		for (IOByteCount off = 0; off < bytes && runs < 40;) {
+			IOByteCount len = 0;
+			addr64_t pa = md->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
+			if (!pa || !len) break;
+			IOLog("B2L FB PROBE: run %u va_off=0x%llx pa=0x%llx len=0x%llx\n", runs++,
+			    (uint64_t)off, (uint64_t)pa, (uint64_t)len);
+			off += len;
+		}
+		md->complete();
+	}
+	OSSafeReleaseNULL(md);
+	for (uint32_t i = 0; i < fProbePages; i++) {
+		uint32_t n = (i + 1) * PAGE_SIZE <= bytes ? PAGE_SIZE : bytes - i * PAGE_SIZE;
+		fProbeHash[i] = b2l_probe_hash(fProbe + (size_t)i * PAGE_SIZE, n);
+	}
+	IOLog("B2L FB PROBE: %u pages watched from sec=%llu, fill at sec=60\n", fProbePages, b2l_probe_uptime());
+}
+
+/* Every 5 s on the vsync work loop: report pages changed by anyone else,
+ * then (once, at 60 s) fill the buffer and keep checking the pattern. */
+void
+AppleCLCD::probeTick(void)
+{
+	uint32_t bytes = fRowBytes * fHeight, changed = 0, logged = 0;
+	uint64_t sec = b2l_probe_uptime();
+	for (uint32_t i = 0; i < fProbePages; i++) {
+		uint32_t n = (i + 1) * PAGE_SIZE <= bytes ? PAGE_SIZE : bytes - i * PAGE_SIZE;
+		uint64_t h = b2l_probe_hash(fProbe + (size_t)i * PAGE_SIZE, n);
+		if (h != fProbeHash[i]) {
+			changed++;
+			if (logged++ < 8) {
+				IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(
+				    (mach_vm_address_t)(fProbe + (size_t)i * PAGE_SIZE), PAGE_SIZE, kIODirectionNone, kernel_task);
+				addr64_t pa = 0;
+				if (md != NULL && md->prepare() == kIOReturnSuccess) {
+					IOByteCount len = 0;
+					pa = md->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
+					md->complete();
+				}
+				OSSafeReleaseNULL(md);
+				IOLog("B2L FB PROBE: foreign write page=%u pa=0x%llx sec=%llu\n", i, (uint64_t)pa, sec);
+			}
+			fProbeHash[i] = h;
+		}
+	}
+	if (fProbeReports++ < 120) {
+		IOLog("B2L FB PROBE: sec=%llu filled=%d changed_pages=%u\n", sec, fProbeFilled, changed);
+	}
+	if (!fProbeFilled && sec >= 60) {
+		/* The same kind of write the dirty copy's first fill makes. */
+		for (uint32_t y = 0; y < fHeight; y++) {
+			uint32_t *row = (uint32_t *)(fProbe + (size_t)y * fRowBytes);
+			for (uint32_t x = 0; x < fRowBytes / 4; x++) row[x] = 0xff000000u | (y << 8) | (x & 0xff);
+		}
+		for (uint32_t i = 0; i < fProbePages; i++) {
+			uint32_t n = (i + 1) * PAGE_SIZE <= bytes ? PAGE_SIZE : bytes - i * PAGE_SIZE;
+			fProbeHash[i] = b2l_probe_hash(fProbe + (size_t)i * PAGE_SIZE, n);
+		}
+		fProbeFilled = true;
+		IOLog("B2L FB PROBE: filled at sec=%llu\n", b2l_probe_uptime());
+	}
+}
+
+/* Wait until no presentation is queued or being copied. */
+void
+AppleCLCD::waitIdle(void)
+{
+	IOLockLock(fLock);
+	if (fBusy) {
+		uint64_t start = mach_absolute_time();
+		while (fBusy) IOLockSleep(fLock, &fBusy, THREAD_UNINT);
+		fPerfWaits++;
+		fPerfWaitTicks += mach_absolute_time() - start;
+	}
+	IOLockUnlock(fLock);
+}
+
+void
+AppleCLCD::copyWorker(thread_call_param_t owner, thread_call_param_t unused __unused)
+{
+	((AppleCLCD *)owner)->runCopy();
+}
+
+/* Copy the queued layers into the panel, then release them and go idle. */
+void
+AppleCLCD::runCopy(void)
+{
+	Job job;
+	IOLockLock(fLock);
+	job = fJob;
+	fJob.count = 0;
+	bool shadowValid = fShadowValid;
+	IOLockUnlock(fLock);
+
+	/* Stop console drawing before the first copy, so nothing can draw on
+	 * the panel between the copy and the shadow becoming valid. */
+	if (job.count && !fConsolePaused) {
+		b2l_early_gui_present();
+		fConsolePaused = true;
+		IOLog("B2L FB: first IOSurface frame copied to physical scanout\n");
+	}
+	uint64_t start = mach_absolute_time(), written = 0, pixels = 0;
+	uint32_t copies = 0, full = 0;
+	bool covered = false;
+	const uint64_t panelBytes = (uint64_t)fRowBytes * fHeight;
+	for (uint32_t i = 0; i < job.count; i++) {
+		Layer *l = &job.layer[i];
+		B2LSurface *s = l->s;
+		uintptr_t src = s->kernelAddress();
+		if (src && s->memory && s->bytesPerElement == 4 && s->elementWidth == 1 && s->elementHeight == 1 &&
+		    s->pixelFormat == B2L_FB_FORMAT_BGRA) {
+			int32_t w = l->w, h = l->h;
+			if (w <= 0 || h <= 0) { w = (int32_t)s->width; h = (int32_t)s->height; }
+			struct b2l_blit_rect r;
+			/* First 64 copies: begin/end lines bracket the copy, and a sampled
+			 * 8x8 grid of source pixels shows whether the frame is black. */
+			bool trace = fCopyLogs < 64;
+			uint64_t traceStart = 0, traceWritten = written;
+			const char *path = (fShadow != NULL && shadowValid) ? "dirty" : (fShadow != NULL ? "fill" : "full");
+			if (trace) {
+				fCopyLogs++;
+				uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+				b2l_diag_record("B2L FB COPY n=%u begin path=%s surface=%ux%u rect=%d,%d %dx%d sec=%llu\n",
+				    fCopyLogs, path, s->width, s->height, l->dx, l->dy, w, h, ns / NSEC_PER_SEC);
+				traceStart = mach_absolute_time();
+			}
+			int shown = b2l_blit_clip(panelBytes, fWidth, fHeight, fRowBytes, s->memory->getLength(),
+			    s->width, s->height, s->bytesPerRow, s->offset, l->sx, l->sy, l->dx, l->dy, w, h, &r);
+			if (shown && fShadow != NULL && shadowValid) {
+				uint64_t n = 0;
+				b2l_blit_dirty((void *)fPixels, fShadow, panelBytes, fWidth, fHeight, fRowBytes,
+				    (const void *)src, s->memory->getLength(), s->width, s->height, s->bytesPerRow, s->offset,
+				    l->sx, l->sy, l->dx, l->dy, w, h, &n);
+				written += n;
+			} else if (shown) {
+				b2l_blit((void *)fPixels, panelBytes, fWidth, fHeight, fRowBytes,
+				    (const void *)src, s->memory->getLength(), s->width, s->height, s->bytesPerRow, s->offset,
+				    l->sx, l->sy, l->dx, l->dy, w, h);
+				if (fShadow != NULL) {
+					b2l_blit(fShadow, panelBytes, fWidth, fHeight, fRowBytes,
+					    (const void *)src, s->memory->getLength(), s->width, s->height, s->bytesPerRow, s->offset,
+					    l->sx, l->sy, l->dx, l->dy, w, h);
+				}
+				written += (uint64_t)r.w * 4 * r.h;
+			}
+			if (trace) {
+				unsigned nonblack = 0;
+				for (unsigned gy = 0; gy < 8 && s->height && s->width; gy++) {
+					for (unsigned gx = 0; gx < 8; gx++) {
+						uint64_t at = (uint64_t)s->offset + (uint64_t)(gy * s->height / 8) * s->bytesPerRow +
+						    (uint64_t)(gx * s->width / 8) * 4;
+						if (at + 4 <= s->memory->getLength()) {
+							uint32_t px; memcpy(&px, (const uint8_t *)src + at, 4);
+							if (px & 0x00FFFFFFu) nonblack++;
+						}
+					}
+				}
+				uint64_t ns; absolutetime_to_nanoseconds(mach_absolute_time() - traceStart, &ns);
+				b2l_diag_record("B2L FB COPY n=%u end shown=%d written=%llu us=%llu nonblack=%u/64\n",
+				    fCopyLogs, shown, written - traceWritten, ns / 1000, nonblack);
+			}
+			if (shown) {
+				copies++;
+				pixels += (uint64_t)r.w * r.h;
+				if (r.w == fWidth && r.h == fHeight) { full++; covered = true; }
+			}
+		}
+		s->release();
+	}
+	__asm__ volatile("dsb sy":::"memory");
+	uint64_t ticks = mach_absolute_time() - start;
+	if (copies) b2l_fb_copy_note(ticks);   /* S10 port: keep B2L FRAMES copy statistics */
+
+	IOLockLock(fLock);
+	if (covered && fShadow != NULL) fShadowValid = true;
+	fPerfCopies += copies;
+	fPerfFull += full;
+	fPerfPixels += pixels;
+	fPerfWritten += written;
+	if (copies) {
+		fPerfTicks += ticks;
+		if (ticks > fPerfMaxTicks) fPerfMaxTicks = ticks;
+	}
+	fBusy = false;
+	IOLockWakeup(fLock, &fBusy, false);
+	IOLockUnlock(fLock);
+}
+
+/* Queue each enabled layer's surface for copying into the panel memory. */
 void
 AppleCLCD::swap(const uint8_t *rec)
 {
@@ -264,6 +542,8 @@ AppleCLCD::swap(const uint8_t *rec)
 		    get32(rec, 0xa0), get32(rec, 0xa4), get32(rec, 0xa8));
 	}
 
+	Job job;
+	job.count = 0;
 	for (uint32_t layer = 0; layer < B2L_FB_LAYERS; layer++) {
 		uint32_t id = get32(rec, 0x9c + 4 * layer);
 		const uint8_t *a = rec + 0xac + 16 * layer;
@@ -287,22 +567,32 @@ AppleCLCD::swap(const uint8_t *rec)
 			OSSafeReleaseNULL(s);
 			continue;
 		}
-		uintptr_t src = s->kernelAddress();
-        if(src && s->memory && s->bytesPerElement==4 && s->elementWidth==1 && s->elementHeight==1 &&
-            s->pixelFormat==B2L_FB_FORMAT_BGRA) {
-            if(w<=0||h<=0){w=(int32_t)s->width;h=(int32_t)s->height;}
-            uint64_t copy_began = mach_absolute_time();
-            IOLockLock(fLock);
-            int shown=b2l_blit((void*)fPixels,(uint64_t)fRowBytes*fHeight,fWidth,fHeight,fRowBytes,
-                (const void*)src,s->memory->getLength(),s->width,s->height,s->bytesPerRow,s->offset,
-                sx,sy,dx,dy,w,h);
-            if(shown&&!fConsolePaused){b2l_early_gui_present();fConsolePaused=true;IOLog("B2L FB: first IOSurface frame copied to physical scanout\n");}
-            __asm__ volatile("dsb sy":::"memory");
-            IOLockUnlock(fLock);
-            if (shown) b2l_fb_copy_note(mach_absolute_time() - copy_began);
-        }
+		Layer *l = &job.layer[job.count++];
+		l->s = s;     /* reference released by runCopy */
+		l->sx = sx; l->sy = sy; l->dx = dx; l->dy = dy; l->w = w; l->h = h;
+	}
 
-		s->release();
+	/* The previous presentation's buffers stay readable until it is copied;
+	 * waiting and queueing under one lock hold keeps clients from interleaving. */
+	IOLockLock(fLock);
+	fPerfSwaps++;
+	if (fBusy) {
+		uint64_t start = mach_absolute_time();
+		while (fBusy) IOLockSleep(fLock, &fBusy, THREAD_UNINT);
+		fPerfWaits++;
+		fPerfWaitTicks += mach_absolute_time() - start;
+	}
+	if (job.count == 0) {
+		IOLockUnlock(fLock);
+		return;
+	}
+	fJob = job;
+	fBusy = true;
+	IOLockUnlock(fLock);
+	if (fCopyCall != NULL) {
+		thread_call_enter(fCopyCall);
+	} else {
+		runCopy();      /* no worker: copy in SwapEnd, as before */
 	}
 }
 
@@ -508,6 +798,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		}
 		break;
 	case kB2LFBSwapWait:
+		fFB->waitIdle();
 		break;
     default: ret=kIOReturnUnsupported;break;
 	}

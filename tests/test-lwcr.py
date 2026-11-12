@@ -31,17 +31,18 @@ body=r'''
 typedef uint64_t user_addr_t,user64_addr_t;
 typedef unsigned mac_policy_handle_t;
 typedef struct {uint32_t val[8];} audit_token_t;
-struct proc {bool is64;};typedef struct proc *proc_t;
+struct proc {bool is64;bool setugid;};typedef struct proc *proc_t;
 struct mac_policy_ops {int (*mpo_policy_syscall)(struct proc*,int,user_addr_t);};
 struct mac_policy_conf {const char *mpc_name,*mpc_fullname;const struct mac_policy_ops *mpc_ops;};
 static bool active=true,found=true,present=true,noent,allocation_failure;
 static unsigned references,objects,allocations,reads,writes,fail_read;
 static uint32_t current_version=9;
-static struct proc process={true};
+static struct proc process={true,false};
 static uint8_t memory[0x10000];
 static bool fail_write;
 static bool b2l_amfi_active(void){return active;}
 static bool proc_is64bit(proc_t p){return p&&p->is64;}
+static int proc_issetugid(proc_t p){return p->setugid;}
 static int copyin(user_addr_t a,void *p,size_t n){reads++;if(reads==fail_read||a>sizeof(memory)||n>sizeof(memory)-a)return EFAULT;memcpy(p,memory+a,n);return 0;}
 static int copyout(const void *p,user_addr_t a,size_t n){writes++;if(fail_write||a>sizeof(memory)||n>sizeof(memory)-a)return EFAULT;memcpy(memory+a,p,n);return 0;}
 static void *kalloc_data(size_t n,int flags){(void)flags;if(allocation_failure)return NULL;allocations++;return malloc(n);}
@@ -106,6 +107,16 @@ int main(void){
  reset(fixture0,sizeof(fixture0));args.constraint=0x8000;memcpy(memory+0x8000,fixture0,sizeof(fixture0));memcpy(memory+0x1000,&args,sizeof(args));assert(!call()&&code()==0);
  reset(fixture0,sizeof(fixture0));args.result_size=0x403;memcpy(memory+0x1000,&args,sizeof(args));assert(call()==EINVAL&&!writes);
  reset(fixture0,sizeof(fixture0));assert(b2l_amfi_constraint_syscall(&process,0x67,0x1000)==ENOTSUP&&!reads);
+ /* Operation 90, dyld policy: {input flags, output pointer} -> @-path allowed only. */
+ {uint64_t in[2]={0,0x3000},out;
+  reset(fixture0,sizeof(fixture0));memcpy(memory+0x1000,in,16);memset(memory+0x3000,0xa5,8);
+  assert(!b2l_amfi_constraint_syscall(&process,90,0x1000));memcpy(&out,memory+0x3000,8);assert(out==1);
+  reset(fixture0,sizeof(fixture0));process.setugid=true;memcpy(memory+0x1000,in,16);
+  assert(!b2l_amfi_constraint_syscall(&process,90,0x1000));memcpy(&out,memory+0x3000,8);assert(out==0);process.setugid=false;
+  reset(fixture0,sizeof(fixture0));in[1]=0;memcpy(memory+0x1000,in,16);assert(b2l_amfi_constraint_syscall(&process,90,0x1000)==EINVAL&&!writes);
+  reset(fixture0,sizeof(fixture0));in[1]=UINT64_MAX;memcpy(memory+0x1000,in,16);assert(b2l_amfi_constraint_syscall(&process,90,0x1000)==EFAULT);
+  reset(fixture0,sizeof(fixture0));fail_read=1;assert(b2l_amfi_constraint_syscall(&process,90,0x1000)==EFAULT&&!writes);
+  reset(fixture0,sizeof(fixture0));active=false;assert(b2l_amfi_constraint_syscall(&process,90,0x1000)==ENOPOLICY&&!reads);}
  active=false;b2l_amfi_constraint_register();assert(!registration_calls);
  active=true;registration_error=ENOMEM;b2l_amfi_constraint_register();assert(!b2l_amfi_constraint_registered&&!existing);
  registration_error=0;b2l_amfi_constraint_register();assert(b2l_amfi_constraint_registered&&existing==&b2l_amfi_constraint_conf);

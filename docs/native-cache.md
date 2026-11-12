@@ -2,7 +2,10 @@
 
 The opt-in `b2l_native_cache=1` mode belongs to the deliberately stripped-pointer
 ARM64e development ABI. It does not implement pointer authentication security,
-claim PAC hardware, or translate arbitrary binaries statically.
+claim PAC hardware, or translate arbitrary binaries statically. The host
+[offline precompiler](arm64e-precompile.md) applies the same allowlisted
+converter to a whole prepared root before flashing; this cache then only has
+to cover what that pass did not see.
 
 ## Boot lifecycle
 

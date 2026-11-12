@@ -97,8 +97,11 @@ int b2l_amfi_proc_copy_der(proc_t process,void**out,size_t*length)
 {
     if(out)*out=NULL;if(length)*length=0;
     if(!out||!length)return EINVAL;
-    void*e=proc_copy_ent(process);bool ok=b2l_ent_copy_der(e,out,length);
-    b2l_ent_release(e);return ok?0:ENOENT;
+    /* No DER slot means no entitlements: like native csops, answer with an
+     * empty blob (csops_copy_token(NULL) writes a zero header), not ENOENT.
+     * Security turns ENOENT into a CFError that some callers mishandle. */
+    void*e=proc_copy_ent(process);(void)b2l_ent_copy_der(e,out,length);
+    b2l_ent_release(e);return 0;
 }
 int b2l_amfi_proc_copy_identity(proc_t process,void**out,size_t*length)
 {
@@ -106,6 +109,14 @@ int b2l_amfi_proc_copy_identity(proc_t process,void**out,size_t*length)
     if(!out||!length)return EINVAL;
     void*e=proc_copy_ent(process);int error=b2l_ent_copy_identity(e,out,length);
     b2l_ent_release(e);return error;
+}
+/* The retained entitlement object, for the b2l_ent_* queries; NULL if none.
+ * b2l_amfi_proc_copy_dict returns the plain OSDictionary, which those queries
+ * do not accept. */
+int b2l_amfi_proc_copy_ent(proc_t process,void **out)
+{
+    if(!out)return EINVAL;
+    *out=proc_copy_ent(process);return 0;
 }
 int b2l_amfi_proc_copy_dict(proc_t process,void **out)
 {
@@ -127,6 +138,8 @@ static void *vnode_copy_ent(struct vnode*vp,off_t offset)
     if(!b2l_amfi_vnode_is_platform(vp)||offset<0)return NULL;
     off_t bytes=0;
     if(vnode_size(vp,&bytes,vfs_context_current())||bytes<0)return b2l_ent_create(NULL,0,true);
+    /* One scratch buffer serves the XML read and then the DER read. */
+    _Static_assert(B2L_AMFI_DER_MAX<=B2L_AMFI_XML_MAX,"scratch buffer must hold the DER slot");
     void*xml=kalloc_data(B2L_AMFI_XML_MAX,Z_WAITOK);
     if(!xml)return NULL;
     struct vnode_reader input={vp};

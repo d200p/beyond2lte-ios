@@ -7,7 +7,7 @@ trap 'rm -rf "$task_test_dir"' EXIT
 sdk_path="$(xcrun --sdk macosx --show-sdk-path)"
 clang_path="$(xcrun --find clang)"
 clangxx_path="$(xcrun --find clang++)"
-for fixture in metadata identity der-metadata cdhash; do
+for fixture in metadata identity der-metadata cdhash large-entitlements; do
  "$clang_path" -isysroot "$sdk_path" -std=c11 -Wall -Wextra -Werror \
   -fsanitize=address,undefined -I"$repo_root/xnu-overlay/bsd/kern" -I"$repo_root/common/cache" \
   "$repo_root/tests/test-$fixture.c" "$repo_root/xnu-overlay/bsd/kern/b2l_amfi_metadata.c" "$repo_root/common/cache/CacheSha.c" \

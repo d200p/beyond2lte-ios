@@ -1,0 +1,8 @@
+--- a/iokit/conf/files
++++ b/iokit/conf/files
+@@ -185,3 +185,5 @@
+ iokit/Kernel/arm/B2LAMFI.cpp optional iokitcpp b2l
+ 
+ iokit/Kernel/arm/B2LBattery.cpp optional iokitcpp b2l
++
++iokit/Kernel/arm/B2LPower.cpp optional iokitcpp b2l

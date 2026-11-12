@@ -24,10 +24,13 @@
  * client and dropped on release or close.
  *
  * Selectors 5, 9, 10 and 27 implement matrix, nonbulk property and bulk
- * attachment updates/readback. Unsupported notification, accelerator and
+ * attachment updates/readback. Selector 20 (SetPurgeable) records the
+ * requested state and reports the previous one; wired surfaces are never
+ * reclaimed (b2l_surface_purgeable.h). Unsupported notification, accelerator and
  * shared-event selectors return kIOReturnUnsupported (logged once).
  */
 #include "B2LSurface.h"
+#include "b2l_surface_purgeable.h"
 
 #if defined(B2L)
 #include <IOKit/IOService.h>
@@ -54,6 +57,7 @@ enum {
 	kB2LSurfaceSetValue           = 9,
 	kB2LSurfaceCopyValues         = 10,
 	kB2LSurfaceSetBulkAttachments = 27,
+	kB2LSurfaceSetPurgeable       = 20,
 	kB2LSurfaceLimits             = 13,
 	kB2LSurfaceLookupFromPort     = 34,
 	kB2LSurfaceCreatePort         = 35,
@@ -788,6 +792,22 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 			ret = (s != NULL && b2l_surface_get(s)) ? returnSurface(s, args, true) : kIOReturnBadArgument;
 		}
 		OSSafeReleaseNULL(obj);
+		b2l_surf_log_once("sel", selector);
+		return ret;
+	}
+	case kB2LSurfaceSetPurgeable: {
+		/* IOSurfaceClientSetPurgeable: in [id, new state], out [old state]. */
+		if (args->scalarInputCount != 2 || args->scalarOutputCount < 1) return kIOReturnBadArgument;
+		B2LSurface *s = b2l_surface_copy((uint32_t)arg0);
+		if (s == NULL) return kIOReturnNotFound;
+		uint64_t old = 0;
+		IOReturn ret = b2l_surface_purgeable(&s->purgeState, args->scalarInput[1], &old) == 0 ?
+		    kIOReturnSuccess : kIOReturnBadArgument;
+		if (ret == kIOReturnSuccess) {
+			args->scalarOutput[0] = old;
+			args->scalarOutputCount = 1;
+		}
+		s->release();
 		b2l_surf_log_once("sel", selector);
 		return ret;
 	}

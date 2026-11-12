@@ -8,7 +8,8 @@ AMFI development metadata, without a verified signature or fake crypto provider.
 
 ## Activation and execution
 
-`b2l_arm64e_compat=1` is parsed at kernel TUNABLES startup. Its message uses
+`b2l_arm64e_compat=1` is parsed at kernel TUNABLES startup. `b2l_precompiled=1`
+additionally selects the [precompiled-root mode](arm64e-precompile.md). Its message uses
 the lock-free early framebuffer sink because normal printf/log locks are not
 yet initialized at that startup phase. Other values leave the
 service disabled. Binary grading accepts versioned ARM64e ABI version 0 only
@@ -127,8 +128,10 @@ Build 0016 includes this resident kernel service and enables its boot argument.
 This is a proof of concept, not complete iOS compatibility. Every unsupported
 instruction currently enters the exception path; the assembly handlers and
 QARMA avoid depending on native PAC, but do not remove exception overhead.
-There is no background daemon, on-disk executable rewriting or translation
-cache. A separate versioned RAM/persistent translation cache is the next phase.
+Build 0016 had no background daemon, on-disk executable rewriting or translation
+cache. The later [persistent observed-instruction cache](native-cache.md) and
+the host [offline precompiler](arm64e-precompile.md) now rewrite convertible
+sites on disk; PACGA, LDRA and unknown instructions still trap.
 First device evidence should distinguish architecture admission, actual EL0
 execution and subsequent failures. A successful build alone proves none of
 those runtime stages.
