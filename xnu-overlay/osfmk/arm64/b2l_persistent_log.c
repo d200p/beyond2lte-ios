@@ -13,6 +13,7 @@
 #include <kern/processor.h>
 #include <kern/recount.h>
 #include <arm64/proc_reg.h>
+#include <pexpert/pexpert.h>
 #include <string.h>
 #include "b2l_cpu_clock.h"
 #include "b2l_task_dump.h"
@@ -105,37 +106,39 @@ static void b2l_cputop_report(void)
     b2l_early_trace("%s\n", line);
 }
 /*
- * S10 port diagnostic: where backboardd's CPU time goes. The timer interrupt
- * (sleh_irq, patch 0068) passes the interrupted state; when it interrupted a
- * backboardd thread, that PC is counted in a 64-byte bucket, user and kernel
- * alike (kernel PCs are slid: anchor, on the header line, is where
- * b2l_pcs_report itself was loaded). Each report
- * window prints the busiest buckets and starts a new table:
- *   B2L PCS: samples=N user=N kernel=N lost=N buckets=N shown=N kept=N anchor=0x...
- *   B2L PCS: pc=count ... (eight per line, busiest first)
+ * S10 port diagnostic: where backboardd's CPU time goes, and one app's
+ * (b2l_pcs_app=NAME, default MobileNotes). The timer interrupt (sleh_irq,
+ * patch 0068) passes the interrupted state; when it interrupted one of those,
+ * its PC is counted in a 64-byte bucket. Boot 29 put 93% of backboardd's
+ * samples in the kernel, 84% of them where interrupts are enabled again, so a
+ * kernel sample also counts the next four return addresses on the thread's
+ * kernel stack and the user PC and LR the thread entered the kernel from.
+ * Kernel PCs are slid: anchor, on the header line, is where b2l_pcs_report was
+ * loaded. A bucket's low six bits say what it counts:
+ *   bits 0-2  0 interrupted PC, 1-4 kernel caller at that depth,
+ *             5 user PC of a thread in the kernel, 6 its user LR
+ *   bit 3     0 backboardd, 1 the app
+ * Each report window prints the busiest buckets and starts a new table:
+ *   B2L PCS: samples=N user=N kernel=N app=NAME app_samples=N app_user=N lost=N buckets=N shown=N kept=N anchor=0x...
+ *   B2L PCS: bucket=count ... (eight per line, busiest first)
  */
-#define B2L_PCS_SLOTS 4096u     /* power of two */
+#define B2L_PCS_SLOTS 8192u     /* power of two */
 #define B2L_PCS_PROBE 32u
-#define B2L_PCS_SHOW  192u
+#define B2L_PCS_SHOW  384u
+#define B2L_PCS_DEPTH 4u
 struct b2l_pcs_slot { uint64_t pc; uint32_t count; uint32_t unused; };
 static struct b2l_pcs_slot b2l_pcs[2][B2L_PCS_SLOTS];
 static struct b2l_pcs_slot b2l_pcs_top[B2L_PCS_SHOW];
-static uint64_t b2l_pcs_samples[2], b2l_pcs_user[2], b2l_pcs_lost[2];
+static uint64_t b2l_pcs_samples[2][2], b2l_pcs_user[2][2], b2l_pcs_lost[2];
 static uint32_t b2l_pcs_set;
-void b2l_pc_sample(arm_saved_state_t *state);
-void b2l_pc_sample(arm_saved_state_t *state)
+static char b2l_pcs_app[20] = "MobileNotes";
+static uint32_t b2l_pcs_app_ready;
+extern vm_offset_t kernel_stack_size;
+extern arm_saved_state_t *get_user_regs(thread_t);
+static void b2l_pcs_add(unsigned set, uint64_t key)
 {
-    task_t task = current_task();
-    if (state == NULL || task == TASK_NULL || task == kernel_task) return;
-    void *p = get_bsdtask_info(task);
-    const char *name = p ? proc_name_address((struct proc *)p) : NULL;
-    if (name == NULL || strncmp(name, "backboardd", 11) != 0) return;
-    unsigned set = __atomic_load_n(&b2l_pcs_set, __ATOMIC_ACQUIRE) & 1u;
-    uint64_t key = (uint64_t)get_saved_state_pc(state) & ~63ull;
-    __atomic_fetch_add(&b2l_pcs_samples[set], 1, __ATOMIC_RELAXED);
-    if (PSR64_IS_USER64(get_saved_state_cpsr(state))) __atomic_fetch_add(&b2l_pcs_user[set], 1, __ATOMIC_RELAXED);
-    unsigned h = (unsigned)(((key >> 6) * 0x9E3779B97F4A7C15ull) >> 52);
-    for (unsigned i = 0; key != 0 && i < B2L_PCS_PROBE; i++) {
+    unsigned h = (unsigned)(((key >> 6) * 0x9E3779B97F4A7C15ull) >> 51);
+    for (unsigned i = 0; i < B2L_PCS_PROBE; i++) {
         struct b2l_pcs_slot *slot = &b2l_pcs[set][(h + i) & (B2L_PCS_SLOTS - 1)];
         uint64_t seen = __atomic_load_n(&slot->pc, __ATOMIC_RELAXED);
         if (seen == 0) {
@@ -146,8 +149,53 @@ void b2l_pc_sample(arm_saved_state_t *state)
     }
     __atomic_fetch_add(&b2l_pcs_lost[set], 1, __ATOMIC_RELAXED);
 }
+void b2l_pc_sample(arm_saved_state_t *state);
+void b2l_pc_sample(arm_saved_state_t *state)
+{
+    task_t task = current_task();
+    if (state == NULL || task == TASK_NULL || task == kernel_task) return;
+    void *p = get_bsdtask_info(task);
+    const char *name = p ? proc_name_address((struct proc *)p) : NULL;
+    if (name == NULL) return;
+    unsigned who;
+    if (strncmp(name, "backboardd", 11) == 0) who = 0;
+    else if (__atomic_load_n(&b2l_pcs_app_ready, __ATOMIC_ACQUIRE) && strncmp(name, b2l_pcs_app, sizeof(b2l_pcs_app)) == 0) who = 1;
+    else return;
+    unsigned set = __atomic_load_n(&b2l_pcs_set, __ATOMIC_ACQUIRE) & 1u;
+    uint64_t tag = (uint64_t)who << 3;
+    uint64_t pc = (uint64_t)get_saved_state_pc(state);
+    bool user = PSR64_IS_USER64(get_saved_state_cpsr(state));
+    __atomic_fetch_add(&b2l_pcs_samples[set][who], 1, __ATOMIC_RELAXED);
+    if (user) __atomic_fetch_add(&b2l_pcs_user[set][who], 1, __ATOMIC_RELAXED);
+    if (pc != 0) b2l_pcs_add(set, (pc & ~63ull) | tag);
+    if (user) return;
+    /* Frame records on this thread's kernel stack only, each strictly above
+     * the last: a bad frame pointer ends the walk instead of being followed. */
+    thread_t thread = current_thread();
+    uint64_t low = (uint64_t)thread->kernel_stack, high = low + (uint64_t)kernel_stack_size;
+    uint64_t fp = (uint64_t)get_saved_state_fp(state);
+    for (unsigned depth = 1; low != 0 && depth <= B2L_PCS_DEPTH; depth++) {
+        if (fp < low || fp > high - 16 || (fp & 7)) break;
+        uint64_t next = ((const uint64_t *)fp)[0], lr = ((const uint64_t *)fp)[1];
+        if (lr == 0) break;
+        b2l_pcs_add(set, (lr & ~63ull) | tag | depth);
+        if (next <= fp) break;
+        fp = next;
+    }
+    arm_saved_state_t *regs = get_user_regs(thread);
+    if (regs != NULL) {
+        uint64_t upc = (uint64_t)get_saved_state_pc(regs), ulr = (uint64_t)get_saved_state_lr(regs);
+        if (upc != 0) b2l_pcs_add(set, (upc & ~63ull) | tag | 5);
+        if (ulr != 0) b2l_pcs_add(set, (ulr & ~63ull) | tag | 6);
+    }
+}
 static void b2l_pcs_report(void)
 {
+    if (!__atomic_load_n(&b2l_pcs_app_ready, __ATOMIC_ACQUIRE)) {
+        char app[sizeof(b2l_pcs_app)] = { 0 };
+        if (PE_parse_boot_argn("b2l_pcs_app", app, sizeof(app)) && app[0]) strlcpy(b2l_pcs_app, app, sizeof(b2l_pcs_app));
+        __atomic_store_n(&b2l_pcs_app_ready, 1, __ATOMIC_RELEASE);
+    }
     unsigned set = __atomic_load_n(&b2l_pcs_set, __ATOMIC_ACQUIRE) & 1u;
     __atomic_store_n(&b2l_pcs_set, set ^ 1u, __ATOMIC_RELEASE);
     delay(200);     /* an interrupt that still holds the old set is long done */
@@ -165,11 +213,12 @@ static void b2l_pcs_report(void)
         b2l_pcs_top[at].count = count;
         if (shown < B2L_PCS_SHOW) shown++;
     }
-    uint64_t samples = b2l_pcs_samples[set], user = b2l_pcs_user[set], lost = b2l_pcs_lost[set];
+    uint64_t samples = b2l_pcs_samples[set][0], user = b2l_pcs_user[set][0], lost = b2l_pcs_lost[set];
+    uint64_t app_samples = b2l_pcs_samples[set][1], app_user = b2l_pcs_user[set][1];
     for (unsigned i = 0; i < shown; i++) kept += b2l_pcs_top[i].count;
-    if (samples) {
-        b2l_early_trace("B2L PCS: samples=%llu user=%llu kernel=%llu lost=%llu buckets=%u shown=%u kept=%llu anchor=0x%llx\n",
-            samples, user, samples - user, lost, buckets, shown, kept,
+    if (samples || app_samples) {
+        b2l_early_trace("B2L PCS: samples=%llu user=%llu kernel=%llu app=%s app_samples=%llu app_user=%llu lost=%llu buckets=%u shown=%u kept=%llu anchor=0x%llx\n",
+            samples, user, samples - user, b2l_pcs_app, app_samples, app_user, lost, buckets, shown, kept,
             (unsigned long long)(uintptr_t)&b2l_pcs_report);
         char line[256];
         int used = 0;
@@ -184,7 +233,9 @@ static void b2l_pcs_report(void)
         }
     }
     memset(table, 0, sizeof(b2l_pcs[0]));
-    b2l_pcs_samples[set] = b2l_pcs_user[set] = b2l_pcs_lost[set] = 0;
+    memset(b2l_pcs_samples[set], 0, sizeof(b2l_pcs_samples[set]));
+    memset(b2l_pcs_user[set], 0, sizeof(b2l_pcs_user[set]));
+    b2l_pcs_lost[set] = 0;
 }
 /* Estimate the current CPU's core clock from a dependent add chain of
  * 1,048,576 single-cycle instructions timed by the generic timer. No PMU or

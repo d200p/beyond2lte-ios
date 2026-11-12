@@ -409,10 +409,16 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * stripes but not those in Settings and Maps. */
                 "b2l_fb_render_width=1179 b2l_fb_render_height=2556 "
                 "b2l_wifi_diag=5 "
+                /* S10: the per-syscall/IPC boundary diagnostics are off in
+                 * the working system. With b2l_diag=1 every system call of
+                 * backboardd, SpringBoard and Settings went through them, and
+                 * those three ran with CG_CONTEXT_SHOW_BACKTRACE=1. */
+                "b2l_diag=0 "
 #else
                 "rd=b2l-diagnostic b2l_root_rw=0 b2l_system_log=0 b2l_native_cache=0 "
+                "b2l_diag=1 "
 #endif
-                "b2l_diag=1 b2l_userspace_bootstrap=0 exception_log_max_pid=4096");
+                "b2l_userspace_bootstrap=0 exception_log_max_pid=4096");
     Entry = Base + Mach.entry - Mach.virtual_base;
     if(Kernel){FreePool(Kernel); Kernel = NULL;}
     if (Root) { Root->Close(Root); Root = NULL; }

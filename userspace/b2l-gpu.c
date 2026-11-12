@@ -143,6 +143,16 @@ extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
 #define B2L_GPU_LIVE_MASKS 0
 #endif
 /*
+ * S10: kind 3 drawn live. Off: boot 29 still had the dashed black lines with
+ * masks off, and its live draws were kind 3 from surfaces plus kind 1. Kind 3
+ * went live in every boot with lines (15, 16, 27, 28, 29: 51 to 1529 draws);
+ * boot 25, with 440 kind 1 copies and only 19 kind 3, left none. Kind 3 stays
+ * in shadow mode.
+ */
+#ifndef B2L_GPU_LIVE_KIND3
+#define B2L_GPU_LIVE_KIND3 0
+#endif
+/*
  * S10: the cross-thread draw lock of boot 28 (see draw_read_enter). Off: it
  * did not remove the lines, and while a live pass runs it makes every other
  * render thread wait.
@@ -1219,7 +1229,7 @@ live_kind(const struct draw_key *key)
 	if (!source || key->unit1 != 0 || key->image != IMAGE_IDENTITY) {
 		return 0;
 	}
-	if ((key->kind == 3 || key->kind == 1) && key->blend == BLEND_SOVER && (key->blend_on & 1)) {
+	if (((B2L_GPU_LIVE_KIND3 && key->kind == 3) || key->kind == 1) && key->blend == BLEND_SOVER && (key->blend_on & 1)) {
 		return 1;
 	}
 	if (key->kind == 1 && key->blend == BLEND_COPY && !(key->blend_on & 1)) {
