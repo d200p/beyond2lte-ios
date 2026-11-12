@@ -389,19 +389,22 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * so Reduce Motion/Transparency and cross-fades follow Settings. */
                 "b2l_cache_interactive=1 b2l_ax_seed=0 b2l_dvfs=0 "
                 /* The GPU translation library is back in backboardd: boot 21,
-                 * without it, showed the same glass-bar stripes. */
+                 * without it, showed the same glass-bar stripes. The GPU runs
+                 * at its 702 MHz top when busy (fork default 433); B2LMali
+                 * still drops it above 85 C on the g3d sensor. */
+                "b2l_gpu_khz=702000 "
                 /* Fork build 0148 scanout from surfaces is untested: copy path. */
                 "b2l_scanout=0 "
                 /* The fork keeps 136 black rows for the S10+ camera pill; the
                  * S10 hole is small, so iOS keeps the whole panel. */
                 "b2l_fb_top_inset=0 "
-                /* iOS draws 1200x2532 (400x844 points at 3x, 31% fewer pixels
-                 * than the panel, exactly its aspect); the framebuffer copy
-                 * scales it up. The width is a multiple of 16 pixels: at 1179
-                 * (rows of 4716 bytes) surfaces aligned to 16 and to 64 bytes
-                 * disagreed and glass bars showed diagonal stripes (boots 20,
-                 * 21). 375x792 points got UIKit's red fallback status bar. */
-                "b2l_fb_render_width=1200 b2l_fb_render_height=2532 "
+                /* iOS draws 1179x2556, the iPhone 15/16 geometry (393x852
+                 * points at 3x, 31% fewer pixels than the panel); the
+                 * framebuffer copy scales it up. UIKit only accepts real iPhone
+                 * geometries: 375x792 and 400x844 points (boot 22) got its red
+                 * fallback status bar. 1200 wide removed the App Library
+                 * stripes but not those in Settings and Maps. */
+                "b2l_fb_render_width=1179 b2l_fb_render_height=2556 "
                 "b2l_wifi_diag=5 "
 #else
                 "rd=b2l-diagnostic b2l_root_rw=0 b2l_system_log=0 b2l_native_cache=0 "
