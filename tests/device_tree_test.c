@@ -82,7 +82,7 @@ static size_t decode(const unsigned char *buf, size_t size, size_t off,
         if (!strcmp(name,"artwork-device-idiom")) assert(len==sizeof("phone") && !memcmp(buf+off,"phone",len));
         if (!strcmp(name,"artwork-device-subtype")) assert(len==4 && read32(buf+off)==2868);
         if (!strcmp(name,"artwork-scale-factor")) assert(len==4 && read32(buf+off)==3);
-        if (!strcmp(name,"display-corner-radius")) assert(depth==1 && len==8 && read32(buf+off)==1 && read32(buf+off+4)==1);
+        if (!strcmp(name,"display-corner-radius")) assert(depth==1 && len==8 && read32(buf+off)==38 && read32(buf+off+4)==1);
         if (!strcmp(name,"artwork-display-gamut")) assert(len==sizeof("sRGB") && !memcmp(buf+off,"sRGB",len));
         if (!strcmp(name,"graphics-featureset-class") || !strcmp(name,"graphics-featureset-fallbacks")) assert(len==sizeof("GLES2,0") && !memcmp(buf+off,"GLES2,0",len));
         if (!strcmp(name,"target-type")) { ++target_type_properties; assert(depth==0 && len==sizeof("D94") && !memcmp(buf+off,"D94",len)); }

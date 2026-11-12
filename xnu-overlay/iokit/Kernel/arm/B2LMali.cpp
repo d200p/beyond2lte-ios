@@ -227,7 +227,12 @@ class B2LMali : public IOService {
 	IOReturn mapRange(task_t task, uint64_t va, uint64_t bytes, uint64_t *gpu_va);
 	static uint64_t lastJobTimeout();
 	IOReturn submit(const struct b2l_mali_submit *request, uint64_t *out);
+	/* S10 port: the framebuffer's scaled present (see presentScaled). Its two
+	 * buffers live in buffers[] like a client's; runtimeEnd frees them. */
+	int kernelPass = -1, kernelCode = -1;
+	uint64_t kernelPassVA, kernelCodeVA, kernelPresents, kernelFailures;
 public:
+	int presentScaled(uint32_t source_id, uint32_t panel_id, uint32_t width, uint32_t height, uint64_t *gpu_ns);
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 };
 OSDefineMetaClassAndStructors(B2LMali, IOService);
@@ -640,6 +645,8 @@ bool
 B2LMali::runtimeBegin()
 {
 	IOByteCount length = 0;
+
+	kernelPass = kernelCode = -1;   /* S10 port: buffers[] starts empty */
 
 	runtimeTables = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
 	    kIOMemoryPhysicallyContiguous | kIODirectionInOut, B2L_RT_TABLES * 4096, B2L_GPU_ADDRESS_MASK);
@@ -1109,6 +1116,7 @@ B2LMali::runtimeEnd()
 	for (unsigned i = 0; i < B2L_MALI_MAX_BUFFERS; i++) {
 		OSSafeReleaseNULL(buffers[i]);
 	}
+	kernelPass = kernelCode = -1;
 	if (coresOn) {
 		gpuClock(false);
 		b2l_mali_power_off(&io);
@@ -1457,6 +1465,87 @@ B2LMaliUserClient::clientClose(void)
 	return kIOReturnSuccess;
 }
 
+/*
+ * S10 port: the framebuffer's scaled present on the GPU. One textured quad,
+ * bilinear, from the swapped surface onto the panel surface, through the
+ * runtime the backboardd client brought up and under the same lock. Without
+ * a client, or for anything unusual, it returns 0 and the framebuffer copies
+ * on the CPU. The panel is not cleaned: the CPU never reads it.
+ */
+static B2LMali *gB2LMaliPresent;
+
+int
+B2LMali::presentScaled(uint32_t source_id, uint32_t panel_id, uint32_t width, uint32_t height, uint64_t *gpu_ns)
+{
+	int done = 0;
+	uint64_t src[5] = { 0, 0, 0, 0, 0 }, dst[5] = { 0, 0, 0, 0, 0 };
+	IOLockLock(runtimeLock);
+	if (!clientOpen || runtimeTables == NULL) {
+		IOLockUnlock(runtimeLock);
+		return 0;
+	}
+	if (kernelPass < 0 || buffers[kernelPass] == NULL || kernelCode < 0 || buffers[kernelCode] == NULL) {
+		uint64_t va = 0, type = 0;
+		kernelPass = kernelCode = -1;
+		if (createBuffer(B2L_MALI_PASS_BYTES(2), 0, &va, &type) == kIOReturnSuccess) {
+			kernelPass = (int)type;
+			kernelPassVA = va;
+			if (createBuffer(4096, B2L_MALI_BUFFER_CODE, &va, &type) == kIOReturnSuccess) {
+				kernelCode = (int)type;
+				kernelCodeVA = va;
+				uint8_t *code = (uint8_t *)buffers[kernelCode]->getBytesNoCopy();
+				bcopy(b2l_mali_shader_textured, code, sizeof(b2l_mali_shader_textured));
+				flush_dcache64((addr64_t)code, 4096, FALSE);
+			}
+		}
+		b2l_diag_record("B2L GPU PRESENT: buffers pass=%d code=%d\n", kernelPass, kernelCode);
+	}
+	if (kernelPass >= 0 && kernelCode >= 0 &&
+	    mapSurface(source_id, src) == kIOReturnSuccess && mapSurface(panel_id, dst) == kIOReturnSuccess &&
+	    src[4] == 0x42475241 && dst[4] == 0x42475241 && !(src[0] & 63) && !(dst[0] & 63) &&
+	    !(src[1] & 63) && !(dst[1] & 63) && src[2] && src[3] && width && height &&
+	    width <= dst[2] && height <= dst[3]) {
+		struct b2l_mali_target rt = { dst[0], width, height, (uint32_t)dst[1], 0, B2L_RT_BGRA,
+			B2L_RT_HEAP_VA, B2L_RT_HEAP_BYTES };
+		struct b2l_mali_pass pass;
+		b2l_mali_pass_begin(&pass, (uint8_t *)buffers[kernelPass]->getBytesNoCopy(), kernelPassVA, &rt);
+		b2l_mali_pass_bounds(&pass, 0, 0, width, height);
+		float zero = 0.0f, one = 1.0f;
+		struct b2l_mali_quad q = {
+			b2l_int_float(0), b2l_int_float(0), b2l_int_float(width), b2l_int_float(height), 0, 0, 0, 0,
+			{ 0, 0, 0, 0 }, kernelCodeVA, src[0], (uint32_t)src[2], (uint32_t)src[3], (uint32_t)src[1],
+			B2L_FORMAT_BGRA8_UNORM, B2L_EQ_COPY, 0, 1, 1, 0,
+		};
+		memcpy(&q.u0, &zero, 4);
+		memcpy(&q.v0, &zero, 4);
+		memcpy(&q.u1, &one, 4);
+		memcpy(&q.v1, &one, 4);
+		b2l_mali_pass_add(&pass, &q);
+		struct b2l_mali_submit request = { kernelPassVA + B2L_MALI_PASS_DRAWS, kernelPassVA + B2L_MALI_PASS_FRAGMENT,
+			(uint32_t)kernelPass, (uint32_t)B2L_MALI_PASS_BYTES(pass.draws), 0, 1, { source_id } };
+		uint64_t out[3] = { 0, 0, 0 };
+		IOReturn ret = submit(&request, out);
+		done = ret == kIOReturnSuccess && out[0] == B2L_MALI_STATUS_DONE;
+		if (gpu_ns != NULL) {
+			*gpu_ns = out[1] + out[2];
+		}
+		if (done) {
+			kernelPresents++;
+		} else if (kernelFailures++ < 8) {
+			b2l_diag_record("B2L GPU PRESENT: failed ret=0x%x status=%llu\n", ret, out[0]);
+		}
+	}
+	IOLockUnlock(runtimeLock);
+	return done;
+}
+
+extern "C" int
+b2l_mali_present_scaled(uint32_t source_id, uint32_t panel_id, uint32_t width, uint32_t height, uint64_t *gpu_ns)
+{
+	B2LMali *mali = gB2LMaliPresent;
+	return mali != NULL ? mali->presentScaled(source_id, panel_id, width, height, gpu_ns) : 0;
+}
+
 IOReturn
 B2LMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
 {
@@ -1563,6 +1652,7 @@ B2LMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
 bool
 B2LMali::start(IOService *provider)
 {
+	gB2LMaliPresent = this;     /* S10 port: framebuffer present, see presentScaled */
 	if (!IOService::start(provider)) {
 		return false;
 	}

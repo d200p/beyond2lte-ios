@@ -235,11 +235,11 @@ static void b2l_accessibility_before_init(vfs_context_t ctx)
 }
 /* S10 port, b2l_mg_refresh=1: MobileGestalt keeps what it computed once, so a
  * new device-tree value (display-corner-radius) is only read after its cache
- * is rebuilt. The cache is renamed once to .b2l-before-corner-v1.plist in the
+ * is rebuilt. The cache is renamed once to .b2l-before-corner-v2.plist in the
  * same folder; MobileGestalt then recreates it natively. Once the backup
  * exists nothing more happens. Returns 0 renamed, EEXIST already done. */
 static const char mg_cache_path[]="/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist";
-static const char mg_cache_backup[]="/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.b2l-before-corner-v1.plist";
+static const char mg_cache_backup[]="/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.b2l-before-corner-v2.plist";
 static int b2l_mg_cache_refresh(vfs_context_t ctx)
 {
     vnode_t saved=NULLVP;

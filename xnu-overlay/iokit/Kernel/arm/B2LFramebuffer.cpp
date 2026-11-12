@@ -23,6 +23,9 @@
 #include "b2l_decon_dump.h"
 extern "C" void b2l_hid_set_display_inset(uint32_t inset_rows, uint32_t panel_rows);
 extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
+/* S10 port: B2LMali draws the scaled frame onto the panel (see runCopy). */
+extern "C" int b2l_mali_present_scaled(uint32_t source_id, uint32_t panel_id, uint32_t width, uint32_t height,
+    uint64_t *gpu_ns);
 
 #if defined(B2L)
 #include <IOKit/IOService.h>
@@ -132,6 +135,12 @@ public:
 	uint16_t     *fYFirst;          /* first panel row of each source row */
 	uint8_t      *fYCount;          /* panel rows of each source row */
 	uint32_t     *fExpand;          /* one scaled panel row, cacheable; guarded by fBusy */
+	/* GPU present (b2l_fb_gpu, default on): a full-frame single layer is scaled
+	 * onto the panel by the Mali instead of the CPU. The shadow is not updated
+	 * then, so it is marked invalid after each GPU frame. */
+	bool          fGpuPresent;
+	uint32_t      fGpuLogs, fGpuFallbacks;
+	uint64_t      fGpuFrames;
 	bool scaledSetup(uint32_t renderWidth);
 	void presentSpan(uint32_t sy, uint32_t sx0, uint32_t sx1);
 	void presentAll(void);
@@ -268,6 +277,10 @@ AppleCLCD::start(IOService *provider)
 	}
 	IOLog("B2L FB: iOS renders %ux%u, panel %ux%u%s, dot pitch %u\n", fWidth, fHeight, fOutWidth, fOutHeight,
 	    fScaled ? " (scaled up)" : "", fDotPitch);
+	uint32_t gpuPresent = 1;
+	PE_parse_boot_argn("b2l_fb_gpu", &gpuPresent, sizeof(gpuPresent));
+	fGpuPresent = gpuPresent && fScaled && fTopInset == 0;
+	IOLog("B2L FB: GPU present %s\n", fGpuPresent ? "on" : "off");
 	uint32_t probe = 0;
 	PE_parse_boot_argn("b2l_fb_probe", &probe, sizeof(probe));
 	if (probe) probeStart();
@@ -947,6 +960,44 @@ AppleCLCD::runCopy(void)
 			for (uint32_t x = 0; x < fRowBytes / 8; x++) row[x] = 0xff000000ff000000ull;
 		}
 		IOLog("B2L FB: first IOSurface frame copied to physical scanout\n");
+	}
+	if (fScaled && fGpuPresent && job.count == 1) {
+		Layer *l = &job.layer[0];
+		B2LSurface *s = l->s;
+		int32_t w = l->w, h = l->h;
+		if (w <= 0 || h <= 0) { w = (int32_t)s->width; h = (int32_t)s->height; }
+		if (l->sx == 0 && l->sy == 0 && l->dx == 0 && l->dy == 0 && (uint32_t)w == fWidth && (uint32_t)h == fHeight &&
+		    s->width == fWidth && s->height == fHeight && s->pixelFormat == B2L_FB_FORMAT_BGRA && fSurface != NULL) {
+			uint64_t gpuStart = mach_absolute_time(), gpuNS = 0;
+			if (b2l_mali_present_scaled(s->id, fSurface->id, fOutWidth, fOutHeight, &gpuNS)) {
+				uint64_t ticks = mach_absolute_time() - gpuStart;
+				b2l_fb_copy_note(ticks);
+				if (fGpuLogs < 12) {
+					uint64_t ns = 0;
+					absolutetime_to_nanoseconds(ticks, &ns);
+					fGpuLogs++;
+					b2l_diag_record("B2L FB: GPU present %ux%u -> %ux%u in %llu us (GPU %llu us)\n", fWidth, fHeight,
+					    fOutWidth, fOutHeight, ns / 1000, gpuNS / 1000);
+				}
+				s->release();
+				IOLockLock(fLock);
+				fGpuFrames++;
+				fShadowValid = false;
+				fPerfCopies++;
+				fPerfFull++;
+				fPerfPixels += (uint64_t)fWidth * fHeight;
+				fPerfTicks += ticks;
+				if (ticks > fPerfMaxTicks) fPerfMaxTicks = ticks;
+				fBusy = false;
+				IOLockWakeup(fLock, &fBusy, false);
+				IOLockUnlock(fLock);
+				return;
+			}
+			if (fGpuFallbacks++ < 8) {
+				b2l_diag_record("B2L FB: GPU present unavailable, CPU copy (frame %llu)\n", fGpuFrames);
+			}
+			shadowValid = false;    /* GPU frames left the shadow behind */
+		}
 	}
 	if (fScaled) {
 		uint64_t scaledStart = mach_absolute_time(), scaledWritten = 0, scaledPixels = 0;
