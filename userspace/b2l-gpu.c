@@ -109,6 +109,17 @@ extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
 #ifndef B2L_GPU_JOIN
 #define B2L_GPU_JOIN 0          /* S10: fork build 0148 batch joining, see draw_hook */
 #endif
+/*
+ * S10: row alignment the translator asks of destinations and of textures read
+ * in place (fork: 64). At 1179 wide Core Animation's own full-screen surfaces
+ * have 4720-byte rows (16-byte aligned), and boot 25 rejected 54k draws for
+ * that alone. Every kind is still compared against the CPU before it goes
+ * live, so a stride the GPU mishandles cannot reach the screen; a GPU fault
+ * stops the translator for the boot.
+ */
+#ifndef B2L_GPU_ROW_ALIGN
+#define B2L_GPU_ROW_ALIGN 16
+#endif
 #ifndef B2L_GPU_BLUR
 #define B2L_GPU_BLUR 1          /* S10: gaussian_blur on the GPU, see gpu_blur */
 #endif
@@ -657,7 +668,7 @@ translate(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 	uint64_t magnitude = stride < 0 ? (uint64_t)-stride : (uint64_t)stride;
 
 	if (base == NULL || width <= 0 || height <= 0 || width > SHADOW_MAX_W || height > SHADOW_MAX_H ||
-	    magnitude < (uint64_t)width * 4 || (magnitude & 63) || magnitude * (uint64_t)height > SHADOW_BYTES ||
+	    magnitude < (uint64_t)width * 4 || (magnitude & (B2L_GPU_ROW_ALIGN - 1)) || magnitude * (uint64_t)height > SHADOW_BYTES ||
 	    (plane2 != NULL && plane2 != base)) {
 		if (reject_samples[R_GEOMETRY]++ < 4) {
 			log_line("G cur=%p p2=%p stride=%lld bounds=%d,%d-%d,%d", base, plane2, stride, cx0, cy0, cx1, cy1);
@@ -704,7 +715,7 @@ translate(void *ctx, uint32_t mode, uint32_t count, const uint16_t *indices, con
 		if (data == NULL || src.width <= 0 || src.height <= 0 || src.width > 16384 || src.height > 16384) {
 			return R_TEXTURE;
 		}
-		if ((src.magnitude & 63) || src.magnitude < (uint64_t)src.width * src.texel_bytes) {
+		if ((src.magnitude & (B2L_GPU_ROW_ALIGN - 1)) || src.magnitude < (uint64_t)src.width * src.texel_bytes) {
 			static uint32_t formats_seen;
 			reject_samples[R_TEXTURE_STRIDE]++;
 			if (key->format < 32 && !(formats_seen & (1u << key->format))) {
