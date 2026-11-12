@@ -718,13 +718,18 @@ AppleCLCD::presentSpan(uint32_t sy, uint32_t sx0, uint32_t sx1)
 	dx1 = (dx1 + 15) & ~15u;
 	if (dx1 > fOutWidth) dx1 = fOutWidth;
 	if (dx1 <= dx0) return;
-	/* Scale the span once into cacheable memory, then one sequential copy per
-	 * panel row it covers (one or two): the write-combined panel sees whole
-	 * 64-byte aligned runs. */
+	/* Scale the span once into cacheable memory, then 64-bit stores per panel
+	 * row it covers (one or two). Boot 19: memcpy into the write-combined
+	 * panel doubled the copy time (4.9 to 10.7 ms), so plain paired stores, as
+	 * in boot 18, write it. dx0 is even (16-aligned). */
 	for (uint32_t dx = dx0; dx < dx1; dx++) fExpand[dx] = row[fXMap[dx]];
+	const uint64_t *pairs = (const uint64_t *)(fExpand + dx0);
+	uint32_t count = (dx1 - dx0) / 2;
 	for (uint32_t k = 0; k < fYCount[sy]; k++) {
 		uintptr_t base = fPixels + (uintptr_t)(fYFirst[sy] + k) * fRowBytes;
-		memcpy((void *)(base + (uintptr_t)dx0 * 4), fExpand + dx0, (size_t)(dx1 - dx0) * 4);
+		volatile uint64_t *out = (volatile uint64_t *)(base + (uintptr_t)dx0 * 4);
+		for (uint32_t i = 0; i < count; i++) out[i] = pairs[i];
+		if ((dx1 - dx0) & 1) ((volatile uint32_t *)base)[dx1 - 1] = fExpand[dx1 - 1];
 	}
 }
 
