@@ -127,7 +127,9 @@ extern "C" pmap_t get_task_pmap(task_t task);
 #define B2L_GPU_MAX_KHZ        702000
 #define B2L_GPU_HOT_C          85
 #define B2L_GPU_COOL_C         75
-#define B2L_CPU_BIG_FIRST_C    76              /* the big sensor: that cluster steps down from here */
+/* S10 port: 80 (fork: 76). Boot 17 reached 80 C and spent its busiest windows
+ * at 1820 MHz; B2L_CPU_ALL_HOT_C still sends every cluster to boot rates. */
+#define B2L_CPU_BIG_FIRST_C    80              /* the big sensor: that cluster steps down from here */
 #define B2L_CPU_BIG_PER_C      4               /* and one more step for each of these */
 #define B2L_MIF_KHZ            2093000         /* Android's boot memory clock; 0 leaves it */
 #define B2L_MIF_TEST_BYTES     (8u << 20)

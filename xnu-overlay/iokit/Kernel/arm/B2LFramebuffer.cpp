@@ -131,6 +131,7 @@ public:
 	uint16_t     *fXMap;            /* source column of each panel column */
 	uint16_t     *fYFirst;          /* first panel row of each source row */
 	uint8_t      *fYCount;          /* panel rows of each source row */
+	uint32_t     *fExpand;          /* one scaled panel row, cacheable; guarded by fBusy */
 	bool scaledSetup(uint32_t renderWidth);
 	void presentSpan(uint32_t sy, uint32_t sx0, uint32_t sx1);
 	void presentAll(void);
@@ -686,6 +687,14 @@ AppleCLCD::scaledSetup(uint32_t renderWidth)
 		if (ycount[sy] == 0) yfirst[sy] = (uint16_t)y;
 		ycount[sy]++;
 	}
+	uint32_t *expand = (uint32_t *)IOMallocData(fOutWidth * sizeof(uint32_t));
+	if (expand == NULL) {
+		IOFreeData(xmap, fOutWidth * sizeof(uint16_t));
+		IOFreeData(yfirst, renderHeight * sizeof(uint16_t));
+		IOFreeData(ycount, renderHeight);
+		return false;
+	}
+	fExpand = expand;
 	fXMap = xmap;
 	fYFirst = yfirst;
 	fYCount = ycount;
@@ -708,14 +717,14 @@ AppleCLCD::presentSpan(uint32_t sy, uint32_t sx0, uint32_t sx1)
 	dx0 &= ~15u;
 	dx1 = (dx1 + 15) & ~15u;
 	if (dx1 > fOutWidth) dx1 = fOutWidth;
+	if (dx1 <= dx0) return;
+	/* Scale the span once into cacheable memory, then one sequential copy per
+	 * panel row it covers (one or two): the write-combined panel sees whole
+	 * 64-byte aligned runs. */
+	for (uint32_t dx = dx0; dx < dx1; dx++) fExpand[dx] = row[fXMap[dx]];
 	for (uint32_t k = 0; k < fYCount[sy]; k++) {
 		uintptr_t base = fPixels + (uintptr_t)(fYFirst[sy] + k) * fRowBytes;
-		volatile uint64_t *out = (volatile uint64_t *)base;
-		uint32_t dx = dx0;
-		for (; dx + 1 < dx1; dx += 2) {
-			out[dx / 2] = (uint64_t)row[fXMap[dx]] | ((uint64_t)row[fXMap[dx + 1]] << 32);
-		}
-		if (dx < dx1) ((volatile uint32_t *)base)[dx] = row[fXMap[dx]];
+		memcpy((void *)(base + (uintptr_t)dx0 * 4), fExpand + dx0, (size_t)(dx1 - dx0) * 4);
 	}
 }
 
@@ -750,8 +759,9 @@ AppleCLCD::copyScaled(B2LSurface *s, const Layer *l, bool shadowValid, uint64_t 
 		uint32_t *shadow = (uint32_t *)(fShadow + (uint64_t)(dy + y) * fShadowStride + (uint64_t)dx * 4);
 		uint32_t first = 0, last = r.w;
 		if (shadowValid) {
+			/* Most rows of most frames are unchanged: one memcmp settles them. */
+			if (memcmp(in, shadow, (size_t)r.w * 4) == 0) continue;
 			while (first < r.w && in[first] == shadow[first]) first++;
-			if (first == r.w) continue;
 			while (last > first && in[last - 1] == shadow[last - 1]) last--;
 		}
 		memcpy(shadow + first, in + first, (size_t)(last - first) * 4);
