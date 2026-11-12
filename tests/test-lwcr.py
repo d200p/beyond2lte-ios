@@ -43,6 +43,13 @@ static bool fail_write;
 static bool b2l_amfi_active(void){return active;}
 static bool proc_is64bit(proc_t p){return p&&p->is64;}
 static int proc_issetugid(proc_t p){return p->setugid;}
+typedef struct mock_vnode *vnode_t;
+#define NULLVP ((vnode_t)0)
+static int gpu_ui_ready;static const char *exe_path="/usr/libexec/other";static int vnode_refs;
+int b2l_gpu_ui_is_ready(void);int b2l_gpu_ui_is_ready(void){return gpu_ui_ready;}
+static vnode_t proc_getexecutablevnode(proc_t p){(void)p;if(!exe_path)return NULLVP;vnode_refs++;return (vnode_t)&vnode_refs;}
+static int vn_getpath(vnode_t v,char *path,int *length){(void)v;if((int)strlen(exe_path)>=*length)return 63;strcpy(path,exe_path);return 0;}
+static int vnode_put(vnode_t v){(void)v;vnode_refs--;return 0;}
 static int copyin(user_addr_t a,void *p,size_t n){reads++;if(reads==fail_read||a>sizeof(memory)||n>sizeof(memory)-a)return EFAULT;memcpy(p,memory+a,n);return 0;}
 static int copyout(const void *p,user_addr_t a,size_t n){writes++;if(fail_write||a>sizeof(memory)||n>sizeof(memory)-a)return EFAULT;memcpy(memory+a,p,n);return 0;}
 static void *kalloc_data(size_t n,int flags){(void)flags;if(allocation_failure)return NULL;allocations++;return malloc(n);}
@@ -113,6 +120,15 @@ int main(void){
   assert(!b2l_amfi_constraint_syscall(&process,90,0x1000));memcpy(&out,memory+0x3000,8);assert(out==1);
   reset(fixture0,sizeof(fixture0));process.setugid=true;memcpy(memory+0x1000,in,16);
   assert(!b2l_amfi_constraint_syscall(&process,90,0x1000));memcpy(&out,memory+0x3000,8);assert(out==0);process.setugid=false;
+  /* The GPU library: backboardd only, only once published, and never set-uid. */
+  #define POLICY() (reset(fixture0,sizeof(fixture0)),memcpy(memory+0x1000,in,16),assert(!b2l_amfi_constraint_syscall(&process,90,0x1000)),memcpy(&out,memory+0x3000,8),out)
+  gpu_ui_ready=1;assert(POLICY()==1&&!vnode_refs);
+  exe_path="/usr/libexec/backboardd";assert(POLICY()==(1|2|32)&&!vnode_refs);
+  exe_path="/usr/libexec/backboardd2";assert(POLICY()==1);
+  exe_path="/private/var/tmp/a/very/long/path/that/does/not/fit/in/the/sixty/four/byte/buffer/backboardd";assert(POLICY()==1&&!vnode_refs);
+  exe_path=NULL;assert(POLICY()==1);
+  exe_path="/usr/libexec/backboardd";gpu_ui_ready=0;assert(POLICY()==1);
+  gpu_ui_ready=1;process.setugid=true;assert(POLICY()==0);process.setugid=false;gpu_ui_ready=0;
   reset(fixture0,sizeof(fixture0));in[1]=0;memcpy(memory+0x1000,in,16);assert(b2l_amfi_constraint_syscall(&process,90,0x1000)==EINVAL&&!writes);
   reset(fixture0,sizeof(fixture0));in[1]=UINT64_MAX;memcpy(memory+0x1000,in,16);assert(b2l_amfi_constraint_syscall(&process,90,0x1000)==EFAULT);
   reset(fixture0,sizeof(fixture0));fail_read=1;assert(b2l_amfi_constraint_syscall(&process,90,0x1000)==EFAULT&&!writes);

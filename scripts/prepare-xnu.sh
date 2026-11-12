@@ -77,7 +77,9 @@ python3 "$repo_root/scripts/apply-board-patches.py" "$xnu_path" \
   "$repo_root/patches/0062-b2l-platform-error-fault-detail.patch" \
   "$repo_root/patches/0063-b2l-wifi-shared-block-diagnostic.patch" \
   "$repo_root/patches/0064-b2l-max77705-battery.patch" \
-  "$repo_root/patches/0065-b2l-power.patch"
+  "$repo_root/patches/0065-b2l-power.patch" \
+  "$repo_root/patches/0066-b2l-mali-g76-selftest.patch" \
+  "$repo_root/patches/0067-b2l-gpu-ui-exec.patch"
 # New files have separate provenance and are kept as an overlay.
 while IFS= read -r -d '' source_file; do
   relative="${source_file#"$repo_root/xnu-overlay/"}"
@@ -92,6 +94,15 @@ if [[ "${B2L_KERNEL_ONLY:-0}" == 1 ]]; then
   printf '#define B2L_HAS_USERSPACE_PAYLOAD 0\n' > "$xnu_path/bsd/kern/b2l_userspace_payload.h"
 else
   python3 "$repo_root/scripts/build-userspace-bootstrap.py" --output "$xnu_path/bsd/kern/b2l_userspace_payload.h"
+fi
+# Core Animation GPU translation library for backboardd (from the
+# StachowiakDawid fork). Built from userspace/b2l-gpu.c against the iPhoneOS SDK
+# and embedded in the kernel, which publishes it at boot. B2L_GPU_LIBRARY=0
+# builds a kernel without it; otherwise a failure stops the build.
+if [[ "${B2L_GPU_LIBRARY:-1}" == 1 ]]; then
+  python3 "$repo_root/scripts/build-gpu-library.py" --xnu "$xnu_path" --output "$repo_root/out/b2l-gpu/b2l-gpu.dylib"
+else
+  printf '#define B2L_HAS_GPU_UI_PAYLOAD 0\n' > "$xnu_path/bsd/kern/b2l_gpu_payload.h"
 fi
 printf '#define B2L_DIAGNOSTIC_READ_ONLY %s\n' "$storage_read_only" > "$xnu_path/bsd/dev/b2l_build_profile.h"
 for source_file in "$repo_root/common/cache/"*; do

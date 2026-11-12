@@ -13,6 +13,22 @@
 #include <kern/processor.h>
 #include <kern/recount.h>
 #include <string.h>
+#include "b2l_cpu_clock.h"
+#include "b2l_task_dump.h"
+void b2l_cpu_clock_measure(void){b2l_cpu_clock_report();}
+/* Scheduler ticks of all CPUs so far, for a load figure over an interval. */
+void b2l_cpu_load_sample(uint64_t*busy,uint64_t*idle)
+{
+    *busy=*idle=0;
+    for(unsigned cpu=0;cpu<real_ncpus&&cpu<16;cpu++){
+        processor_t processor=cpu_to_processor((int)cpu);
+        natural_t ticks[CPU_STATE_MAX]={0};
+        if(processor==PROCESSOR_NULL)continue;
+        processor_cpu_load_info(processor,ticks);
+        *busy+=(uint64_t)ticks[CPU_STATE_USER]+ticks[CPU_STATE_SYSTEM];
+        *idle+=ticks[CPU_STATE_IDLE];
+    }
+}
 static struct b2l_log_ring console_ring;
 extern void b2l_fb_swap_snapshot(uint64_t out[7]);
 extern void b2l_acpm_dvfs_snapshot(int32_t temps[4], uint32_t sent_khz[3]);
@@ -121,12 +137,15 @@ void b2l_log_append_bytes(const void*p,size_t n){b2l_log_ring_append_bytes(&cons
 static void b2l_log_worker(void*argument __unused,wait_result_t result __unused)
 {
     unsigned reports=0,ticks=0;
+    bool clocks_reported=false;
     for(;;){
         /* For the first 300 s, drain every second and leave a TICK line, so
          * the last line on disk dates a stall to within about one second. */
         uint64_t up=0;absolutetime_to_nanoseconds(mach_absolute_time(),&up);up/=NSEC_PER_SEC;
         bool early=up<300;
         if(early)b2l_early_trace("B2L TICK sec=%llu\n",up);
+        /* Once, after SMP bring-up and before the UI loads the CPUs. */
+        if(!clocks_reported&&up>=20){clocks_reported=true;b2l_cpu_clock_report();}
         int err=b2l_log_writer_drain(&disk_writer,&console_ring,128);
         if(err){__atomic_fetch_add(&flush_failures,1,__ATOMIC_RELAXED);__atomic_store_n(&last_error,err,__ATOMIC_RELAXED);}
         /* Outside every storage lock/callback. One bounded progress line per

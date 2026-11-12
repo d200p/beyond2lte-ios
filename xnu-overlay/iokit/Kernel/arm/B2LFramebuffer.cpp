@@ -20,6 +20,9 @@
  */
 #include "B2LSurface.h"
 #include "B2LBlit.h"
+#include "b2l_decon_dump.h"
+extern "C" void b2l_hid_set_display_inset(uint32_t inset_rows, uint32_t panel_rows);
+extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 
 #if defined(B2L)
 #include <IOKit/IOService.h>
@@ -59,6 +62,10 @@ enum {
 #define B2L_FB_VSYNC_US               16667
 #define B2L_FB_DOT_PITCH              522     /* S10+ panel; geometry still comes from GOP */
 #define B2L_FB_FORMAT_BGRA            0x42475241
+/* Rows kept black above iOS for the S10+ front-camera hole (top right). 136
+ * leaves 1440x2904, exactly 480x968 points at 3x, and keeps every row start
+ * 64-byte aligned. Boot argument b2l_fb_top_inset overrides it. */
+#define B2L_FB_TOP_INSET              136
 
 class IOMobileFramebuffer : public IOService {
 	OSDeclareDefaultStructors(IOMobileFramebuffer);
@@ -76,6 +83,8 @@ class AppleCLCD : public IOMobileFramebuffer {
 	uint64_t            fVsyncCount;
 
 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
+	static void deconDumpMain(void *owner, wait_result_t result);
+	void deconDump(void);
 	/* b2l_fb_probe=1: a panel-sized buffer that is never presented. Its
 	 * physical runs are logged, per-page hashes are checked every 5 s to
 	 * catch writes from outside the kernel, and at 60 s uptime it is filled
@@ -90,7 +99,9 @@ class AppleCLCD : public IOMobileFramebuffer {
 public:
 	uint64_t      fPhys;
 	uint32_t      fWidth, fHeight, fRowBytes;
-	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+	uintptr_t     fPixels;          /* kernel mapping of the presented area */
+	uintptr_t     fPanelPixels;     /* kernel mapping of the whole panel */
+	uint32_t      fTopInset;        /* black rows above the presented area */
 	IOMemoryMap  *fMap;
 	B2LSurface *fSurface;         /* the panel memory as an IOSurface */
 	IOLock       *fLock;            /* swaps and client list */
@@ -109,6 +120,19 @@ public:
 	thread_call_t fCopyCall;
 	uint8_t      *fShadow;          /* cached copy of what the panel shows */
 	bool          fShadowValid;     /* set once a copy covered the whole panel */
+
+	/* Scanout straight from a surface: DECON_F window 5, DMA channel 0, as the
+	 * boot chain set them up for the panel memory (0147 dump). */
+	IOMemoryMap  *fDeconMap, *fDmaMap;
+	volatile uint32_t *fDecon, *fDma;
+	bool          fScanout;         /* b2l_scanout, default on */
+	bool          fFlipped;         /* the channel points at a surface, not the panel */
+	B2LSurface   *fShown[2];        /* the surface on screen and the one before it */
+	uint32_t      fPerfFlips, fPerfFallbacks;
+	uint64_t      fPerfFlipTicks, fPerfCleanTicks;
+	bool flipTo(B2LSurface *s, const Layer *l);
+	void pointAtPanel(void);
+	void programChannel(uint32_t base, uint32_t stride_px, uint32_t w, uint32_t h, uint32_t top);
 
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 	void addClient(IOMobileFramebufferUserClient *client);
@@ -165,14 +189,25 @@ AppleCLCD::start(IOService *provider)
 	fLock = IOLockAlloc();
 	fClients = OSArray::withCapacity(4);
 	fSurface = b2l_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, B2L_FB_FORMAT_BGRA);
-	fPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
+	fPanelPixels = fSurface != NULL ? fSurface->kernelAddress() : 0;
 	fWorkLoop = IOWorkLoop::workLoop();
-	if (fLock == NULL || fClients == NULL || fPixels == 0 || fWorkLoop == NULL) {
+	if (fLock == NULL || fClients == NULL || fPanelPixels == 0 || fWorkLoop == NULL) {
 		IOLog("B2L FB: setup failed\n");
 		OSSafeReleaseNULL(fSurface);    /* stays published: also held by the table */
 		OSSafeReleaseNULL(fWorkLoop);
 		return false;
 	}
+	/* From here on fPixels/fHeight describe only the area below the camera
+	 * band: GetDisplaySize, copies, clipping and the shadow all use it. The
+	 * default surface stays the whole physical panel and is never copied. */
+	uint32_t inset = B2L_FB_TOP_INSET;
+	PE_parse_boot_argn("b2l_fb_top_inset", &inset, sizeof(inset));
+	if (inset > fHeight / 4) inset = 0;
+	fTopInset = inset;
+	fPixels = fPanelPixels + (uintptr_t)fRowBytes * inset;
+	fHeight -= inset;
+	b2l_hid_set_display_inset(inset, fHeight + inset);
+	IOLog("B2L FB: top inset %u rows, presenting %ux%u\n", inset, fWidth, fHeight);
 	/* Without a shadow every copy is a full write; without the thread call it
 	 * runs in SwapEnd as before. Both are allowed to fail. */
 	/* Dirty-span copy (64-byte aligned spans, see B2LBlit.h); boot argument
@@ -189,6 +224,29 @@ AppleCLCD::start(IOService *provider)
 	 * path stays, unused, behind fCopyCall). */
 	fCopyCall = NULL;
 	IOLog("B2L FB: present shadow %s, copy worker %s\n", fShadow ? "on" : "off", fCopyCall ? "on" : "off");
+	IOMemoryDescriptor *regs = IOMemoryDescriptor::withPhysicalAddress(B2L_DECON_BASE, B2L_DECON_BYTES, kIODirectionInOut);
+	fDeconMap = regs ? regs->map(kIOMapInhibitCache) : NULL;
+	OSSafeReleaseNULL(regs);
+	regs = IOMemoryDescriptor::withPhysicalAddress(B2L_DPU_DMA_BASE, B2L_DPU_DMA_BYTES, kIODirectionInOut);
+	fDmaMap = regs ? regs->map(kIOMapInhibitCache) : NULL;
+	OSSafeReleaseNULL(regs);
+	fDecon = fDeconMap ? (volatile uint32_t *)fDeconMap->getVirtualAddress() : NULL;
+	fDma = fDmaMap ? (volatile uint32_t *)fDmaMap->getVirtualAddress() : NULL;
+	int scanout = 1;
+	PE_parse_boot_argn("b2l_scanout", &scanout, sizeof(scanout));
+	fScanout = scanout && fDecon != NULL && fDma != NULL;
+	IOLog("B2L FB: scanout from surfaces %s\n", fScanout ? "on" : "off");
+	int dump = 1;
+	PE_parse_boot_argn("b2l_decon_dump", &dump, sizeof(dump));
+	if (dump) {
+		thread_t thread;
+		retain();
+		if (kernel_thread_start(&AppleCLCD::deconDumpMain, this, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		} else {
+			release();
+		}
+	}
 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
 		IOLog("B2L FB: no vsync timer\n");
@@ -226,9 +284,15 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 		fb->fPerfReports++;
 		uint64_t wait_ns;
 		absolutetime_to_nanoseconds(fb->fPerfWaitTicks, &wait_ns);
-		IOLog("B2L FB PERF: vsync=%llu swaps=%u copies=%u full=%u kpix=%llu written_kb=%llu copy_ms=%llu max_copy_us=%llu waits=%u wait_ms=%llu\n",
+		uint64_t flip_ns = 0, clean_ns = 0;
+		absolutetime_to_nanoseconds(fb->fPerfFlipTicks, &flip_ns);
+		absolutetime_to_nanoseconds(fb->fPerfCleanTicks, &clean_ns);
+		IOLog("B2L FB PERF: vsync=%llu swaps=%u copies=%u full=%u kpix=%llu written_kb=%llu copy_ms=%llu max_copy_us=%llu waits=%u wait_ms=%llu flips=%u flip_ms=%llu clean_ms=%llu fallbacks=%u\n",
 		    count, fb->fPerfSwaps, fb->fPerfCopies, fb->fPerfFull, fb->fPerfPixels / 1000,
-		    fb->fPerfWritten / 1024, total_ns / 1000000, max_ns / 1000, fb->fPerfWaits, wait_ns / 1000000);
+		    fb->fPerfWritten / 1024, total_ns / 1000000, max_ns / 1000, fb->fPerfWaits, wait_ns / 1000000,
+		    fb->fPerfFlips, flip_ns / 1000000, clean_ns / 1000000, fb->fPerfFallbacks);
+		fb->fPerfFlips = fb->fPerfFallbacks = 0;
+		fb->fPerfFlipTicks = fb->fPerfCleanTicks = 0;
 		fb->fPerfSwaps = fb->fPerfCopies = fb->fPerfFull = fb->fPerfWaits = 0;
 		fb->fPerfPixels = fb->fPerfTicks = fb->fPerfMaxTicks = fb->fPerfWritten = fb->fPerfWaitTicks = 0;
 	}
@@ -420,6 +484,119 @@ AppleCLCD::copyWorker(thread_call_param_t owner, thread_call_param_t unused __un
 	((AppleCLCD *)owner)->runCopy();
 }
 
+void
+AppleCLCD::deconDumpMain(void *owner, wait_result_t result __unused)
+{
+	AppleCLCD *self = (AppleCLCD *)owner;
+
+	IOSleep(45000);         /* after the GPU stage, before the CPU boost */
+	self->deconDump();
+	self->release();
+	thread_terminate(current_thread());
+}
+
+/* See b2l_decon_dump.h. Nothing is written. */
+void
+AppleCLCD::deconDump(void)
+{
+	volatile uint32_t *decon = fDecon, *dma = fDma;
+
+	if (decon == NULL || dma == NULL) {
+		b2l_diag_record("B2L DECON: not mapped\n");
+		return;
+	}
+	b2l_diag_record("B2L DECON: reading global\n");
+	IOSleep(1500);
+	b2l_diag_record("B2L DECON: global=%08x shadow_req=%08x trig=%08x path0=%08x path2=%08x panel_pa=%llx\n",
+	    decon[0x0 / 4], decon[0x60 / 4], decon[0x70 / 4], decon[0x214 / 4], decon[0x230 / 4], (uint64_t)fPhys);
+	IOSleep(1500);
+	for (unsigned w = 0; w < B2L_DECON_WINDOWS; w++) {
+		unsigned at = (0x1000 + w * 0x30) / 4;
+		b2l_diag_record("B2L DECON: win%u control=%08x %08x start=%08x end=%08x\n", w, decon[at], decon[at + 1],
+		    decon[at + 2], decon[at + 3]);
+	}
+	IOSleep(1500);
+	for (unsigned c = 0; c < B2L_DPU_DMA_CHANNELS; c++) {
+		unsigned at = (0x1000 + c * 0x1000) / 4;
+		b2l_diag_record("B2L DECON: dma%u enable=%08x in_con=%08x src=%08x offset=%08x img=%08x base=%08x\n", c,
+		    dma[at], dma[at + 0x8 / 4], dma[at + 0x10 / 4], dma[at + 0x14 / 4], dma[at + 0x18 / 4], dma[at + 0x40 / 4]);
+	}
+	b2l_diag_record("B2L DECON: dump done\n");
+}
+
+/*
+ * Point DMA channel 0 and window 5 at a frame. SRC_SIZE is the whole frame in
+ * pixels, IMG_SIZE the part shown, both height in the high half; the window's
+ * start and end are panel coordinates. SHADOW_REG_UPDATE_REQ for window 5 makes
+ * the hardware take all of it at the next frame trigger, as Samsung's driver does.
+ */
+void
+AppleCLCD::programChannel(uint32_t base, uint32_t stride_px, uint32_t w, uint32_t h, uint32_t top)
+{
+	volatile uint32_t *dma = fDma + 0x1000 / 4, *win = fDecon + 0x1000 / 4 + 5 * 0x30 / 4;
+
+	dma[0x14 / 4] = 0;
+	dma[0x10 / 4] = (h << 16) | stride_px;
+	dma[0x18 / 4] = (h << 16) | w;
+	dma[0x40 / 4] = base;
+	win[0x8 / 4] = top << 16;
+	win[0xc / 4] = ((top + h - 1) << 16) | (w - 1);
+	__asm__ volatile("dsb sy":::"memory");
+	fDecon[0x60 / 4] = 1u << 5;
+	__asm__ volatile("dsb sy":::"memory");
+}
+
+void
+AppleCLCD::pointAtPanel(void)
+{
+	if (!fFlipped) {
+		return;
+	}
+	programChannel((uint32_t)fPhys, fRowBytes / 4, fWidth, fHeight, 0);
+	fFlipped = false;
+	fShadowValid = false;   /* the panel memory is stale: the next copy fills it */
+	fPerfFallbacks++;
+}
+
+/*
+ * Show a surface without copying it. It must be the whole panel area in BGRA
+ * with 4-byte pixels, in contiguous memory under 4 GB (the base register is 32
+ * bits). Its cache lines are cleaned first: the CPU drew into cached memory and
+ * the controller reads DRAM. The surface stays referenced until two flips later.
+ */
+bool
+AppleCLCD::flipTo(B2LSurface *s, const Layer *l)
+{
+	if (!fScanout || s->memory == NULL || s->pixelFormat != B2L_FB_FORMAT_BGRA || s->bytesPerElement != 4 ||
+	    s->elementWidth != 1 || s->elementHeight != 1 || l->dx != 0 || l->dy != 0 || l->sx != 0 || l->sy != 0 ||
+	    (l->w > 0 && l->w != (int32_t)fWidth) || (l->h > 0 && l->h != (int32_t)fHeight) ||
+	    s->width != fWidth || s->height != fHeight || (s->bytesPerRow & 3) || s->bytesPerRow / 4 > 0xffff ||
+	    s->kernelAddress() == 0) {
+		return false;
+	}
+	IOByteCount length = 0;
+	uint64_t bytes = (uint64_t)s->bytesPerRow * s->height;
+	addr64_t pa = s->memory->getPhysicalSegment(s->offset, &length, kIOMemoryMapperNone);
+	if (pa == 0 || length < bytes || pa + bytes > 0x100000000ull || (pa & 63)) {
+		return false;
+	}
+	uint64_t start = mach_absolute_time();
+	flush_dcache64((addr64_t)s->kernelAddress() + s->offset, (unsigned)bytes, FALSE);
+	uint64_t cleaned = mach_absolute_time();
+	programChannel((uint32_t)pa, s->bytesPerRow / 4, s->width, s->height, fTopInset);
+	fFlipped = true;
+	s->retain();
+	if (fShown[1] != NULL) {
+		fShown[1]->release();
+	}
+	fShown[1] = fShown[0];
+	fShown[0] = s;
+	fPerfFlips++;
+	fPerfCleanTicks += cleaned - start;
+	fPerfFlipTicks += mach_absolute_time() - start;
+	return true;
+}
+
 /* Copy the queued layers into the panel, then release them and go idle. */
 void
 AppleCLCD::runCopy(void)
@@ -436,8 +613,23 @@ AppleCLCD::runCopy(void)
 	if (job.count && !fConsolePaused) {
 		b2l_early_gui_present();
 		fConsolePaused = true;
+		/* Clear boot-console text from the camera band once; whole rows,
+		 * so every write is 64-byte aligned like all other panel writes. */
+		for (uint32_t y = 0; y < fTopInset; y++) {
+			volatile uint64_t *row = (volatile uint64_t *)(fPanelPixels + (uintptr_t)y * fRowBytes);
+			for (uint32_t x = 0; x < fRowBytes / 8; x++) row[x] = 0xff000000ff000000ull;
+		}
 		IOLog("B2L FB: first IOSurface frame copied to physical scanout\n");
 	}
+	if (job.count == 1 && flipTo(job.layer[0].s, &job.layer[0])) {
+		job.layer[0].s->release();
+		IOLockLock(fLock);
+		fBusy = false;
+		IOLockWakeup(fLock, &fBusy, false);
+		IOLockUnlock(fLock);
+		return;
+	}
+	pointAtPanel();         /* a frame the controller cannot take directly: copy it as before */
 	uint64_t start = mach_absolute_time(), written = 0, pixels = 0;
 	uint32_t copies = 0, full = 0;
 	bool covered = false;

@@ -4,17 +4,29 @@
  */
 #include <pexpert/pexpert.h>
 #include "b2l_userspace_payload.h"
+/* Written by prepare-xnu.sh: the library from build-gpu-library.py, or a stub
+ * defining B2L_HAS_GPU_UI_PAYLOAD 0. */
+#include "b2l_gpu_payload.h"
+#ifndef B2L_HAS_GPU_UI_PAYLOAD
+#define B2L_HAS_GPU_UI_PAYLOAD 1
+#endif
 #if defined(B2L_HAS_USERSPACE_PAYLOAD) && !B2L_HAS_USERSPACE_PAYLOAD
+#define B2L_SEED_APPS 0
 /* Kernel/console trials contain no iOS cache or migration executable. */
 int b2l_apps_cache_is_ready(void) { return 0; }
-static void b2l_userspace_before_init(void)
-{
-    printf("B2L: kernel-only build; userspace bootstrap unavailable\n");
-}
 #else
+#define B2L_SEED_APPS 1
+#endif
+#if B2L_SEED_APPS || B2L_HAS_GPU_UI_PAYLOAD
 #include "b2l_apps_payload_compare.h"
+#if B2L_SEED_APPS
 static int b2l_apps_cache_ready;
 int b2l_apps_cache_is_ready(void){return b2l_apps_cache_ready;}
+#else
+/* S10 kernel-only build with the GPU library: no owned executable exists, so
+ * the native-rewrite comparison below never applies. */
+static const unsigned char b2l_apps_executable[1];
+#endif
 static int b2l_apps_directory(const char *path,vfs_context_t ctx)
 {
     struct nameidata nd;struct vnode_attr va;vnode_t vp=NULL;
@@ -85,9 +97,50 @@ static int b2l_apps_publish(const char *final,const char *staging,const unsigned
     }
     int close_error=vnode_close(vp,FREAD|FWRITE,ctx);return error?error:close_error;
 }
+#endif /* B2L_SEED_APPS || B2L_HAS_GPU_UI_PAYLOAD */
+#if B2L_HAS_GPU_UI_PAYLOAD
+/* GPU translation layer: its name carries its hash, so a new build is a new
+ * file and the existing-files-must-match rule above still holds. A failure
+ * here leaves backboardd unchanged and nothing else affected.
+ * S10: published on its own, not only after the userspace bootstrap. */
+static int b2l_gpu_ui_ready;
+int b2l_gpu_ui_is_ready(void){return b2l_gpu_ui_ready;}
+const char b2l_gpu_ui_setting[]="DYLD_INSERT_LIBRARIES=" B2L_GPU_UI_LIBRARY;
+static void b2l_gpu_ui_publish(vfs_context_t ctx)
+{
+    int enabled=1;PE_parse_boot_argn("b2l_gpu_ui",&enabled,sizeof(enabled));
+    if(enabled!=1||b2l_gpu_ui_ready)return;
+    if(!b2l_amfi_active()||!rootvnode||vfs_isrdonly(vnode_mount(rootvnode))||
+       strcmp(vfs_statfs(vnode_mount(rootvnode))->f_fstypename,"hfs")){
+        printf("B2L GPU UI: library not published, root not a writable HFS volume\n");
+        return;
+    }
+    int error=b2l_apps_directory("/usr/local",ctx);
+    if(!error)error=b2l_apps_directory("/usr/local/lib",ctx);
+    if(!error)error=b2l_apps_publish(B2L_GPU_UI_LIBRARY,B2L_GPU_UI_STAGING,b2l_gpu_library,sizeof(b2l_gpu_library),0755,ctx);
+    if(!error)error=VFS_SYNC(vnode_mount(rootvnode),MNT_WAIT,ctx);
+    if(!error)b2l_gpu_ui_ready=1;
+    printf("B2L GPU UI: library publication error=%d bytes=%lu\n",error,(unsigned long)sizeof(b2l_gpu_library));
+}
+#else
+int b2l_gpu_ui_is_ready(void){return 0;}
+const char b2l_gpu_ui_setting[]="";
+#endif /* B2L_HAS_GPU_UI_PAYLOAD */
+#if !B2L_SEED_APPS
+static void b2l_userspace_before_init(void)
+{
+#if B2L_HAS_GPU_UI_PAYLOAD
+    b2l_gpu_ui_publish(vfs_context_current());
+#endif
+    printf("B2L: kernel-only build; userspace bootstrap unavailable\n");
+}
+#else
 #include "b2l_profile_cache.h"
 static void b2l_userspace_before_init(void)
 {
+#if B2L_HAS_GPU_UI_PAYLOAD
+    b2l_gpu_ui_publish(vfs_context_current());
+#endif
     int requested=0;PE_parse_boot_argn("b2l_userspace_bootstrap",&requested,sizeof(requested));
     if(requested!=1||!b2l_amfi_active()||!rootvnode||vfs_isrdonly(vnode_mount(rootvnode))||strcmp(vfs_statfs(vnode_mount(rootvnode))->f_fstypename,"hfs"))return;
     vfs_context_t ctx=vfs_context_current();int error=b2l_profile_cache_refresh(ctx);

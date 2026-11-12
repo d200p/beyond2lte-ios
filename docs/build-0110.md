@@ -1,7 +1,7 @@
 # Build 0110: battery status
 
-Status: BOOT image built offline; not yet booted. Contains everything in
-[build 0109](build-0109.md). Root, firmware and loader are unchanged.
+Status: the driver runs on the device in build 0121 (two boots). Whether the
+status bar shows the battery is still to be confirmed by the owner.
 
 ## How iOS finds a battery
 
@@ -69,3 +69,23 @@ B2L BATTERY: AppleSmartBattery published
 `tests/test_battery_model.py` compiles the decoding header: the UEFI timing
 formula for several clocks, unit conversions and rounding, every charger
 state, the no-charger fallback, and plausibility limits.
+
+## Device result (0121)
+
+The bus was unconfigured at kernel start (pins in function 1, USI mode 0,
+timing registers 0), so the driver configured it; every read succeeded.
+
+| | Value |
+| --- | --- |
+| Charge | 99%, then 98% |
+| Voltage | 4.22 to 4.27 V |
+| Current | -0.4 to -0.9 A unplugged |
+| Design capacity | 3958 mAh (cell rated 3930 to 4100 mAh) |
+| Temperature | 31.3 °C |
+| Charger plugged in | CHG_INT_OK 0x9f to 0xdf (CHGIN_OK), CHG_DETAILS_00 0x80 to 0xe0 (CHGIN valid), CHG_DTLS 0x8 to 0x1 (off to fast CC): `ext=1 charging=1` |
+
+The charger register interpretation is confirmed. Two values look wrong:
+the cycle count reads 0, and remaining capacity (RepCap) is about 1% above
+full capacity (FullCapRep), so the mAh scaling needs a second look; the
+percentage does not depend on it. powerd's battery-health reporting
+(`BatteryHealthMetrics`, `poweruiagent`) appears in the unified log.

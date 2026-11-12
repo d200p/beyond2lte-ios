@@ -246,8 +246,8 @@ int main(void) {
 }
 '''
 loader = (repo / 'uefi/XnuLoader/XnuLoader.c').read_text()
-for flag in ('b2l_dvfs=2 ', 'b2l_dvfs_cl0=1950000', 'b2l_dvfs_cl1=2002000', 'b2l_dvfs_cl2=2080000'):
-    assert flag in loader
+# S10 GPU build: B2LMali owns the ACPM mailbox, so this governor stays off.
+assert 'b2l_dvfs=0 ' in loader and 'b2l_dvfs=2' not in loader and 'b2l_dvfs_cl' not in loader
 with tempfile.TemporaryDirectory(prefix='b2l-acpm-') as temporary:
     root = Path(temporary)
     c = root / 'driver.c'

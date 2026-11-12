@@ -31,6 +31,7 @@ extern void read_frandom(void *, unsigned int);
 extern void b2l_native_cache_observe(uint64_t,uint32_t);
 #endif
 #include "b2l_compat.h"
+#include "b2l_fjcvtzs.h"
 #include "b2l_pacga_qarma5.h"
 #include "b2l_pacga_keyless.h"
 extern uint64_t b2l_pacga_qarma5_asm(uint64_t, uint64_t, uint64_t, uint64_t);
@@ -305,6 +306,67 @@ b2l_compat_is_pacga(uint32_t instruction)
     return (instruction & UINT32_C(0xffe0fc00)) == UINT32_C(0x9ac03000);
 }
 
+#ifndef B2L_COMPAT_HOST_TEST
+extern pmap_t get_task_pmap(task_t);
+extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
+
+/* JavaScriptCore converts doubles with it: one trap per conversion on these cores. */
+static void
+b2l_compat_fjcvtzs(arm_saved_state_t *state, uint32_t instruction)
+{
+    arm_neon_saved_state64_t *neon = neon_state64(current_thread()->machine.uNeon);
+    unsigned rd = instruction & 31, rn = (instruction >> 5) & 31;
+    int exact;
+    uint32_t value = b2l_fjcvtzs((uint64_t)neon->v.q[rn], &exact);
+
+    if (rd == 29) {
+        set_saved_state_fp(state, value);
+    } else if (rd == 30) {
+        set_user_saved_state_lr(state, value);
+    } else if (rd != 31) {
+        set_user_saved_state_reg(state, rd, value);
+    }
+    uint32_t flags = get_saved_state_cpsr(state) & ~UINT32_C(0xf0000000);
+    set_user_saved_state_cpsr(state, flags | (exact ? UINT32_C(0x40000000) : 0));
+    set_user_saved_state_pc(state, get_saved_state_pc(state) + 4);
+}
+
+/*
+ * iOS's sys_icache_invalidate is only ic ivau: Apple's cores see their own data
+ * cache from the instruction side, and these do not. So JIT code can reach the
+ * fetch unit as the bytes that were there before, which traps as undefined while
+ * memory holds a valid instruction. Clean the page and run it again, once per
+ * thread and address, so a truly undefined instruction still raises its signal.
+ */
+static bool
+b2l_compat_stale_code(arm_saved_state_t *state, uint32_t instruction)
+{
+    static uint64_t seen[64];
+    static unsigned logged;
+    uint64_t pc = get_saved_state_pc(state);
+    uint64_t key = pc ^ (thread_tid(current_thread()) << 48);
+    uint64_t *entry = &seen[(pc >> 2) & 63];
+
+    if (__atomic_exchange_n(entry, key, __ATOMIC_RELAXED) == key) {
+        __atomic_store_n(entry, 0, __ATOMIC_RELAXED);
+        return false;
+    }
+    ppnum_t page = pmap_find_phys(get_task_pmap(current_task()), trunc_page_64(pc));
+    if (page == 0 || !isphysmem(ptoa(page))) {
+        return false;
+    }
+    vm_offset_t alias = phystokv(ptoa(page));
+    for (vm_offset_t line = alias; line < alias + PAGE_SIZE; line += 64) {
+        __asm__ volatile ("dc cvau, %0" : : "r"(line));
+    }
+    __asm__ volatile ("dsb ish\n ic ialluis\n dsb ish\n isb");
+    if (__atomic_fetch_add(&logged, 1, __ATOMIC_RELAXED) < 16) {
+        b2l_early_trace("B2L COMPAT: stale code retried pc=0x%llx insn=0x%x\n", pc, instruction);
+    }
+    return true;
+}
+#endif
+
 bool
 b2l_arm64e_compat_emulate(arm_saved_state_t *state, uint32_t instruction)
 {
@@ -315,6 +377,12 @@ b2l_arm64e_compat_emulate(arm_saved_state_t *state, uint32_t instruction)
         !PSR64_IS_USER64(get_saved_state_cpsr(state)) ||
         !b2l_arm64e_current_task()) return false;
     if (trace) b2l_early_trace("B2L COMPAT: process and EL0 gates passed; pc checks are range-only\n");
+#ifndef B2L_COMPAT_HOST_TEST
+    if ((instruction & B2L_FJCVTZS_MASK) == B2L_FJCVTZS_VALUE) {
+        b2l_compat_fjcvtzs(state, instruction);
+        return true;
+    }
+#endif
     struct b2l_compat_slot *slot=b2l_compat_slot();
     uint64_t ticket=__atomic_fetch_add(&slot->traps,1,__ATOMIC_RELAXED);
     struct b2l_compat_measurement measurement={.sample=(ticket & 1023u)==0,
@@ -346,7 +414,11 @@ b2l_arm64e_compat_emulate(arm_saved_state_t *state, uint32_t instruction)
     if (result != B2L_COMPAT_OK) {
         b2l_early_trace("B2L COMPAT: rejected result=%u pc=0x%llx x8=0x%llx x16=0x%llx lr=0x%llx\n",
             result, context.pc, context.x[8], context.x[16], context.x[30]);
+#ifndef B2L_COMPAT_HOST_TEST
+        return b2l_compat_stale_code(state, instruction);
+#else
         return false;
+#endif
     }
     if (b2l_compat_pair && !(context.cpsr & PSR64_SS) &&
         current_thread()->machine.DebugData == NULL && b2l_compat_is_pacga(instruction)) {
