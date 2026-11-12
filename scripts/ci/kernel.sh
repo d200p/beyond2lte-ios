@@ -79,7 +79,7 @@ export KDKROOT B2L_DEPSROOT
 ENV
 bash scripts/build-firehose.sh
 scripts/build-kernel.sh CWARNFLAGS=-w CXXWARNFLAGS=-w
-if [[ "${B2L_CCACHE:-0}" == 1 ]] && command -v ccache >/dev/null; then ccache --show-stats || true; fi
+if [[ "${B2L_CCACHE:-0}" == 1 ]] && command -v ccache >/dev/null; then ccache --show-stats --verbose || true; fi
 mkdir -p out/ci-kernel
 kernel="$(find out/xnu -name mach.development.b2l -type f -print -quit)"
 [[ -n "$kernel" ]]

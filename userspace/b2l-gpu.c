@@ -111,14 +111,12 @@ extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
 #endif
 /*
  * S10: row alignment the translator asks of destinations and of textures read
- * in place (fork: 64). At 1179 wide Core Animation's own full-screen surfaces
- * have 4720-byte rows (16-byte aligned), and boot 25 rejected 54k draws for
- * that alone. Every kind is still compared against the CPU before it goes
- * live, so a stride the GPU mishandles cannot reach the screen; a GPU fault
- * stops the translator for the boot.
+ * in place. 16 (boot 26) made the Mali fault with DATA_INVALID (0x58) on the
+ * first shadow pass: 64 is a hardware requirement. Core Animation's own
+ * surfaces get 64-byte rows instead (see install_stride64).
  */
 #ifndef B2L_GPU_ROW_ALIGN
-#define B2L_GPU_ROW_ALIGN 16
+#define B2L_GPU_ROW_ALIGN 64
 #endif
 #ifndef B2L_GPU_BLUR
 #define B2L_GPU_BLUR 1          /* S10: gaussian_blur on the GPU, see gpu_blur */
@@ -1475,6 +1473,37 @@ blur1_hook(uint8_t *data, long rowbytes, int width, int height, float sigma, uns
 	blur_note(width, height, rowbytes, sigma, sigma, bpp, 0, 0, mach_absolute_time() - start);
 }
 
+/*
+ * S10: CA::OGL::SWContext::create_surface_with_properties rounds a software
+ * surface's rows to 16 bytes (add #0xf; and #0x3fff0) and stores the result
+ * as the surface stride (+0x98), which also sizes its allocation. At 1179 wide
+ * the full-screen surfaces get 4720-byte rows, which the Mali cannot render
+ * to (64-byte rows), so boot 25 rejected 54k draws. The two instructions
+ * become add #0x3f; and #0x3ffc0: 64-byte rows, at most 48 bytes more per row.
+ * Checked word for word; a mismatch leaves Core Animation untouched.
+ */
+#define STRIDE_ROUND 0x18410d55cull
+static void
+install_stride64(uint64_t slide)
+{
+	static const uint32_t before[2] = { 0x11003d29, 0x121c3537 };   /* add w9,w9,#0xf; and w23,w9,#0x3fff0 */
+	static const uint32_t after[2] = { 0x1100fd29, 0x121a2d37 };    /* add w9,w9,#0x3f; and w23,w9,#0x3ffc0 */
+	uint32_t *at = (uint32_t *)(STRIDE_ROUND + slide);
+	if (memcmp(at, before, sizeof(before))) {
+		log_line("hook: surface stride words differ %08x %08x", at[0], at[1]);
+		return;
+	}
+	vm_address_t p = (vm_address_t)at & ~(vm_address_t)(vm_page_size - 1);
+	if (vm_protect(mach_task_self(), p, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY)) {
+		log_line("hook: surface stride not writable");
+		return;
+	}
+	memcpy(at, after, sizeof(after));
+	sys_icache_invalidate(at, sizeof(after));
+	vm_protect(mach_task_self(), p, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+	log_line("hook: software surfaces get 64-byte rows");
+}
+
 /* Patch one blur entry; a mismatch leaves it alone. */
 static void
 install_blur_hook(uint64_t slide, uint64_t address, const uint32_t *words, uint64_t *resume, void *hook, const char *name)
@@ -1562,6 +1591,7 @@ install_hook(void)
 		vm_protect(mach_task_self(), p, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
 	}
 	log_line("hook: %u pre-hooks installed", (unsigned)(sizeof(prehooks) / sizeof(prehooks[0])));
+	install_stride64(slide);
 	install_blur_hook(slide, BLUR1_ENTRY, BLUR1_WORDS, &b2l_blur1_resume, (void *)blur1_hook, "gaussian_blur");
 	install_blur_hook(slide, BLUR2_ENTRY, BLUR2_WORDS, &b2l_blur2_resume, (void *)blur2_hook, "gaussian_blur2");
 	return 1;
