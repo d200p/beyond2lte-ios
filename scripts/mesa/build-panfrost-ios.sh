@@ -53,7 +53,7 @@ for kv in platforms= egl=disabled glx=disabled gbm=disabled gallium-drivers=panf
     opengl=true gles1=disabled gles2=enabled llvm=disabled shared-llvm=disabled valgrind=disabled \
     libunwind=disabled lmsensors=disabled zstd=disabled xmlconfig=disabled expat=disabled \
     build-tests=false tools= gallium-va=disabled gallium-vdpau=disabled gallium-mediafoundation=disabled \
-    gallium-rusticl=false android-libbacktrace=disabled; do
+    gallium-rusticl=false android-libbacktrace=disabled shader-cache=disabled; do
   name=${kv%%=*}
   if grep -q "option('$name'\|option(\"$name\"\|^  '$name'" "$options_file"; then args+=("-D$kv"); else echo "skipping -D$kv (not in this release)"; fi
 done

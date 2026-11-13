@@ -64,6 +64,8 @@ typedef struct _drmDevice {
 } drmDevice, *drmDevicePtr;
 
 extern int drmIoctl(int fd, unsigned long request, void *arg);
+extern int drmOpenWithType(const char *name, const char *busid, int type);
+extern int drmClose(int fd);
 extern drmVersionPtr drmGetVersion(int fd);
 extern void drmFreeVersion(drmVersionPtr version);
 extern int drmGetCap(int fd, uint64_t capability, uint64_t *value);
