@@ -659,30 +659,37 @@ AppleCLCD::applyBlank(void)
 	bool shadowValid = fShadowValid;
 	IOLockUnlock(fLock);
 	uint64_t start = mach_absolute_time();
-	if (off) {
-		/* Whole rows, so every write is 64-byte aligned like all other panel writes. */
+	/* Whole rows, so every write is 64-byte aligned like all other panel writes. */
+	auto paintBlack = [this]() {
 		for (uint32_t y = 0; y < fOutHeight; y++) {
 			volatile uint64_t *row = (volatile uint64_t *)(fPixels + (uintptr_t)y * fRowBytes);
 			for (uint32_t x = 0; x < fRowBytes / 8; x++) row[x] = 0xff000000ff000000ull;
 		}
-	}
-	__asm__ volatile("dsb sy":::"memory");
-	uint64_t ns = 0;
-	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
-	/* S10: put the panel to sleep once the black frame went out (three
-	 * frames), and wake it before iOS's next frame. Sleep out needs 120 ms
-	 * before display on. A command that does not drain leaves blanking only. */
+		__asm__ volatile("dsb sy":::"memory");
+	};
+	/*
+	 * S10: display off is the panel's own, at once: DCS display off + sleep in,
+	 * with no black frame first. Only when DSIM did not take commands at start,
+	 * or display off does not drain now, is the panel painted black instead.
+	 * Waking, the panel memory is painted black while the panel is still dark,
+	 * so the frame from before sleep never shows; sleep out needs 120 ms
+	 * before display on, and iOS's next frame then replaces the black.
+	 */
 	const char *panel = NULL;
-	if (off && fPanelSleep && !fPanelAsleep) {
-		IOSleep(50);
-		bool shown = dsimShortWrite(0x28);      /* display off */
-		IOSleep(20);
-		bool slept = shown && dsimShortWrite(0x10); /* sleep in */
-		IOSleep(120);
-		/* Once display off went out, waking must send display on. */
-		fPanelAsleep = shown;
-		panel = slept ? "asleep" : shown ? "display off, sleep in FAILED" : "sleep FAILED, blanked only";
-	} else if (!off && fPanelAsleep) {
+	if (off) {
+		bool shown = fPanelSleep && !fPanelAsleep && dsimShortWrite(0x28);  /* display off */
+		if (shown) {
+			IOSleep(20);
+			bool slept = dsimShortWrite(0x10);                      /* sleep in */
+			IOSleep(120);
+			fPanelAsleep = true;    /* waking must send display on */
+			panel = slept ? "asleep" : "display off, sleep in FAILED";
+		} else {
+			paintBlack();
+			if (fPanelSleep) panel = "display off FAILED, blanked";
+		}
+	} else if (fPanelAsleep) {
+		paintBlack();
 		bool done = false;
 		for (unsigned attempt = 0; attempt < 3 && !done; attempt++) {
 			bool out = dsimShortWrite(0x11);    /* sleep out (harmless if awake) */
@@ -693,6 +700,8 @@ AppleCLCD::applyBlank(void)
 		fPanelAsleep = false;
 		panel = done ? "awake again" : "wake FAILED";
 	}
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
 	if (panel != NULL) b2l_diag_record("B2L FB: panel %s\n", panel);
 
 	IOLockLock(fLock);
@@ -711,7 +720,7 @@ AppleCLCD::applyBlank(void)
 		thread_call_enter_delayed(fRestoreCall, deadline);
 	}
 	b2l_diag_record("B2L FB: display %s, panel %s in %llu us\n", off ? "off" : "on",
-	    off ? "blanked" : "black until the next frame", ns / 1000);
+	    off ? (fPanelAsleep ? "switched off" : "blanked") : "black until the next frame", ns / 1000);
 }
 
 void
