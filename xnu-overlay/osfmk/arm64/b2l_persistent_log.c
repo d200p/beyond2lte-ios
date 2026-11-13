@@ -13,6 +13,9 @@
 #include <kern/processor.h>
 #include <kern/recount.h>
 #include <arm64/proc_reg.h>
+#include <kern/misc_protos.h>
+#include <vm/vm_map_xnu.h>
+#include <vm/vm_shared_region_xnu.h>
 #include <pexpert/pexpert.h>
 #include <string.h>
 #include "b2l_cpu_clock.h"
@@ -237,6 +240,170 @@ static void b2l_pcs_report(void)
     memset(b2l_pcs_user[set], 0, sizeof(b2l_pcs_user[set]));
     b2l_pcs_lost[set] = 0;
 }
+/*
+ * S10 port diagnostic: user call stacks of one app's main thread
+ * (b2l_pcs_app, default MobileNotes; b2l_stack=0 turns it off). Boot 33:
+ * MobileNotes held a core at 100% with the keyboard idle and wrote nothing
+ * about it to the unified log, and the PC sampler only sees single frames.
+ * Every 20 ms a kernel thread stops that thread for an instant (thread_hold
+ * + thread_stop, as thread_get_state does), reads its user PC, LR and FP,
+ * lets it go, then follows its frame records through the app's own map
+ * (vm_map_switch_to + copyin). A thread inside a system call shows the user
+ * stack it called from. Each 30 s window prints the busiest stacks:
+ *   B2L STACK: app=NAME samples=N stacks=N lost=N misses=N slide=0x...
+ *   B2L STACK: #i n=count f=pc lr ret ret ... (user addresses, slid)
+ */
+#define B2L_STK_DEPTH   14
+#define B2L_STK_SLOTS   256u
+#define B2L_STK_SHOW    20u
+#define B2L_STK_MS      20u
+#define B2L_STK_VA_MASK 0x0000ffffffffffffull   /* drops pointer-authentication bits */
+struct b2l_stack { uint64_t f[B2L_STK_DEPTH]; uint32_t depth, count; };
+static struct b2l_stack b2l_stacks[B2L_STK_SLOTS];
+static uint32_t b2l_stack_used;
+
+static task_t b2l_stack_find(const char *app, size_t size)
+{
+    task_t task, found = TASK_NULL;
+    lck_mtx_lock(&tasks_threads_lock);
+    queue_iterate(&tasks, task, task_t, tasks) {
+        if (task == kernel_task) continue;
+        void *p = get_bsdtask_info(task);
+        const char *name = p ? proc_name_address((struct proc *)p) : NULL;
+        if (name != NULL && strncmp(name, app, size) == 0) {
+            task_reference(task);
+            found = task;
+            break;
+        }
+    }
+    lck_mtx_unlock(&tasks_threads_lock);
+    return found;
+}
+
+static unsigned b2l_stack_sample(task_t task, uint64_t *f)
+{
+    thread_t thread = THREAD_NULL;
+    task_lock(task);
+    if (!queue_empty(&task->threads)) {
+        thread = (thread_t)queue_first(&task->threads);
+        thread_reference(thread);
+    }
+    task_unlock(task);
+    if (thread == THREAD_NULL) return 0;
+    uint64_t pc = 0, lr = 0, fp = 0;
+    thread_mtx_lock(thread);
+    if (thread->active) {
+        thread_hold(thread);
+        thread_mtx_unlock(thread);
+        boolean_t stopped = thread_stop(thread, FALSE);
+        thread_mtx_lock(thread);
+        if (stopped) {
+            arm_saved_state_t *regs = get_user_regs(thread);
+            if (regs != NULL) {
+                pc = (uint64_t)get_saved_state_pc(regs);
+                lr = (uint64_t)get_saved_state_lr(regs);
+                fp = (uint64_t)get_saved_state_fp(regs);
+            }
+            thread_unstop(thread);
+        }
+        thread_release(thread);
+    }
+    thread_mtx_unlock(thread);
+    thread_deallocate(thread);
+    if (pc == 0) return 0;
+    unsigned depth = 0;
+    f[depth++] = pc & B2L_STK_VA_MASK;
+    if (lr != 0) f[depth++] = lr & B2L_STK_VA_MASK;
+    vm_map_switch_context_t ctx = vm_map_switch_to(get_task_map(task));
+    for (unsigned hop = 0; depth < B2L_STK_DEPTH && hop < 32; hop++) {
+        uint64_t record[2];
+        if (fp == 0 || (fp & 7) || copyin((user_addr_t)fp, record, sizeof(record))) break;
+        uint64_t ret = record[1] & B2L_STK_VA_MASK;
+        if (ret == 0) break;
+        f[depth++] = ret;
+        if (record[0] <= fp) break;
+        fp = record[0];
+    }
+    vm_map_switch_back(ctx);
+    return depth;
+}
+
+static void b2l_stack_report(task_t task, const char *app, uint32_t samples, uint32_t lost, uint32_t misses)
+{
+    uint32_t slide = 0;
+    if (task != TASK_NULL) {
+        vm_shared_region_t region = vm_shared_region_get(task);
+        if (region != NULL) {
+            slide = region->sr_slide;
+            vm_shared_region_deallocate(region);
+        }
+    }
+    if (samples == 0) return;
+    b2l_early_trace("B2L STACK: app=%s samples=%u stacks=%u lost=%u misses=%u slide=0x%x\n",
+        app, samples, b2l_stack_used, lost, misses, slide);
+    static bool shown[B2L_STK_SLOTS];
+    memset(shown, 0, sizeof(shown));
+    for (unsigned rank = 0; rank < B2L_STK_SHOW; rank++) {
+        unsigned best = B2L_STK_SLOTS;
+        for (unsigned i = 0; i < b2l_stack_used; i++)
+            if (!shown[i] && (best == B2L_STK_SLOTS || b2l_stacks[i].count > b2l_stacks[best].count)) best = i;
+        if (best == B2L_STK_SLOTS) break;
+        shown[best] = true;
+        char line[256];
+        int used = snprintf(line, sizeof(line), "B2L STACK: #%u n=%u f=", rank, b2l_stacks[best].count);
+        for (unsigned d = 0; d < b2l_stacks[best].depth && used > 0 && (size_t)used < sizeof(line) - 18; d++)
+            used += snprintf(line + used, sizeof(line) - (size_t)used, " %llx", (unsigned long long)b2l_stacks[best].f[d]);
+        b2l_early_trace("%s\n", line);
+    }
+}
+
+static void b2l_stack_thread(void *arg __unused, wait_result_t result __unused)
+{
+    int enabled = 1;
+    (void)PE_parse_boot_argn("b2l_stack", &enabled, sizeof(enabled));
+    if (!enabled) return;
+    char app[20] = "MobileNotes";
+    char given[20] = { 0 };
+    if (PE_parse_boot_argn("b2l_pcs_app", given, sizeof(given)) && given[0]) strlcpy(app, given, sizeof(app));
+    task_t task = TASK_NULL;
+    uint32_t samples = 0, lost = 0, misses = 0, tick = 0;
+    uint64_t window = mach_absolute_time();
+    for (;;) {
+        delay_for_interval(B2L_STK_MS, NSEC_PER_MSEC);
+        if (task == TASK_NULL && (tick++ % 50) == 0) task = b2l_stack_find(app, sizeof(app));
+        if (task != TASK_NULL) {
+            uint64_t f[B2L_STK_DEPTH];
+            unsigned depth = b2l_stack_sample(task, f);
+            if (depth == 0) {
+                misses++;
+            } else {
+                samples++;
+                unsigned slot = B2L_STK_SLOTS;
+                for (unsigned i = 0; i < b2l_stack_used; i++) {
+                    if (b2l_stacks[i].depth == depth && !memcmp(b2l_stacks[i].f, f, depth * sizeof(f[0]))) { slot = i; break; }
+                }
+                if (slot == B2L_STK_SLOTS && b2l_stack_used < B2L_STK_SLOTS) {
+                    slot = b2l_stack_used++;
+                    memcpy(b2l_stacks[slot].f, f, depth * sizeof(f[0]));
+                    b2l_stacks[slot].depth = depth;
+                    b2l_stacks[slot].count = 0;
+                }
+                if (slot == B2L_STK_SLOTS) lost++; else b2l_stacks[slot].count++;
+            }
+        }
+        uint64_t ns = 0;
+        absolutetime_to_nanoseconds(mach_absolute_time() - window, &ns);
+        if (ns >= 30ull * NSEC_PER_SEC) {
+            b2l_stack_report(task, app, samples, lost, misses);
+            b2l_stack_used = 0;
+            samples = lost = misses = 0;
+            window = mach_absolute_time();
+            /* Look the app up again each window: it may have quit or restarted. */
+            if (task != TASK_NULL) { task_deallocate(task); task = TASK_NULL; }
+            tick = 0;
+        }
+    }
+}
 /* Estimate the current CPU's core clock from a dependent add chain of
  * 1,048,576 single-cycle instructions timed by the generic timer. No PMU or
  * clock-management register is touched. The value is the clock of whichever
@@ -320,5 +487,7 @@ int b2l_log_start(const struct b2l_log_sink*sink)
     if(err){__atomic_store_n(&start_state,0,__ATOMIC_RELEASE);return err;}
     thread_t worker; kern_return_t kr=kernel_thread_start(b2l_log_worker,0,&worker);
     if(kr!=KERN_SUCCESS){disk_writer.active=0;__atomic_store_n(&start_state,0,__ATOMIC_RELEASE);return (int)kr;}
-    thread_deallocate(worker);__atomic_store_n(&start_state,2,__ATOMIC_RELEASE);return 0;
+    thread_deallocate(worker);__atomic_store_n(&start_state,2,__ATOMIC_RELEASE);
+    thread_t sampler;if(kernel_thread_start(b2l_stack_thread,0,&sampler)==KERN_SUCCESS)thread_deallocate(sampler);
+    return 0;
 }

@@ -120,6 +120,17 @@ extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
 #define B2L_GPU_ROW_ALIGN 64
 #endif
 /*
+ * S10: hooks into Core Animation (draw_elements, the pre-hooks, the blur entry
+ * points) and its 64-byte surface rows. Off: in boot 33 the material glitches
+ * stayed with the GPU blur and live draws off, and new striped bars came after
+ * the first display off, while all the library still did was hook and change
+ * surface rows. With 0 the library only keeps the GPU client open, which the
+ * kernel's screen copy on the Mali needs.
+ */
+#ifndef B2L_GPU_HOOKS
+#define B2L_GPU_HOOKS 0
+#endif
+/*
  * S10: gaussian_blur on the GPU (see gpu_blur). Off for an A/B test: build 31
  * still showed material glitches in Settings (the bar's backdrop unblurred and
  * from an older scroll position, or a dark band), with only kind 1 live and
@@ -1780,6 +1791,15 @@ start_thread(void *unused)
 		return NULL;
 	}
 	log_line("library running in pid %d", getpid());
+	if (!B2L_GPU_HOOKS) {
+		/* S10: only the GPU client the kernel's screen copy needs (B2LMali runs
+		 * its runtime while a client is open); Core Animation stays untouched. */
+		uint64_t info[3] = { 0, 0, 0 };
+		uint32_t count = 3;
+		kern_return_t kr = IOConnectCallMethod(connection, kB2LMaliInfo, NULL, 0, NULL, 0, info, &count, NULL, NULL);
+		log_line("GPU client open for the kernel's screen copy (kr=0x%x); Core Animation not hooked", kr);
+		return NULL;
+	}
 	mach_timebase_info(&timebase);
 	window_start = mach_absolute_time();
 	shadow_ready = prepare_shadow();
