@@ -44,15 +44,19 @@ c_link_args = ['-target', 'arm64e-apple-ios26.0', '-isysroot', '$sdk']
 cpp_link_args = ['-target', 'arm64e-apple-ios26.0', '-isysroot', '$sdk']
 EOF
 # Only Panfrost and the OpenGL ES state tracker; everything that needs a
-# window system, LLVM, X11, Wayland or Linux-only libraries stays off.
+# window system, LLVM, X11, Wayland or Linux-only libraries stays off. Options
+# differ between Mesa releases (25.3 has no gallium-vdpau): only those this
+# release declares are passed.
+options_file="$src/meson.options"; [[ -f "$options_file" ]] || options_file="$src/meson_options.txt"
+args=()
+for kv in platforms= egl=disabled glx=disabled gbm=disabled gallium-drivers=panfrost vulkan-drivers= \
+    opengl=true gles1=disabled gles2=enabled llvm=disabled shared-llvm=disabled valgrind=disabled \
+    libunwind=disabled lmsensors=disabled zstd=disabled xmlconfig=disabled expat=disabled \
+    build-tests=false tools= gallium-va=disabled gallium-vdpau=disabled gallium-mediafoundation=disabled \
+    gallium-rusticl=false android-libbacktrace=disabled; do
+  name=${kv%%=*}
+  if grep -q "option('$name'\|option(\"$name\"\|^  '$name'" "$options_file"; then args+=("-D$kv"); else echo "skipping -D$kv (not in this release)"; fi
+done
 meson setup "$build/out" "$src" --cross-file "$cross" --buildtype=release \
-  --default-library=static \
-  -Dplatforms= -Degl=disabled -Dglx=disabled -Dgbm=disabled \
-  -Dgallium-drivers=panfrost -Dvulkan-drivers= \
-  -Dopengl=true -Dgles1=disabled -Dgles2=enabled \
-  -Dllvm=disabled -Dshared-llvm=disabled -Dvalgrind=disabled -Dlibunwind=disabled \
-  -Dlmsensors=disabled -Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled \
-  -Dbuild-tests=false -Dtools= -Dgallium-va=disabled -Dgallium-vdpau=disabled \
-  -Dgallium-mediafoundation=disabled -Dgallium-rusticl=false -Dandroid-libbacktrace=disabled \
-  2>&1 | tee "$build/configure.log"
+  --default-library=static "${args[@]}" 2>&1 | tee "$build/configure.log"
 ninja -C "$build/out" -k 0 2>&1 | tee "$build/build.log"
