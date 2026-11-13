@@ -1899,6 +1899,55 @@ bo_selftest(void)
 	log_line("BO test: done, free kr=0x%x, second free kr=0x%x (expected not found)", kr, again);
 }
 
+/*
+ * S10: the keyboard in Notes spun in a loop (boot 35 stacks, 100% CPU): the
+ * keyboard dock asks whether dictation works, finds the keyboard's language
+ * missing from DictationLanguagesEnabled, rewrites that list (still empty:
+ * assistantd knows no supported dictation language here), the write reports
+ * a dictation availability change, and the dock asks again, reloading its
+ * glyph images from disk each time. A normally set-up phone has the keyboard
+ * language in that list, so the first question already succeeds. Put it there
+ * once, through cfprefsd, when the list is missing or empty; logged.
+ */
+static CFIndex
+dictation_language_count(CFStringRef key, CFStringRef domain, CFStringRef user)
+{
+	CFPropertyListRef value = CFPreferencesCopyValue(key, domain, user, kCFPreferencesAnyHost);
+	CFIndex count = -1;
+	if (value != NULL) {
+		if (CFGetTypeID(value) == CFDictionaryGetTypeID()) {
+			count = CFDictionaryGetCount((CFDictionaryRef)value);
+		}
+		CFRelease(value);
+	}
+	return count;
+}
+
+static void
+keyboard_dictation_languages(void)
+{
+	CFStringRef domain = CFSTR("com.apple.keyboard.preferences");
+	CFStringRef key = CFSTR("DictationLanguagesEnabled");
+	CFStringRef user = CFSTR("mobile");
+	CFIndex before = dictation_language_count(key, domain, user);
+	if (before > 0) {
+		log_line("keyboard: %ld dictation languages enabled, left alone", (long)before);
+		return;
+	}
+	const void *keys[2] = { CFSTR("en_US"), CFSTR("en-US") };
+	const void *values[2] = { kCFBooleanTrue, kCFBooleanTrue };
+	CFDictionaryRef languages = CFDictionaryCreate(NULL, keys, values, 2, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	if (languages == NULL) {
+		return;
+	}
+	CFPreferencesSetValue(key, languages, domain, user, kCFPreferencesAnyHost);
+	Boolean synced = CFPreferencesSynchronize(domain, user, kCFPreferencesAnyHost);
+	CFRelease(languages);
+	log_line("keyboard: dictation languages were %ld (-1 = missing), en_US set: synchronize=%d, now %ld",
+	    (long)before, (int)synced, (long)dictation_language_count(key, domain, user));
+}
+
 static void *
 start_thread(void *unused)
 {
@@ -1918,7 +1967,8 @@ start_thread(void *unused)
 	if (connection == MACH_PORT_NULL) {
 		return NULL;
 	}
-	log_line("library running in pid %d", getpid());
+	log_line("library running in pid %d uid %d", getpid(), (int)getuid());
+	keyboard_dictation_languages();
 	if (!B2L_GPU_HOOKS) {
 		/* S10: only the GPU client the kernel's screen copy needs (B2LMali runs
 		 * its runtime while a client is open); Core Animation stays untouched. */
