@@ -383,11 +383,17 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 "cs_enforcement_disable=1 launchd_unsecure_cache=1 "
                 "b2l_system_log=1 b2l_native_cache=1 b2l_precompiled=1 "
                 "b2l_rtc_wait=0 b2l_boot_timing=1 b2l_console_quiet=1 "
-                /* b2l_dvfs=0: the Mali driver (B2LMali) owns the ACPM mailbox
-                 * for GPU, memory and CPU clocks; two clients would race. */
+                /* b2l_dvfs=1: tables and measured clocks only, no mailbox: the
+                 * Mali driver (B2LMali) owns the ACPM mailbox for GPU, memory
+                 * and CPU clocks; two clients would race. Mode 1 logs the
+                 * FVMAP tables, memory (MIF) included, for standby clocks. */
                 /* b2l_ax_seed=0: clear the seeded managed accessibility file,
                  * so Reduce Motion/Transparency and cross-fades follow Settings. */
-                "b2l_cache_interactive=1 b2l_ax_seed=0 b2l_dvfs=0 "
+                "b2l_cache_interactive=1 b2l_ax_seed=0 b2l_dvfs=1 "
+                /* S10: the development kernel's interrupt-masked and
+                 * preemption-disabled measurements are off, as in release
+                 * kernels; boot 30 showed them on every context switch. */
+                "interrupt-masked-debug-mode=0 sched_preemption_disable_debug_mode=0 "
                 /* Rebuild MobileGestalt's cache once (the old one is kept), so
                  * the new /product display-corner-radius is read. */
                 "b2l_mg_refresh=1 "

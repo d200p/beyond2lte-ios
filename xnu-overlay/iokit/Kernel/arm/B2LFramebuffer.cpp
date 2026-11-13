@@ -560,10 +560,21 @@ AppleCLCD::copyWorker(thread_call_param_t owner, thread_call_param_t unused __un
 /* S10 port: display off/on, see fBlanked. Called from iOS's display power
  * request (selector 12): only records the wish; the panel is rewritten on a
  * thread call. */
+/* S10 port: the last display power iOS asked for, for B2LMali's CPU clocks
+ * (standby rates while the display is off). */
+static int gB2LDisplayOff;
+
+extern "C" int
+b2l_fb_display_is_off(void)
+{
+	return __atomic_load_n(&gB2LDisplayOff, __ATOMIC_ACQUIRE);
+}
+
 extern "C" void
 b2l_fb_display_power(int on)
 {
 	AppleCLCD *fb = gB2LCLCD;
+	__atomic_store_n(&gB2LDisplayOff, on ? 0 : 1, __ATOMIC_RELEASE);
 	if (fb == NULL || fb->fBlankCall == NULL) return;
 	__atomic_store_n(&fb->fBlankWanted, on ? 0 : 1, __ATOMIC_RELEASE);
 	thread_call_enter(fb->fBlankCall);

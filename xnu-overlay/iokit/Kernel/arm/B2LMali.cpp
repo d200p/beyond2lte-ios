@@ -53,14 +53,22 @@ extern "C" void b2l_cpu_load_sample(uint64_t *busy, uint64_t *idle);
  * device tree's tables that ask nothing of the memory clock, and big stops at the
  * rate Android boots with, the highest allowed without the overcurrent driver.
  */
+/*
+ * S10: standby_khz while the display is off and the load is low. Boot 31 (a
+ * night in standby) drew 410-620 mA with about 2 s of CPU work per 30 s: the
+ * clusters sat at their boot rates, and every burst of a daemon boosted them.
+ * These are entries of the validated FVMAP tables of earlier boots (A55 130..
+ * 2106, A75 377..2400, M4 520..3016 MHz).
+ */
 static const struct {
 	const char *name;
-	uint32_t domain, boot_khz, boost_khz;
+	uint32_t domain, boot_khz, boost_khz, standby_khz;
 } b2l_cpu_clusters[] = {
-	{ "cl0", B2L_DVFS_CPUCL0, 1053000, 1586000 },
-	{ "cl1", B2L_DVFS_CPUCL1, 1222000, 2002000 },
-	{ "cl2", B2L_DVFS_CPUCL2, 1378000, 2080000 },
+	{ "cl0", B2L_DVFS_CPUCL0, 1053000, 1586000, 650000 },
+	{ "cl1", B2L_DVFS_CPUCL1, 1222000, 2002000, 650000 },
+	{ "cl2", B2L_DVFS_CPUCL2, 1378000, 2080000, 728000 },
 };
+extern "C" int b2l_fb_display_is_off(void);
 #define B2L_CPU_CLUSTERS (sizeof(b2l_cpu_clusters) / sizeof(b2l_cpu_clusters[0]))
 /* The big cluster under load, fastest first; the last is its boot rate. */
 static const uint32_t b2l_big_steps[] = { 2080000, 1820000, 1560000, 1378000 };
@@ -125,6 +133,7 @@ extern "C" pmap_t get_task_pmap(task_t task);
 #define B2L_RT_MAPPED_LIMIT    (256ull << 20)
 #define B2L_RT_JOB_TIMEOUT_US  1000000
 #define B2L_RT_IDLE_MS         50
+#define B2L_MALI_VA_LOG2       48              /* the whole GPU address space, for a full TLB flush */
 #define B2L_GPU_BOOST_KHZ      433000          /* the stock tree's sustainable level */
 #define B2L_GPU_UNGUARDED_KHZ  325000          /* the most without a temperature */
 #define B2L_GPU_MAX_KHZ        702000
@@ -870,7 +879,7 @@ B2LMali::clusterBoost()
 	struct b2l_acpm_load load = { 0, 0 };
 	unsigned bigStep = 0;
 	int holding = 0;
-	bool measured = false;
+	bool measured = false, wasStandby = false;
 	unsigned dumped = 0, changes = 0, reads = 0, percent = 0;
 	uint32_t rates[B2L_CPU_CLUSTERS];
 
@@ -923,9 +932,18 @@ B2LMali::clusterBoost()
 			}
 		}
 		bool raised = false;
+		/* Display off: standby rates, and boot rates at most under load. */
+		bool standby = enabled && b2l_fb_display_is_off();
+		if (standby != wasStandby) {
+			b2l_diag_record("B2L ACPM: display %s, CPUs %s\n", standby ? "off" : "on",
+			    standby ? "at standby clocks, no boost" : "back to load-driven clocks");
+			wasStandby = standby;
+		}
 		for (unsigned i = 0; i < B2L_CPU_CLUSTERS; i++) {
 			uint32_t want = b2l_cpu_clusters[i].boot_khz;
-			if (enabled && load.boosted && !holding) {
+			if (standby) {
+				want = load.boosted ? b2l_cpu_clusters[i].boot_khz : b2l_cpu_clusters[i].standby_khz;
+			} else if (enabled && load.boosted && !holding) {
 				want = i == B2L_CPU_CLUSTERS - 1 ? b2l_big_steps[bigStep] : b2l_cpu_clusters[i].boost_khz;
 			}
 			if (want != rates[i]) {
@@ -1095,7 +1113,17 @@ B2LMali::coresUp()
 	if (coresOn) {
 		return true;
 	}
-	if (b2l_mali_power_on(&io) != NULL || !b2l_mali_set_as0(&io, pt.tables_pa)) {
+	/*
+	 * S10: drop every GPU TLB entry after the address space is set again.
+	 * evictSlot only flushes while the cores are on, but the cores go off
+	 * after B2L_RT_IDLE_MS (50 ms) without a job, so most evictions happened
+	 * with them off; AS UPDATE does not drop TLB entries, and a new client
+	 * brings new tables. A stale entry sends a render target or texture to
+	 * pages that are no longer it: thin wrong lines along live GPU draws, of
+	 * any kind, that the shadow compare (fixed buffers) never sees.
+	 */
+	if (b2l_mali_power_on(&io) != NULL || !b2l_mali_set_as0(&io, pt.tables_pa) ||
+	    !b2l_mali_flush_region(&io, 0, B2L_MALI_VA_LOG2)) {
 		b2l_mali_power_off(&io);
 		return false;
 	}

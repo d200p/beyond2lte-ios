@@ -125,4 +125,33 @@ b2l_acpm_read_cpu_rates(const struct b2l_acpm_reader *r, uint32_t map,
     return 0;
 }
 
+/* S10: one domain's rates (0 MIF, 1 INT, ...), ascending kHz, with the same
+ * checks as the CPU tables. Read only; for the log. */
+static inline int
+b2l_acpm_read_domain_rates(const struct b2l_acpm_reader *r, uint32_t map, unsigned domain,
+    uint32_t khz[B2L_ACPM_MAX_RATES], unsigned *count)
+{
+    *count = 0;
+    if ((map & 3) || !b2l_acpm_range(map, B2L_ACPM_FVMAP_BYTES) || domain > 15) return -1;
+    uint32_t header = map + domain * 24, first, init, offsets;
+    if (b2l_acpm_word(r, header, &first) ||
+        b2l_acpm_word(r, header + 8, &init) ||
+        b2l_acpm_word(r, header + 20, &offsets)) return -1;
+    unsigned levels = (first >> 8) & 0xff;
+    uint32_t ratevolt = offsets & 0xffff;
+    if ((first & 0xff) != domain || !levels || levels > B2L_ACPM_MAX_RATES ||
+        (init & 0xff) >= levels || (ratevolt & 3) || ratevolt < 5 * 24 ||
+        ratevolt > B2L_ACPM_FVMAP_BYTES - levels * 8) return -1;
+    uint32_t previous = UINT32_MAX;
+    for (unsigned l = 0; l < levels; l++) {
+        uint32_t rate;
+        if (b2l_acpm_word(r, map + ratevolt + l * 8, &rate) ||
+            !rate || rate > 4000000 || rate >= previous || rate % 1000) return -1;
+        khz[levels - 1 - l] = rate;
+        previous = rate;
+    }
+    *count = levels;
+    return 0;
+}
+
 #endif
