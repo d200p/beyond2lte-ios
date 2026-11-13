@@ -238,7 +238,8 @@ still enabled, makes the first endpoint writes:
 4. Outbound ATU2, memory type, `0x14000000..0x14003fff` to PCI
    `0x14000000`, accepted only from an inactive zero control word.
 5. Endpoint command: memory space enable only; bus mastering stays off.
-6. Read config `0x80` (Broadcom BAR0 window) and ChipCommon's chip ID and
+6. Move config `0x80` (Broadcom BAR0 window) to ChipCommon `0x18000000` (it was
+   `0x18003000` in boot 33) and read ChipCommon's chip ID and
    capabilities at BAR0 `+0` and `+4`; success requires chip `0x4375`.
 
 Every step is undone before mode 5's own cleanup: command, ATU2, viewport

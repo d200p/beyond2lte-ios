@@ -151,6 +151,8 @@ wifi_endpoint_bar0(struct wifi_region *regions)
     };
     const char *stage = "initial-state";
     int failed = 0, bar_written = 0, window_changed = 0, command_changed = 0, atu2_owned = 0, sixty_four = 0;
+    int window_moved = 0;
+    uint32_t bar_window = 0;
     uint32_t bar_lo = wifi_read(cfg, 0x2010), bar_hi = wifi_read(cfg, 0x2014);
     uint32_t command = wifi_read(cfg, 0x2004), window = wifi_read(dbi, 0x20);
     if (mem->mapped == 0 || bar_lo == UINT32_MAX || bar_hi == UINT32_MAX || command == UINT32_MAX ||
@@ -216,7 +218,14 @@ wifi_endpoint_bar0(struct wifi_region *regions)
         wlog("BAR0 probe stopped: link state %#x before the first BAR0 read\n", link);
         goto out;
     }
-    uint32_t bar_window = wifi_read(cfg, 0x2080);
+    /* BAR0's first 4 KiB show the backplane core the window register (config
+     * 0x80) selects; boot 33 found it on 0x18003000. ChipCommon, with the chip
+     * ID at +0, is at 0x18000000 (brcmfmac's SI_ENUM_BASE). */
+    bar_window = wifi_read(cfg, 0x2080);
+    if (bar_window == UINT32_MAX) { wlog("BAR0 window register unreadable\n"); goto out; }
+    window_moved = 1;
+    wifi_write(cfg, 0x2080, 0x18000000);
+    if (wifi_read(cfg, 0x2080) != 0x18000000) { wlog("BAR0 window did not move to ChipCommon\n"); goto out; }
     uint32_t chipid = wifi_read(mem, 0), caps = wifi_read(mem, 4);
     wlog("BAR0 window=%#x ChipCommon chipid=%#x capabilities=%#x: chip %#x rev %u package %u type %u\n",
         bar_window, chipid, caps, chipid & 0xffffu, (chipid >> 16) & 15u, (chipid >> 20) & 15u, chipid >> 28);
@@ -227,6 +236,10 @@ wifi_endpoint_bar0(struct wifi_region *regions)
     wlog("BAR0 chip identity verified: BCM4375 rev %u; no DMA, firmware or interrupts\n", (chipid >> 16) & 15u);
     stage = "complete";
 out:
+    if (window_moved) {
+        wifi_write(cfg, 0x2080, bar_window);
+        if (wifi_read(cfg, 0x2080) != bar_window) failed = 1;
+    }
     if (command_changed) {
         wifi_write(cfg, 0x2004, command & 0xffffu);         /* decoding off again; W1C status as zero */
         uint32_t back = wifi_read(cfg, 0x2004);
