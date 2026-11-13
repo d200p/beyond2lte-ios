@@ -144,6 +144,7 @@ extern "C" pmap_t get_task_pmap(task_t task);
 #define B2L_CPU_BIG_FIRST_C    80              /* the big sensor: that cluster steps down from here */
 #define B2L_CPU_BIG_PER_C      4               /* and one more step for each of these */
 #define B2L_MIF_KHZ            2093000         /* Android's boot memory clock; 0 leaves it */
+#define B2L_MIF_STANDBY_KHZ    546000          /* display off (MIF table 421..2093 MHz) */
 #define B2L_MIF_TEST_BYTES     (8u << 20)
 #define B2L_CPU_ALL_HOT_C      88              /* any sensor: every cluster goes to its boot rate */
 #define B2L_CPU_ALL_COOL_C     78
@@ -938,6 +939,18 @@ B2LMali::clusterBoost()
 			b2l_diag_record("B2L ACPM: display %s, CPUs %s\n", standby ? "off" : "on",
 			    standby ? "at standby clocks, no boost" : "back to load-driven clocks");
 			wasStandby = standby;
+			/* S10: the memory clock too. S-Boot leaves it at its top rate and
+			 * nothing lowered it (boot 31 standby: 410-620 mA). 546 MHz is an
+			 * entry of the MIF FVMAP table that boot 32 logged (421..2093). */
+			int mif = B2L_MIF_KHZ;
+			PE_parse_boot_argn("b2l_mif_khz", &mif, sizeof(mif));
+			uint32_t want = standby ? B2L_MIF_STANDBY_KHZ : (uint32_t)mif;
+			if (mif > 0) {
+				IOLockLock(runtimeLock);
+				int answered = acpmReady && b2l_acpm_set_rate(&acpm, &acpmDvfs, B2L_DVFS_MIF, want);
+				IOLockUnlock(runtimeLock);
+				b2l_diag_record("B2L ACPM: memory %u kHz reply=%d\n", want, answered);
+			}
 		}
 		for (unsigned i = 0; i < B2L_CPU_CLUSTERS; i++) {
 			uint32_t want = b2l_cpu_clusters[i].boot_khz;

@@ -119,18 +119,26 @@ extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
 #ifndef B2L_GPU_ROW_ALIGN
 #define B2L_GPU_ROW_ALIGN 64
 #endif
+/*
+ * S10: gaussian_blur on the GPU (see gpu_blur). Off for an A/B test: build 31
+ * still showed material glitches in Settings (the bar's backdrop unblurred and
+ * from an older scroll position, or a dark band), with only kind 1 live and
+ * this blur left on the GPU. On the CPU it costs under 1%.
+ */
 #ifndef B2L_GPU_BLUR
-#define B2L_GPU_BLUR 1          /* S10: gaussian_blur on the GPU, see gpu_blur */
+#define B2L_GPU_BLUR 0
 #endif
 #ifndef B2L_GPU_BATCH
 #define B2L_GPU_BATCH 0         /* S10: fork build 0146 open batches, see draw_hook */
 #endif
 /*
  * S10: draws translated one at a time (shadow compare, then live). 0 leaves
- * every draw to the CPU and only times it for the K lines.
+ * every draw to the CPU and only times it for the K lines. Off for the same
+ * A/B test as B2L_GPU_BLUR: with both off only the kernel's screen copy is on
+ * the GPU. The live draws saved well under 1% of backboardd's CPU.
  */
 #ifndef B2L_GPU_DRAWS
-#define B2L_GPU_DRAWS 1
+#define B2L_GPU_DRAWS 0
 #endif
 /*
  * S10: one-byte masks (format 9) drawn live. Off: the thin dashed black lines
