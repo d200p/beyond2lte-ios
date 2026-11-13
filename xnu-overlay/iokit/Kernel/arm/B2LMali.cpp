@@ -134,6 +134,12 @@ extern "C" pmap_t get_task_pmap(task_t task);
 #define B2L_RT_JOB_TIMEOUT_US  1000000
 #define B2L_RT_IDLE_MS         50
 #define B2L_MALI_VA_LOG2       48              /* the whole GPU address space, for a full TLB flush */
+#define B2L_MALI_LOCK_MIN_LOG2 15              /* the smallest region AS LOCK takes */
+#define B2L_RT_BO_VA           0xa0000000ull   /* buffer objects: after the draw client's buffers, */
+#define B2L_RT_BO_END          0x100000000ull  /* under 4 GiB like Linux panfrost's range */
+#define B2L_RT_BO_PAGES        ((B2L_RT_BO_END - B2L_RT_BO_VA) >> 12)
+#define B2L_RT_BO_LIMIT        (768ull << 20)  /* resident bytes of all buffer objects */
+#define B2L_RT_BO_CODE_PAGES   4096            /* executable objects stay inside 16 MiB */
 #define B2L_GPU_BOOST_KHZ      433000          /* the stock tree's sustainable level */
 #define B2L_GPU_UNGUARDED_KHZ  325000          /* the most without a temperature */
 #define B2L_GPU_MAX_KHZ        702000
@@ -164,6 +170,14 @@ struct b2l_mali_slot {
 	ppnum_t range_first, range_last;
 	uint64_t last_use;
 	uint32_t cleaned_seed, cleaned;
+};
+
+/* S10 port: a Mesa buffer object (type 1 clients); handle = index + 1. */
+struct b2l_mali_bo {
+	IOBufferMemoryDescriptor *memory;       /* NULL while the handle is free */
+	void *owner;                            /* the B2LMaliUserClient */
+	uint64_t va, bytes, resident;           /* VA range; memory behind its start */
+	uint32_t flags;
 };
 
 class B2LMali : public IOService {
@@ -245,6 +259,29 @@ class B2LMali : public IOService {
 	 * buffers live in buffers[] like a client's; runtimeEnd frees them. */
 	int kernelPass = -1, kernelCode = -1;
 	uint64_t kernelPassVA, kernelCodeVA, kernelPresents, kernelFailures;
+	/* S10 port, Mesa Panfrost: GPU properties and the buffer objects of type 1
+	 * clients, in their own VA range of the shared address space. The runtime
+	 * runs while any client is open; one drawing client at a time. */
+	struct b2l_mali_props props;
+	struct b2l_mali_bo *bos;
+	uint64_t *boPages;              /* one bit per 4 KiB page of the BO range */
+	uint64_t boBytes, boJobs, boFaults;
+	unsigned clients;
+	bool drawOpen;
+	void readProps();
+	bool boReserve(uint64_t pages, bool exec, uint64_t *first);
+	void boRelease(uint64_t first, uint64_t pages);
+	void flushRange(uint64_t va, uint64_t bytes);
+	void unmapRange(uint64_t va, uint64_t bytes);
+	void releaseBuffers();
+	void boDrop(struct b2l_mali_bo *bo);
+	IOReturn boCreate(void *owner, uint64_t bytes, uint64_t flags, uint64_t *handle, uint64_t *va);
+	IOReturn boFree(void *owner, uint64_t handle);
+	void boFreeAll(void *owner);
+	IOBufferMemoryDescriptor *boMemory(void *owner, uint32_t handle);
+	IOReturn jobSubmit(uint64_t jc, uint64_t requirements, uint64_t *out);
+	IOReturn clientBegin(bool draw);
+	void clientEnd(bool draw, void *owner);
 public:
 	int presentScaled(uint32_t source_id, uint32_t panel_id, uint32_t width, uint32_t height, uint64_t *gpu_ns);
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
@@ -255,6 +292,7 @@ class B2LMaliUserClient : public IOUserClient {
 	OSDeclareDefaultStructors(B2LMaliUserClient);
 	B2LMali *owner;
 	task_t clientTask;
+	UInt32 clientType;              /* B2L_MALI_CLIENT_DRAW or B2L_MALI_CLIENT_BO */
 	bool opened;
 public:
 	bool initWithTask(task_t task, void *security, UInt32 type) APPLE_KEXT_OVERRIDE;
@@ -371,7 +409,49 @@ B2LMali::identify()
 		b2l_diag_record("B2L GPU: unexpected id, stopping\n");
 		return false;
 	}
+	readProps();
 	return true;
+}
+
+/* S10 port: what Panfrost asks with DRM_PANFROST_PARAM_*; fixed per GPU. */
+void
+B2LMali::readProps()
+{
+	props.gpu_id = b2l_mali_r(&io, B2L_MALI_ID);
+	props.l2_features = b2l_mali_r(&io, B2L_MALI_L2_FEATURES);
+	props.core_features = b2l_mali_r(&io, B2L_MALI_CORE_FEATURES);
+	props.tiler_features = b2l_mali_r(&io, B2L_MALI_TILER_FEATURES);
+	props.mem_features = b2l_mali_r(&io, B2L_MALI_MEM_FEATURES);
+	props.mmu_features = b2l_mali_r(&io, B2L_MALI_MMU_FEATURES);
+	props.as_present = b2l_mali_r(&io, B2L_MALI_AS_PRESENT);
+	props.js_present = b2l_mali_r(&io, B2L_MALI_JS_PRESENT);
+	props.thread_max_threads = b2l_mali_r(&io, B2L_MALI_THREAD_MAX_THREADS);
+	props.thread_max_workgroup = b2l_mali_r(&io, B2L_MALI_THREAD_MAX_WORKGROUP);
+	props.thread_max_barrier = b2l_mali_r(&io, B2L_MALI_THREAD_MAX_BARRIER);
+	props.thread_features = b2l_mali_r(&io, B2L_MALI_THREAD_FEATURES);
+	props.coherency_features = b2l_mali_r(&io, B2L_MALI_COHERENCY);
+	props.thread_tls_alloc = b2l_mali_r(&io, B2L_MALI_THREAD_TLS_ALLOC);
+	props.afbc_features = b2l_mali_r(&io, B2L_MALI_AFBC_FEATURES);
+	for (unsigned i = 0; i < 4; i++) {
+		props.texture_features[i] = b2l_mali_r(&io, B2L_MALI_TEXTURE_FEATURES(i));
+	}
+	for (unsigned i = 0; i < 16; i++) {
+		props.js_features[i] = b2l_mali_r(&io, B2L_MALI_JS_FEATURES(i));
+	}
+	props.shader_present = b2l_mali_r(&io, B2L_MALI_SHADER_PRESENT) |
+	    (uint64_t)b2l_mali_r(&io, B2L_MALI_SHADER_PRESENT + 4) << 32;
+	props.tiler_present = b2l_mali_r(&io, B2L_MALI_TILER_PRESENT) |
+	    (uint64_t)b2l_mali_r(&io, B2L_MALI_TILER_PRESENT + 4) << 32;
+	props.l2_present = b2l_mali_r(&io, B2L_MALI_L2_PRESENT) |
+	    (uint64_t)b2l_mali_r(&io, B2L_MALI_L2_PRESENT + 4) << 32;
+	props.stack_present = b2l_mali_r(&io, B2L_MALI_STACK_PRESENT) |
+	    (uint64_t)b2l_mali_r(&io, B2L_MALI_STACK_PRESENT + 4) << 32;
+	b2l_diag_record("B2L GPU: props threads=%u workgroup=%u barrier=%u thread=0x%x tls=%u "
+	    "texture=0x%x,0x%x,0x%x,0x%x afbc=0x%x stack=0x%llx js0=0x%x js1=0x%x\n",
+	    props.thread_max_threads, props.thread_max_workgroup, props.thread_max_barrier,
+	    props.thread_features, props.thread_tls_alloc, props.texture_features[0],
+	    props.texture_features[1], props.texture_features[2], props.texture_features[3],
+	    props.afbc_features, props.stack_present, props.js_features[0], props.js_features[1]);
 }
 
 bool
@@ -687,6 +767,17 @@ B2LMali::runtimeBegin()
 	IOByteCount length = 0;
 
 	kernelPass = kernelCode = -1;   /* S10 port: buffers[] starts empty */
+	if (bos == NULL) {
+		bos = IONewZero(b2l_mali_bo, B2L_MALI_MAX_BOS);
+	}
+	if (boPages == NULL) {
+		boPages = (uint64_t *)IOMallocData(B2L_RT_BO_PAGES / 8);
+	}
+	if (bos == NULL || boPages == NULL) {
+		return false;
+	}
+	bzero(boPages, B2L_RT_BO_PAGES / 8);
+	boBytes = 0;
 
 	runtimeTables = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
 	    kIOMemoryPhysicallyContiguous | kIODirectionInOut, B2L_RT_TABLES * 4096, B2L_GPU_ADDRESS_MASK);
@@ -1188,6 +1279,14 @@ B2LMali::runtimeEnd()
 		OSSafeReleaseNULL(buffers[i]);
 	}
 	kernelPass = kernelCode = -1;
+	for (unsigned i = 0; bos != NULL && i < B2L_MALI_MAX_BOS; i++) {
+		if (bos[i].memory != NULL) {
+			bos[i].memory->complete();
+			OSSafeReleaseNULL(bos[i].memory);
+		}
+		bzero(&bos[i], sizeof(bos[i]));
+	}
+	boBytes = 0;
 	if (coresOn) {
 		gpuClock(false);
 		b2l_mali_power_off(&io);
@@ -1500,6 +1599,296 @@ B2LMali::submit(const struct b2l_mali_submit *request, uint64_t *out)
 	return kIOReturnSuccess;
 }
 
+/*
+ * S10 port, Mesa Panfrost buffer objects. All under runtimeLock; jobs are
+ * synchronous, so the GPU is idle whenever these run.
+ */
+void
+B2LMali::flushRange(uint64_t va, uint64_t bytes)
+{
+	unsigned log2 = B2L_MALI_LOCK_MIN_LOG2;
+
+	while (log2 < B2L_MALI_VA_LOG2 && (va >> log2) != ((va + bytes - 1) >> log2)) {
+		log2++;
+	}
+	if (coresOn) {          /* otherwise coresUp flushes everything */
+		b2l_mali_flush_region(&io, va, log2);
+	}
+}
+
+void
+B2LMali::unmapRange(uint64_t va, uint64_t bytes)
+{
+	for (uint64_t off = 0; off < bytes; off += 4096) {
+		b2l_mali_pt_unmap(&pt, va + off);
+	}
+	flushTables();
+	flushRange(va, bytes);
+}
+
+/* First fit over the BO range. Executable objects must not cross 16 MiB (the
+ * shader program counter); 2 MiB and larger ones start on 2 MiB. */
+bool
+B2LMali::boReserve(uint64_t pages, bool exec, uint64_t *first)
+{
+	const uint64_t align = !exec && pages >= 512 ? 512 : 1;
+	uint64_t start = 0;
+
+	if (pages == 0 || pages > B2L_RT_BO_PAGES || (exec && pages > B2L_RT_BO_CODE_PAGES)) {
+		return false;
+	}
+	for (;;) {
+		while (start < B2L_RT_BO_PAGES && !(start & 63) && boPages[start >> 6] == ~0ull) {
+			start += 64;    /* whole words in use */
+		}
+		start = (start + align - 1) & ~(align - 1);
+		if (exec && start / B2L_RT_BO_CODE_PAGES != (start + pages - 1) / B2L_RT_BO_CODE_PAGES) {
+			start = (start / B2L_RT_BO_CODE_PAGES + 1) * B2L_RT_BO_CODE_PAGES;
+			continue;
+		}
+		if (start + pages > B2L_RT_BO_PAGES) {
+			return false;
+		}
+		uint64_t p = start, end = start + pages;
+		while (p < end) {
+			uint64_t word = boPages[p >> 6];
+			if (!(p & 63) && word == 0 && p + 64 <= end) {
+				p += 64;
+			} else if (word & (1ull << (p & 63))) {
+				break;
+			} else {
+				p++;
+			}
+		}
+		if (p == end) {
+			for (p = start; p < end; p++) {
+				boPages[p >> 6] |= 1ull << (p & 63);
+			}
+			*first = start;
+			return true;
+		}
+		start = p + 1;
+	}
+}
+
+void
+B2LMali::boRelease(uint64_t first, uint64_t pages)
+{
+	for (uint64_t p = first; p < first + pages; p++) {
+		boPages[p >> 6] &= ~(1ull << (p & 63));
+	}
+}
+
+IOReturn
+B2LMali::boCreate(void *owner, uint64_t bytes, uint64_t flags, uint64_t *handle, uint64_t *va)
+{
+	const uint64_t known = B2L_MALI_BO_NOEXEC | B2L_MALI_BO_HEAP;
+
+	if (bos == NULL || bytes == 0 || bytes > B2L_RT_BO_LIMIT || (flags & ~known)) {
+		return kIOReturnBadArgument;
+	}
+	bytes = (bytes + 4095) & ~4095ull;
+	bool heap = (flags & B2L_MALI_BO_HEAP) != 0;
+	bool exec = !heap && !(flags & B2L_MALI_BO_NOEXEC);
+	uint64_t resident = heap && bytes > B2L_MALI_BO_HEAP_RESIDENT ? B2L_MALI_BO_HEAP_RESIDENT : bytes;
+	if (boBytes + resident > B2L_RT_BO_LIMIT) {
+		return kIOReturnNoMemory;
+	}
+	unsigned index = 0;
+	while (index < B2L_MALI_MAX_BOS && bos[index].memory != NULL) {
+		index++;
+	}
+	uint64_t first = 0;
+	if (index == B2L_MALI_MAX_BOS) {
+		return kIOReturnNoResources;
+	}
+	if (!boReserve(bytes >> 12, exec, &first)) {
+		return kIOReturnNoSpace;
+	}
+	/*
+	 * Write-combined everywhere, as IOSurface does it: pageable memory makes
+	 * its own VM object, created with that cache mode, so no mapping of these
+	 * pages (kernel or client) is cacheable; prepare() wires them for the
+	 * GPU. The zero fill went through the cacheable physical aperture: clean
+	 * it out once by physical address.
+	 */
+	IOBufferMemoryDescriptor *memory = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+	    kIODirectionInOut | kIOMemoryPageable | kIOMapWriteCombineCache, resident, 4096);
+	uint64_t base = B2L_RT_BO_VA + (first << 12);
+	if (memory == NULL || memory->prepare() != kIOReturnSuccess) {
+		OSSafeReleaseNULL(memory);
+		boRelease(first, bytes >> 12);
+		return kIOReturnNoMemory;
+	}
+	for (uint64_t off = 0; off < resident; off += 4096) {
+		IOByteCount length = 0;
+		addr64_t pa = memory->getPhysicalSegment(off, &length, kIOMemoryMapperNone);
+		if (pa) {
+			flush_dcache64(pa, 4096, TRUE);
+		}
+	}
+	if (!mapMemory(memory, base, resident, exec)) {
+		unmapRange(base, resident);
+		boRelease(first, bytes >> 12);
+		memory->complete();
+		memory->release();
+		return kIOReturnNoSpace;
+	}
+	flushTables();
+	flushRange(base, bytes);
+	struct b2l_mali_bo *bo = &bos[index];
+	bo->memory = memory;
+	bo->owner = owner;
+	bo->va = base;
+	bo->bytes = bytes;
+	bo->resident = resident;
+	bo->flags = (uint32_t)flags;
+	boBytes += resident;
+	*handle = index + 1;
+	*va = base;
+	return kIOReturnSuccess;
+}
+
+/* A client mapping keeps the memory alive; the GPU loses it here. */
+void
+B2LMali::boDrop(struct b2l_mali_bo *bo)
+{
+	unmapRange(bo->va, bo->resident);
+	boRelease((bo->va - B2L_RT_BO_VA) >> 12, bo->bytes >> 12);
+	boBytes -= bo->resident;
+	bo->memory->complete();
+	OSSafeReleaseNULL(bo->memory);
+	bzero(bo, sizeof(*bo));
+}
+
+IOReturn
+B2LMali::boFree(void *owner, uint64_t handle)
+{
+	if (bos == NULL || handle == 0 || handle > B2L_MALI_MAX_BOS) {
+		return kIOReturnBadArgument;
+	}
+	struct b2l_mali_bo *bo = &bos[handle - 1];
+	if (bo->memory == NULL || bo->owner != owner) {
+		return kIOReturnNotFound;
+	}
+	boDrop(bo);
+	return kIOReturnSuccess;
+}
+
+void
+B2LMali::boFreeAll(void *owner)
+{
+	unsigned freed = 0;
+
+	for (unsigned i = 0; bos != NULL && i < B2L_MALI_MAX_BOS; i++) {
+		if (bos[i].memory != NULL && bos[i].owner == owner) {
+			boDrop(&bos[i]);
+			freed++;
+		}
+	}
+	if (freed) {
+		b2l_diag_record("B2L GPU BO: %u objects freed with their client, %llu bytes still resident\n",
+		    freed, boBytes);
+	}
+}
+
+IOBufferMemoryDescriptor *
+B2LMali::boMemory(void *owner, uint32_t handle)
+{
+	if (bos == NULL || handle == 0 || handle > B2L_MALI_MAX_BOS) {
+		return NULL;
+	}
+	struct b2l_mali_bo *bo = &bos[handle - 1];
+	if (bo->memory == NULL || bo->owner != owner || (bo->flags & B2L_MALI_BO_HEAP)) {
+		return NULL;
+	}
+	bo->memory->retain();
+	return bo->memory;
+}
+
+/* One job chain, as DRM_IOCTL_PANFROST_SUBMIT, awaited here. */
+IOReturn
+B2LMali::jobSubmit(uint64_t jc, uint64_t requirements, uint64_t *out)
+{
+	if (jc == 0 || (requirements & ~(uint64_t)B2L_MALI_REQ_FS)) {
+		return kIOReturnBadArgument;
+	}
+	__asm__ volatile("dsb sy" ::: "memory");        /* the client's write-combined stores */
+	if (!coresUp()) {
+		return kIOReturnNotReady;
+	}
+	checkTemperature();
+	unsigned slot = (requirements & B2L_MALI_REQ_FS) ? B2L_MALI_SLOT_FRAGMENT : B2L_MALI_SLOT_TILER;
+	uint64_t begin = nowNS();
+	uint32_t status = b2l_mali_run_job(&io, slot, jc, B2L_RT_JOB_TIMEOUT_US);
+	out[0] = status;
+	out[1] = nowNS() - begin;
+	boJobs++;
+	if (status != B2L_MALI_STATUS_DONE) {
+		if (boFaults++ < 16) {
+			b2l_diag_record("B2L GPU BO: job 0x%llx slot %u status 0x%x js_status=0x%x\n", jc, slot, status,
+			    b2l_mali_r(&io, B2L_MALI_JS0 + slot * B2L_MALI_JS_STRIDE + B2L_MALI_JS_STATUS));
+			reportFault((unsigned)boJobs);
+		}
+		/* A faulted address space stays stopped until the GPU is reset. */
+		if (b2l_mali_soft_reset(&io) && b2l_mali_power_on(&io) == NULL) {
+			b2l_mali_set_as0(&io, pt.tables_pa);
+		}
+	}
+	lastJobNS = nowNS();
+	if (idleCall != NULL) {
+		thread_call_enter_delayed(idleCall, lastJobTimeout());
+	}
+	return kIOReturnSuccess;
+}
+
+/* The drawing client's buffers, when it closes while other clients stay. */
+void
+B2LMali::releaseBuffers()
+{
+	for (unsigned i = 0; i < B2L_MALI_MAX_BUFFERS; i++) {
+		if (buffers[i] != NULL) {
+			unmapRange(B2L_RT_BUFFER_VA + i * B2L_RT_BUFFER_STEP, buffers[i]->getLength());
+			OSSafeReleaseNULL(buffers[i]);
+		}
+	}
+	kernelPass = kernelCode = -1;
+}
+
+IOReturn
+B2LMali::clientBegin(bool draw)
+{
+	if (!runtimeReady || (draw && drawOpen)) {
+		return kIOReturnExclusiveAccess;
+	}
+	if (clients == 0 && !runtimeBegin()) {
+		runtimeEnd();
+		b2l_diag_record("B2L GPU: runtime start failed\n");
+		return kIOReturnNotReady;
+	}
+	clients++;
+	clientOpen = true;
+	drawOpen |= draw;
+	b2l_diag_record("B2L GPU: %s client opened by pid %d, %u open\n", draw ? "drawing" : "buffer-object",
+	    proc_selfpid(), clients);
+	return kIOReturnSuccess;
+}
+
+void
+B2LMali::clientEnd(bool draw, void *owner)
+{
+	if (draw) {
+		releaseBuffers();
+		drawOpen = false;
+	} else {
+		boFreeAll(owner);
+	}
+	if (clients > 0 && --clients == 0) {
+		runtimeEnd();
+		clientOpen = false;
+	}
+}
+
 uint64_t
 B2LMali::lastJobTimeout()
 {
@@ -1511,7 +1900,11 @@ B2LMali::lastJobTimeout()
 bool
 B2LMaliUserClient::initWithTask(task_t task, void *security, UInt32 type)
 {
+	if (type != B2L_MALI_CLIENT_DRAW && type != B2L_MALI_CLIENT_BO) {
+		return false;
+	}
 	clientTask = task;
+	clientType = type;
 	return IOUserClient::initWithTask(task, security, type);
 }
 
@@ -1527,8 +1920,7 @@ B2LMaliUserClient::clientClose(void)
 {
 	if (opened) {
 		IOLockLock(owner->runtimeLock);
-		owner->runtimeEnd();
-		owner->clientOpen = false;
+		owner->clientEnd(clientType == B2L_MALI_CLIENT_DRAW, this);
 		IOLockUnlock(owner->runtimeLock);
 		opened = false;
 	}
@@ -1620,12 +2012,13 @@ b2l_mali_present_scaled(uint32_t source_id, uint32_t panel_id, uint32_t width, u
 IOReturn
 B2LMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
 {
-	if (!opened || type >= B2L_MALI_MAX_BUFFERS) {
+	bool bo = clientType == B2L_MALI_CLIENT_BO;
+	if (!opened || (bo ? (type & ~0xffffu) != B2L_MALI_BO_MEMORY(0) : type >= B2L_MALI_MAX_BUFFERS)) {
 		return kIOReturnBadArgument;
 	}
 	IOLockLock(owner->runtimeLock);
-	IOBufferMemoryDescriptor *buffer = owner->buffers[type];
-	if (buffer != NULL) {
+	IOBufferMemoryDescriptor *buffer = bo ? owner->boMemory(this, type & 0xffffu) : owner->buffers[type];
+	if (buffer != NULL && !bo) {
 		buffer->retain();
 	}
 	IOLockUnlock(owner->runtimeLock);
@@ -1655,20 +2048,23 @@ B2LMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
 
 	IOReturn ret = kIOReturnUnsupported;
 	IOLockLock(owner->runtimeLock);
+	bool draw = clientType == B2L_MALI_CLIENT_DRAW;
 	if (!opened) {
-		if (!owner->runtimeReady || owner->clientOpen) {
+		ret = owner->clientBegin(draw);
+		if (ret != kIOReturnSuccess) {
 			IOLockUnlock(owner->runtimeLock);
-			return kIOReturnExclusiveAccess;
+			return ret;
 		}
-		if (!owner->runtimeBegin()) {
-			owner->runtimeEnd();
-			IOLockUnlock(owner->runtimeLock);
-			b2l_diag_record("B2L GPU: runtime start failed\n");
-			return kIOReturnNotReady;
-		}
-		owner->clientOpen = true;
 		opened = true;
-		b2l_diag_record("B2L GPU: client opened by pid %d\n", proc_selfpid());
+		ret = kIOReturnUnsupported;
+	}
+	/* Drawing selectors for the drawing client, buffer objects for the others. */
+	bool drawing = selector == kB2LMaliCreateBuffer || selector == kB2LMaliMapSurface ||
+	    selector == kB2LMaliMapRange || selector == kB2LMaliSubmit;
+	bool objects = selector == kB2LMaliBoCreate || selector == kB2LMaliBoFree || selector == kB2LMaliJobSubmit;
+	if ((drawing && !draw) || (objects && draw)) {
+		IOLockUnlock(owner->runtimeLock);
+		return kIOReturnUnsupported;
 	}
 	switch (selector) {
 	case kB2LMaliCreateBuffer:
@@ -1699,6 +2095,33 @@ B2LMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
 			struct b2l_mali_submit request;
 			bcopy(args->structureInput, &request, sizeof(request));
 			ret = owner->submit(&request, args->scalarOutput);
+		} else {
+			ret = kIOReturnBadArgument;
+		}
+		break;
+	case kB2LMaliProps:
+		if (args->structureOutput != NULL && args->structureOutputSize >= sizeof(owner->props)) {
+			bcopy(&owner->props, args->structureOutput, sizeof(owner->props));
+			args->structureOutputSize = sizeof(owner->props);
+			ret = kIOReturnSuccess;
+		} else {
+			ret = kIOReturnBadArgument;
+		}
+		break;
+	case kB2LMaliBoCreate:
+		if (args->scalarInputCount == 2 && args->scalarOutputCount == 2) {
+			ret = owner->boCreate(this, args->scalarInput[0], args->scalarInput[1],
+			    &args->scalarOutput[0], &args->scalarOutput[1]);
+		} else {
+			ret = kIOReturnBadArgument;
+		}
+		break;
+	case kB2LMaliBoFree:
+		ret = args->scalarInputCount == 1 ? owner->boFree(this, args->scalarInput[0]) : kIOReturnBadArgument;
+		break;
+	case kB2LMaliJobSubmit:
+		if (args->scalarInputCount == 2 && args->scalarOutputCount == 2) {
+			ret = owner->jobSubmit(args->scalarInput[0], args->scalarInput[1], args->scalarOutput);
 		} else {
 			ret = kIOReturnBadArgument;
 		}

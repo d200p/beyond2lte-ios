@@ -5,6 +5,21 @@ Status 2026-11-13: Mesa 24.3.4 builds completely for iOS arm64e in CI
 Bifrost v7 (Mali-G76), its shader compiler, the GLES dispatch. Nothing runs
 on the phone yet.
 
+Status 2026-11-14: pieces 1 to 3 written, not yet run.
+- Kernel (B2LMali): client type 1 with `kB2LMaliProps`, `kB2LMaliBoCreate`,
+  `kB2LMaliBoFree`, `kB2LMaliJobSubmit` (`b2l_mali_uapi.h`). The runtime now
+  serves several clients at once (one drawing client, any number of
+  buffer-object clients) in one address space; buffer objects live at
+  0xa0000000-0xffffffff, at most 768 MiB resident, the tiler heap with 32 MiB
+  of its range backed. Their memory is pageable, write-combined and wired
+  while it exists, the way IOSurface makes write-combined memory, so neither
+  the CPU nor the GPU side needs cache maintenance.
+- `userspace/b2l-gpu.c` checks it at every boot from backboardd ("BO test"
+  lines in the kernel log): properties, a mapped object, a fragment clear and
+  a write-value job read back, a tiler heap, a shader object, cleanup.
+- libdrm (`scripts/mesa/b2l-drm/b2l_drm.c`) and the `os_mmap` redirect
+  (`patch_os_mman.py`), compiled by the Mesa workflow.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
@@ -36,8 +51,8 @@ software renderer reaches about 10-15 fps.
    sync objects are user-space flags; `drmGetVersion` names the driver
    "panfrost"; a fake DRM fd identifies the connection.
 3. **Mesa patch, buffer mapping**: `os_mmap` on the fake fd returns the
-   `IOConnectMapMemory` address of the BO (one small patch to
-   `src/util/os_mman.h`, applied by the build script).
+   `IOConnectMapMemory` address of the BO (macros appended to
+   `src/util/os_mman.h` by `scripts/mesa/b2l-drm/patch_os_mman.py`).
 4. **EAGL shim**: the `EAGLContext` / renderbuffer / IOSurface entry points
    that `CA::OGL::GLESContext` uses, on a Gallium frontend that creates a
    Panfrost screen and GLES contexts, with IOSurfaces (CA layers, the

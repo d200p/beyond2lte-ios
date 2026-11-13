@@ -25,6 +25,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
 #include "b2l_flush_rect.h"
 #include "b2l_mali_draw.h"
 #include "b2l_mali_uapi.h"
@@ -40,6 +42,10 @@ extern kern_return_t IOConnectCallMethod(io_connect_t c, uint32_t selector, cons
 extern kern_return_t IOConnectMapMemory64(io_connect_t c, uint32_t type, task_port_t task, mach_vm_address_t *address,
     mach_vm_size_t *size, uint32_t options);
 extern bool _dyld_get_shared_cache_uuid(uuid_t uuid);
+extern kern_return_t IOServiceClose(io_connect_t connect);
+extern kern_return_t IOConnectUnmapMemory64(io_connect_t c, uint32_t type, task_port_t task, mach_vm_address_t address);
+#define B2L_MAP_ANYWHERE        0x001u  /* kIOMapAnywhere */
+#define B2L_MAP_WRITE_COMBINE   0x400u  /* kIOMapWriteCombineCache */
 
 #define CACHE_UUID "\xcc\x67\x0b\x30\x8f\xdb\x34\xda\xaf\xab\x7a\xee\x12\x51\x38\x4b"
 #define QC_BASE    0x183ed7000ull
@@ -1771,6 +1777,128 @@ prepare_shadow(void)
 	return 1;
 }
 
+/*
+ * S10: groundwork for Mesa's Panfrost. A second connection, of the
+ * buffer-object type the B2LMali libdrm will open: the GPU properties, a
+ * write-combined buffer object mapped here, a fragment clear and a write-value
+ * job into it read back on the CPU, a tiler heap and a shader object, all
+ * freed with the connection. Logged only; nothing else depends on it. A
+ * marker in /var/tmp skips it after a run that never finished.
+ */
+#define BO_TEST_MARKER "/private/var/tmp/b2l-bo-test.running"
+#define BO_TEST_BYTES  0x10000u
+#define BO_TEST_COLOUR 0xff2040c0u
+
+static int
+bo_call(io_connect_t c, uint32_t selector, uint64_t a, uint64_t b, uint64_t *out, uint32_t outs)
+{
+	uint64_t in[2] = { a, b };
+	uint32_t count = outs;
+	return (int)IOConnectCallMethod(c, selector, in, 2, NULL, 0, out, &count, NULL, NULL);
+}
+
+static void
+bo_selftest(void)
+{
+	int marker = open(BO_TEST_MARKER, O_CREAT | O_EXCL | O_WRONLY, 0644);
+	if (marker < 0 && errno == EEXIST) {
+		log_line("BO test: skipped, the last run did not finish (%s)", BO_TEST_MARKER);
+		return;
+	}
+	if (marker >= 0) {
+		close(marker);
+	}
+	io_connect_t c = MACH_PORT_NULL;
+	io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("B2LMali"));
+	kern_return_t kr = service != MACH_PORT_NULL ?
+	    IOServiceOpen(service, mach_task_self(), B2L_MALI_CLIENT_BO, &c) : KERN_FAILURE;
+	if (service != MACH_PORT_NULL) {
+		IOObjectRelease(service);
+	}
+	if (kr != KERN_SUCCESS) {
+		log_line("BO test: open failed kr=0x%x", kr);
+		unlink(BO_TEST_MARKER);
+		return;
+	}
+
+	struct b2l_mali_props props;
+	size_t props_size = sizeof(props);
+	memset(&props, 0, sizeof(props));
+	kr = IOConnectCallMethod(c, kB2LMaliProps, NULL, 0, NULL, 0, NULL, NULL, &props, &props_size);
+	log_line("BO test: props kr=0x%x size=%zu gpu=0x%x shader=0x%llx tiler=0x%llx l2=0x%llx threads=%u tex0=0x%x mmu=0x%x",
+	    kr, props_size, props.gpu_id, (unsigned long long)props.shader_present,
+	    (unsigned long long)props.tiler_present, (unsigned long long)props.l2_present,
+	    props.thread_max_threads, props.texture_features[0], props.mmu_features);
+
+	uint64_t out[2] = { 0, 0 };
+	kr = bo_call(c, kB2LMaliBoCreate, BO_TEST_BYTES, B2L_MALI_BO_NOEXEC, out, 2);
+	uint32_t handle = (uint32_t)out[0];
+	uint64_t va = out[1];
+	mach_vm_address_t address = 0;
+	mach_vm_size_t size = 0;
+	kern_return_t mapped = kr ? kr : IOConnectMapMemory64(c, B2L_MALI_BO_MEMORY(handle), mach_task_self(),
+	    &address, &size, B2L_MAP_ANYWHERE | B2L_MAP_WRITE_COMBINE);
+	log_line("BO test: object kr=0x%x handle=%u va=0x%llx map kr=0x%x at 0x%llx size 0x%llx",
+	    kr, handle, (unsigned long long)va, mapped, (unsigned long long)address, (unsigned long long)size);
+	if (!kr && !mapped && size >= BO_TEST_BYTES) {
+		uint8_t *cpu = (uint8_t *)address;
+		volatile uint32_t *pixels = (volatile uint32_t *)(cpu + 0x1000);
+		volatile uint32_t *value = (volatile uint32_t *)(cpu + 0x2000);
+		for (unsigned i = 0; i < 256; i++) {
+			pixels[i] = 0x5aa55aa5u;
+		}
+		/* A fragment job clearing a 16 x 16 target, as the kernel's self-test. */
+		b2l_mali_clear_job(cpu, va, va + 0x1000, 16, 16, 64, BO_TEST_COLOUR);
+		uint64_t start = mach_absolute_time();
+		kr = bo_call(c, kB2LMaliJobSubmit, va, B2L_MALI_REQ_FS, out, 2);
+		uint64_t ticks = mach_absolute_time() - start;
+		unsigned bad = 0;
+		for (unsigned i = 0; i < 256; i++) {
+			bad += pixels[i] != BO_TEST_COLOUR;
+		}
+		log_line("BO test: clear kr=0x%x status=%llu gpu_ns=%llu call_ticks=%llu bad=%u first=0x%x",
+		    kr, (unsigned long long)out[0], (unsigned long long)out[1], (unsigned long long)ticks, bad, pixels[0]);
+
+		/* A write-value job (type 2): a 32-bit immediate (type 6) to +0x2000. */
+		volatile uint32_t *job = (volatile uint32_t *)(cpu + 0x800);
+		uint64_t target = va + 0x2000;
+		for (unsigned i = 0; i < 16; i++) {
+			job[i] = 0;
+		}
+		*value = 0;
+		job[4] = 1u | (2u << 1) | (1u << 16);   /* 64-bit descriptor, write value, index 1 */
+		job[8] = (uint32_t)target;
+		job[9] = (uint32_t)(target >> 32);
+		job[10] = 6;
+		job[12] = 0xc0ffee42u;
+		kr = bo_call(c, kB2LMaliJobSubmit, va + 0x800, 0, out, 2);
+		log_line("BO test: write value kr=0x%x status=%llu gpu_ns=%llu value=0x%x",
+		    kr, (unsigned long long)out[0], (unsigned long long)out[1], *value);
+	}
+
+	/* The tiler heap as Mesa asks for it, and a small shader object. */
+	uint64_t heap[2] = { 0, 0 }, code[2] = { 0, 0 };
+	kern_return_t heap_kr = bo_call(c, kB2LMaliBoCreate, 128u << 20, B2L_MALI_BO_HEAP | B2L_MALI_BO_NOEXEC, heap, 2);
+	mach_vm_address_t heap_address = 0;
+	mach_vm_size_t heap_size = 0;
+	kern_return_t heap_map = heap_kr ? heap_kr : IOConnectMapMemory64(c, B2L_MALI_BO_MEMORY((uint32_t)heap[0]),
+	    mach_task_self(), &heap_address, &heap_size, B2L_MAP_ANYWHERE);
+	kern_return_t code_kr = bo_call(c, kB2LMaliBoCreate, 4096, 0, code, 2);
+	log_line("BO test: heap kr=0x%x va=0x%llx (map refused: 0x%x) code kr=0x%x va=0x%llx",
+	    heap_kr, (unsigned long long)heap[1], heap_map, code_kr, (unsigned long long)code[1]);
+
+	if (address != 0) {
+		IOConnectUnmapMemory64(c, B2L_MALI_BO_MEMORY(handle), mach_task_self(), address);
+	}
+	uint64_t in[1] = { handle };
+	uint32_t none = 0;
+	kr = IOConnectCallMethod(c, kB2LMaliBoFree, in, 1, NULL, 0, NULL, &none, NULL, NULL);
+	kern_return_t again = IOConnectCallMethod(c, kB2LMaliBoFree, in, 1, NULL, 0, NULL, &none, NULL, NULL);
+	IOServiceClose(c);
+	unlink(BO_TEST_MARKER);
+	log_line("BO test: done, free kr=0x%x, second free kr=0x%x (expected not found)", kr, again);
+}
+
 static void *
 start_thread(void *unused)
 {
@@ -1798,6 +1926,7 @@ start_thread(void *unused)
 		uint32_t count = 3;
 		kern_return_t kr = IOConnectCallMethod(connection, kB2LMaliInfo, NULL, 0, NULL, 0, info, &count, NULL, NULL);
 		log_line("GPU client open for the kernel's screen copy (kr=0x%x); Core Animation not hooked", kr);
+		bo_selftest();          /* beside the open drawing client, as Mesa will be */
 		return NULL;
 	}
 	mach_timebase_info(&timebase);
@@ -1805,6 +1934,7 @@ start_thread(void *unused)
 	shadow_ready = prepare_shadow();
 	install_hook();
 	log_line("translator ready=%d", shadow_ready);
+	bo_selftest();
 	return NULL;
 }
 

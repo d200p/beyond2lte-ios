@@ -2,10 +2,9 @@
 /*
  * S10 port: the part of libdrm's public interface that Mesa's Panfrost uses,
  * for an iOS build with no DRM device. Newly written from the documented
- * libdrm API (function names, argument order, drmVersion layout); the
- * implementation will be a small library that turns each call into a
- * B2LMali user-client call instead of a Linux ioctl. Until then these are
- * declarations only, so that Mesa compiles.
+ * libdrm API (function names, argument order, drmVersion layout). The
+ * implementation is scripts/mesa/b2l-drm/b2l_drm.c, which turns each call
+ * into a B2LMali user-client call instead of a Linux ioctl.
  */
 #ifndef B2L_XF86DRM_H
 #define B2L_XF86DRM_H

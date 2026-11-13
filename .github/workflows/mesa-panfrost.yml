@@ -54,6 +54,7 @@ jobs:
           bash scripts/mesa/build-panfrost-ios.sh "out/mesa/mesa-${MESA_VERSION}" out/mesa/ios || true
           echo '--- configure tail'; tail -60 out/mesa/ios/configure.log || true
           echo '--- first errors'; grep -n 'error:' out/mesa/ios/build.log | head -80 || true
+          echo '--- b2l-drm'; cat out/mesa/ios/b2l-drm.log || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
