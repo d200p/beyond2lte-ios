@@ -253,9 +253,9 @@ static void b2l_pcs_report(void)
  *   B2L STACK: app=NAME samples=N stacks=N lost=N misses=N slide=0x...
  *   B2L STACK: #i n=count f=pc lr ret ret ... (user addresses, slid)
  */
-#define B2L_STK_DEPTH   14
-#define B2L_STK_SLOTS   256u
-#define B2L_STK_SHOW    20u
+#define B2L_STK_DEPTH   32
+#define B2L_STK_SLOTS   768u
+#define B2L_STK_SHOW    30u
 #define B2L_STK_MS      20u
 #define B2L_STK_VA_MASK 0x0000ffffffffffffull   /* drops pointer-authentication bits */
 struct b2l_stack { uint64_t f[B2L_STK_DEPTH]; uint32_t depth, count; };
@@ -315,7 +315,7 @@ static unsigned b2l_stack_sample(task_t task, uint64_t *f)
     f[depth++] = pc & B2L_STK_VA_MASK;
     if (lr != 0) f[depth++] = lr & B2L_STK_VA_MASK;
     vm_map_switch_context_t ctx = vm_map_switch_to(get_task_map(task));
-    for (unsigned hop = 0; depth < B2L_STK_DEPTH && hop < 32; hop++) {
+    for (unsigned hop = 0; depth < B2L_STK_DEPTH && hop < 64; hop++) {
         uint64_t record[2];
         if (fp == 0 || (fp & 7) || copyin((user_addr_t)fp, record, sizeof(record))) break;
         uint64_t ret = record[1] & B2L_STK_VA_MASK;
@@ -349,11 +349,17 @@ static void b2l_stack_report(task_t task, const char *app, uint32_t samples, uin
             if (!shown[i] && (best == B2L_STK_SLOTS || b2l_stacks[i].count > b2l_stacks[best].count)) best = i;
         if (best == B2L_STK_SLOTS) break;
         shown[best] = true;
-        char line[256];
-        int used = snprintf(line, sizeof(line), "B2L STACK: #%u n=%u f=", rank, b2l_stacks[best].count);
-        for (unsigned d = 0; d < b2l_stacks[best].depth && used > 0 && (size_t)used < sizeof(line) - 18; d++)
-            used += snprintf(line + used, sizeof(line) - (size_t)used, " %llx", (unsigned long long)b2l_stacks[best].f[d]);
-        b2l_early_trace("%s\n", line);
+        /* Up to 12 frames per line; later lines are "#i+ f=" continuations. */
+        for (unsigned d0 = 0; d0 < b2l_stacks[best].depth; d0 += 12) {
+            char line[256];
+            int used = d0 == 0 ?
+                snprintf(line, sizeof(line), "B2L STACK: #%u n=%u f=", rank, b2l_stacks[best].count) :
+                snprintf(line, sizeof(line), "B2L STACK: #%u+ f=", rank);
+            for (unsigned d = d0; d < d0 + 12 && d < b2l_stacks[best].depth && used > 0 &&
+                (size_t)used < sizeof(line) - 18; d++)
+                used += snprintf(line + used, sizeof(line) - (size_t)used, " %llx", (unsigned long long)b2l_stacks[best].f[d]);
+            b2l_early_trace("%s\n", line);
+        }
     }
 }
 

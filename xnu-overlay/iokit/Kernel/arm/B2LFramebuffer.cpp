@@ -645,51 +645,34 @@ AppleCLCD::applyBlank(void)
 {
 	bool off = __atomic_load_n(&fBlankWanted, __ATOMIC_ACQUIRE) == 1;
 	/*
-	 * S10: with DSIM taking commands, display off/on is only the panel's own:
-	 * DCS display off + sleep in, sleep out + display on (120 ms after sleep
-	 * out). Nothing is written to the panel memory and frames keep being
-	 * presented as usual, so on wake the panel already holds iOS's latest
-	 * frame. Blanking below is only the fallback when DSIM did not take
-	 * commands at start, or display off does not drain.
+	 * S10: display off = DCS display off, so the panel goes dark at once while
+	 * its driver IC stays configured (no sleep in: in boots 33-34 every wake
+	 * from sleep in left striped bars), then the panel memory is painted black
+	 * while it is dark and frames wait in the shadow. Display on = the panel,
+	 * already holding black, is lit with DCS display on, and iOS's next frame
+	 * replaces the black: the frame from before off never shows. Without DSIM
+	 * this is plain blanking, as before.
 	 */
-	if (fPanelSleep && !fBlanked) {
-		uint64_t start = mach_absolute_time(), ns = 0;
-		if (off && !fPanelAsleep) {
-			bool shown = dsimShortWrite(0x28);              /* display off */
-			IOSleep(20);
-			bool slept = shown && dsimShortWrite(0x10);     /* sleep in */
-			IOSleep(120);
-			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
-			if (shown) {
-				fPanelAsleep = true;    /* waking must send display on */
-				b2l_diag_record("B2L FB: display off, panel %s in %llu us\n",
-				    slept ? "switched off" : "dark, sleep in FAILED", ns / 1000);
-				return;
-			}
-			b2l_diag_record("B2L FB: display off FAILED over DSIM, blanking instead\n");
-		} else if (!off && fPanelAsleep) {
-			bool done = false;
-			for (unsigned attempt = 0; attempt < 3 && !done; attempt++) {
-				bool out = dsimShortWrite(0x11);        /* sleep out (harmless if awake) */
-				IOSleep(120);
-				done = dsimShortWrite(0x29) && out;     /* display on */
-				if (!done) IOSleep(20);
-			}
-			fPanelAsleep = false;
-			absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
-			b2l_diag_record("B2L FB: display on, panel %s in %llu us\n",
-			    done ? "switched on" : "wake FAILED", ns / 1000);
-			return;
-		} else {
-			return;
-		}
+	if (off && fPanelSleep && !fPanelAsleep) {
+		fPanelAsleep = dsimShortWrite(0x28);            /* display off */
+		if (!fPanelAsleep) b2l_diag_record("B2L FB: DCS display off FAILED, blanking only\n");
 	}
+	auto light = [this]() {
+		if (!fPanelAsleep) return;
+		bool done = false;
+		for (unsigned attempt = 0; attempt < 3 && !done; attempt++) {
+			done = dsimShortWrite(0x29);            /* display on */
+			if (!done) IOSleep(20);
+		}
+		fPanelAsleep = false;
+		b2l_diag_record("B2L FB: DCS display on %s\n", done ? "sent" : "FAILED");
+	};
 
-	/* Fallback: blanking, as before panel sleep existed. */
 	IOLockLock(fLock);
 	while (fBusy) IOLockSleep(fLock, &fBusy, THREAD_UNINT);
 	if (off == fBlanked) {
 		IOLockUnlock(fLock);
+		if (!off) light();
 		return;
 	}
 	fBlanked = off;
@@ -722,13 +705,14 @@ AppleCLCD::applyBlank(void)
 	fBusy = false;
 	IOLockWakeup(fLock, &fBusy, false);
 	IOLockUnlock(fLock);
+	if (!off) light();
 	if (!off && fRestoreCall != NULL) {
 		uint64_t deadline;
 		clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
 		thread_call_enter_delayed(fRestoreCall, deadline);
 	}
 	b2l_diag_record("B2L FB: display %s, panel %s in %llu us\n", off ? "off" : "on",
-	    off ? "blanked" : "black until the next frame", ns / 1000);
+	    off ? (fPanelAsleep ? "dark and blanked" : "blanked") : "black until the next frame", ns / 1000);
 }
 
 void
