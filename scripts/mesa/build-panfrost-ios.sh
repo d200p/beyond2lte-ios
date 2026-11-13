@@ -57,6 +57,12 @@ for kv in platforms= egl=disabled glx=disabled gbm=disabled gallium-drivers=panf
   name=${kv%%=*}
   if grep -q "option('$name'\|option(\"$name\"\|^  '$name'" "$options_file"; then args+=("-D$kv"); else echo "skipping -D$kv (not in this release)"; fi
 done
+# The libdrm calls Panfrost makes: what the B2LMali-backed libdrm must provide.
+grep -rhoE '\bdrm[A-Z][A-Za-z0-9]+\(' "$src/src/panfrost" "$src/src/gallium/drivers/panfrost" \
+  "$src/src/gallium/winsys/panfrost" 2>/dev/null | sort | uniq -c | sort -rn > "$build/libdrm-calls.txt" || true
+grep -rhoE 'DRM_IOCTL_[A-Z0-9_]+' "$src/src/panfrost" "$src/src/gallium/drivers/panfrost" \
+  "$src/src/gallium/winsys/panfrost" 2>/dev/null | sort | uniq -c | sort -rn > "$build/drm-ioctls.txt" || true
+echo '--- libdrm calls'; cat "$build/libdrm-calls.txt"; echo '--- DRM ioctls'; cat "$build/drm-ioctls.txt"
 meson setup "$build/out" "$src" --cross-file "$cross" --buildtype=release \
   --default-library=static "${args[@]}" 2>&1 | tee "$build/configure.log"
 ninja -C "$build/out" -k 0 2>&1 | tee "$build/build.log"
