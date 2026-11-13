@@ -64,6 +64,15 @@ enum {
 #define B2L_FB_NOTIFY_VSYNC           5
 #define B2L_FB_VSYNC_US               16667
 #define B2L_FB_DOT_PITCH              522     /* S10+ panel; geometry still comes from GOP */
+/* S10: DSIM0 (live device tree dsim@0x19080000), exynos9820 regs-dsim.h. */
+#define B2L_DSIM_BASE                 0x19080000ull
+#define B2L_DSIM_BYTES                0x1000
+#define B2L_DSIM_LINK_STATUS1         0x0c
+#define B2L_DSIM_INTSRC               0x50
+#define B2L_DSIM_INT_PH_FIFO_EMPTY    (1u << 28)
+#define B2L_DSIM_PKTHDR               0x58
+#define B2L_DSIM_FIFOCTRL             0x68
+#define B2L_DSIM_FIFO_EMPTY_PH        (1u << 10)
 #define B2L_FB_FORMAT_BGRA            0x42475241
 /* Rows kept black above iOS for the S10+ front-camera hole (top right). 136
  * leaves 1440x2904, exactly 480x968 points at 3x, and keeps every row start
@@ -155,6 +164,15 @@ public:
 	 * written back. Guarded by fLock + fBusy. */
 	bool          fBlanked;
 	int           fBlankWanted;     /* atomic: 1 off, 0 on */
+	/* S10: real panel sleep. DSIM0 (0x19080000) sends DCS short writes to the
+	 * panel's driver IC: display off + sleep in after blanking, sleep out +
+	 * display on before the next frame. Register offsets from Samsung's
+	 * exynos9820 dpu20 regs-dsim.h. b2l_fb_panel_sleep=0 keeps blanking only. */
+	IOMemoryMap  *fDsimMap;
+	volatile uint32_t *fDsim;
+	bool          fPanelSleep;      /* DSIM accepted commands at start */
+	bool          fPanelAsleep;
+	bool dsimShortWrite(uint8_t command);
 	thread_call_t fBlankCall, fRestoreCall;
 	bool          fWakeRestore;     /* the shadow may be shown if no frame comes */
 	uint64_t      fWakeCopies;      /* fPerfCopies when the display came on */
@@ -305,6 +323,21 @@ AppleCLCD::start(IOService *provider)
 	OSSafeReleaseNULL(regs);
 	fDecon = fDeconMap ? (volatile uint32_t *)fDeconMap->getVirtualAddress() : NULL;
 	fDma = fDmaMap ? (volatile uint32_t *)fDmaMap->getVirtualAddress() : NULL;
+	/* S10: DSIM0 for panel sleep. Only used when it looks like the boot chain
+	 * left it: command mode, packet header FIFO empty, no all-ones reads. */
+	int panelSleep = 1;
+	PE_parse_boot_argn("b2l_fb_panel_sleep", &panelSleep, sizeof(panelSleep));
+	regs = panelSleep && fBlankCall != NULL ?
+	    IOMemoryDescriptor::withPhysicalAddress(B2L_DSIM_BASE, B2L_DSIM_BYTES, kIODirectionInOut) : NULL;
+	fDsimMap = regs ? regs->map(kIOMapInhibitCache) : NULL;
+	OSSafeReleaseNULL(regs);
+	fDsim = fDsimMap ? (volatile uint32_t *)fDsimMap->getVirtualAddress() : NULL;
+	if (fDsim != NULL) {
+		uint32_t status1 = fDsim[B2L_DSIM_LINK_STATUS1 / 4], fifo = fDsim[B2L_DSIM_FIFOCTRL / 4];
+		fPanelSleep = status1 != UINT32_MAX && fifo != UINT32_MAX && (fifo & B2L_DSIM_FIFO_EMPTY_PH);
+		IOLog("B2L FB: DSIM link_status1=0x%x (cmd mode %u) fifoctrl=0x%x: panel sleep %s\n", status1,
+		    (status1 >> 26) & 1, fifo, fPanelSleep ? "on" : "off");
+	}
 	int scanout = 1;
 	PE_parse_boot_argn("b2l_scanout", &scanout, sizeof(scanout));
 	fScanout = scanout && fDecon != NULL && fDma != NULL;
@@ -586,6 +619,27 @@ AppleCLCD::blankWorker(thread_call_param_t owner, thread_call_param_t unused __u
 	((AppleCLCD *)owner)->applyBlank();
 }
 
+/*
+ * One DCS short write without a parameter (data type 0x05): clear the header
+ * FIFO empty flag, queue the header, wait up to 50 ms for the FIFO to drain.
+ * As Samsung's dsim_write_data for MIPI_DSI_DCS_SHORT_WRITE.
+ */
+bool
+AppleCLCD::dsimShortWrite(uint8_t command)
+{
+	if (fDsim == NULL || !fPanelSleep) return false;
+	uint32_t fifo = fDsim[B2L_DSIM_FIFOCTRL / 4];
+	if (fifo == UINT32_MAX || !(fifo & B2L_DSIM_FIFO_EMPTY_PH)) return false;
+	fDsim[B2L_DSIM_INTSRC / 4] = B2L_DSIM_INT_PH_FIFO_EMPTY;
+	fDsim[B2L_DSIM_PKTHDR / 4] = 0x05u | ((uint32_t)command << 8);
+	__asm__ volatile("dsb sy":::"memory");
+	for (unsigned i = 0; i < 500; i++) {
+		if (fDsim[B2L_DSIM_FIFOCTRL / 4] & B2L_DSIM_FIFO_EMPTY_PH) return true;
+		IODelay(100);
+	}
+	return false;
+}
+
 void
 AppleCLCD::applyBlank(void)
 {
@@ -615,6 +669,31 @@ AppleCLCD::applyBlank(void)
 	__asm__ volatile("dsb sy":::"memory");
 	uint64_t ns = 0;
 	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+	/* S10: put the panel to sleep once the black frame went out (three
+	 * frames), and wake it before iOS's next frame. Sleep out needs 120 ms
+	 * before display on. A command that does not drain leaves blanking only. */
+	const char *panel = NULL;
+	if (off && fPanelSleep && !fPanelAsleep) {
+		IOSleep(50);
+		bool shown = dsimShortWrite(0x28);      /* display off */
+		IOSleep(20);
+		bool slept = shown && dsimShortWrite(0x10); /* sleep in */
+		IOSleep(120);
+		/* Once display off went out, waking must send display on. */
+		fPanelAsleep = shown;
+		panel = slept ? "asleep" : shown ? "display off, sleep in FAILED" : "sleep FAILED, blanked only";
+	} else if (!off && fPanelAsleep) {
+		bool done = false;
+		for (unsigned attempt = 0; attempt < 3 && !done; attempt++) {
+			bool out = dsimShortWrite(0x11);    /* sleep out (harmless if awake) */
+			IOSleep(120);
+			done = dsimShortWrite(0x29) && out; /* display on */
+			if (!done) IOSleep(20);
+		}
+		fPanelAsleep = false;
+		panel = done ? "awake again" : "wake FAILED";
+	}
+	if (panel != NULL) b2l_diag_record("B2L FB: panel %s\n", panel);
 
 	IOLockLock(fLock);
 	if (!off) {
