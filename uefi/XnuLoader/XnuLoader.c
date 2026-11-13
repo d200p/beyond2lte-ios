@@ -414,7 +414,7 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * fallback status bar. 1200 wide removed the App Library
                  * stripes but not those in Settings and Maps. */
                 "b2l_fb_render_width=1179 b2l_fb_render_height=2556 "
-                "b2l_wifi_diag=5 "
+                "b2l_wifi_diag=6 "
                 /* S10: the per-syscall/IPC boundary diagnostics are off in
                  * the working system. With b2l_diag=1 every system call of
                  * backboardd, SpringBoard and Settings went through them, and

@@ -170,7 +170,7 @@ Look for all three results: `Gen1 link up`, `Gen1 quiesce verified`, and
 
 ## Read-only endpoint identity
 
-The userspace loader now selects `b2l_wifi_diag=5`. It repeats the verified
+Mode 5 repeats the verified
 Gen1 sequence, then reads only CFG0 words at offsets `0x00`, `0x04`, `0x08`
 and `0x2c` for bus 1/device 0/function 0. These contain vendor/device IDs,
 command/status, PCI class/revision and subsystem IDs. The physical outcome
@@ -217,6 +217,33 @@ bytes are retained. Cleanup failure is explicit, contributes to the Gen1
 quiescence failure result, and does not suppress the common PHY/power cleanup.
 Require `endpoint identity verified`, `endpoint probe end: stage=complete
 cleanup=verified`, `Gen1 quiesce verified` and `power probe restore verified`.
+
+Boot 28 on the S10 (beyond1lte, 2026-11-12) verified mode 5: endpoint
+`14e4:4475`, subsystem `14e4:4375`, PCI revision 5, class `0x28000`, with
+`endpoint probe end: stage=complete cleanup=verified`, `Gen1 quiesce
+verified` and `power probe restore verified`.
+
+## BAR0 and chip ID
+
+`b2l_wifi_diag=6` (the userspace loader's choice from the S10 build of
+2026-11-13) runs mode 5 and, only after a verified identity with ATU1/CFG0
+still enabled, makes the first endpoint writes:
+
+1. Size BAR0 (write all ones, read, restore) with memory decoding off.
+2. Place BAR0 at `0x14000000`, the bottom of PCIe0's memory aperture (live
+   DT `ranges`: PCI = CPU `0x14000000`, `0xff0000` bytes); clear the upper
+   half of a 64-bit BAR.
+3. Root memory base/limit (DBI `0x20`) = `0x14001400`: forward
+   `0x14000000..0x140fffff`.
+4. Outbound ATU2, memory type, `0x14000000..0x14003fff` to PCI
+   `0x14000000`, accepted only from an inactive zero control word.
+5. Endpoint command: memory space enable only; bus mastering stays off.
+6. Read config `0x80` (Broadcom BAR0 window) and ChipCommon's chip ID and
+   capabilities at BAR0 `+0` and `+4`; success requires chip `0x4375`.
+
+Every step is undone before mode 5's own cleanup: command, ATU2, viewport
+back to ATU1, root window, BAR0. No DMA mapping, firmware, interrupt or
+network service. The host tests do not simulate mode 6 yet.
 
 ## Recovery evidence
 
