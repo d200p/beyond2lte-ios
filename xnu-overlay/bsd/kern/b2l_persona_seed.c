@@ -270,6 +270,22 @@ static void b2l_mg_before_init(vfs_context_t ctx)
     printf("B2L MG: MobileGestalt cache refresh error=%d sync=%d (0 moved aside, %d already done, %d no cache)\n",
         error,sync,EEXIST,ENOENT);
 }
+/*
+ * S10: TextInput's key image cache (TIImageCache) lives in
+ * ~mobile/Library/Caches/com.apple.keyboards/images/, which this root never
+ * had. Without it every key image is drawn again on every press: in boot 30
+ * Notes kept a whole core busy in TIImageCacheClient and UIKit image lookups
+ * while typing 3 or 4 letters a minute. Created once, mobile-owned; an
+ * existing directory is left alone.
+ */
+static void b2l_keyboard_cache_before_init(vfs_context_t ctx)
+{
+    static const char base[]="/private/var/mobile/Library/Caches/com.apple.keyboards";
+    static const char images[]="/private/var/mobile/Library/Caches/com.apple.keyboards/images";
+    int error=ax_directory(base,501,501,0755,ctx);
+    if(!error)error=ax_directory(images,501,501,0755,ctx);
+    printf("B2L KEYBOARD: key image cache directory error=%d\n",error);
+}
 #endif
 #ifndef B2L_PERSONA_HOST_TEST
 extern void b2l_acpm_dvfs_start(void);
@@ -285,6 +301,7 @@ void b2l_persona_before_init(void)
        !strcmp(vfs_statfs(vnode_mount(rootvnode))->f_fstypename,"hfs")){
         b2l_accessibility_before_init(vfs_context_current());
         b2l_mg_before_init(vfs_context_current());
+        b2l_keyboard_cache_before_init(vfs_context_current());
     }
 #endif
     if(!b2l_amfi_active()||!rootvnode||vfs_isrdonly(vnode_mount(rootvnode))||
