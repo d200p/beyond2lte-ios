@@ -24,6 +24,7 @@
 extern "C" void b2l_hid_set_display_inset(uint32_t inset_rows, uint32_t panel_rows);
 extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 /* S10 port: B2LMali draws the scaled frame onto the panel (see runCopy). */
+extern "C" void b2l_mif_for_display(int on);
 extern "C" int b2l_mali_present_scaled(uint32_t source_id, uint32_t panel_id, uint32_t width, uint32_t height,
     uint64_t *gpu_ns);
 
@@ -651,7 +652,14 @@ AppleCLCD::applyBlank(void)
 	 * shadow. Display on = sleep out, 120 ms, display on: the panel holds black
 	 * until iOS's next frame, so the frame from before off never shows.
 	 * Without DSIM this is plain blanking, as before.
+	 *
+	 * The memory clock changes only while the panel sleeps (no TE, so DECON
+	 * reads nothing): raised here before anything reaches the panel again,
+	 * lowered once it has gone to sleep. Changed under a running panel it
+	 * left striped bars until reboot: boots 33, 34 and 35 each got them on the
+	 * wake where the panel came back before the memory clock rose.
 	 */
+	if (!off) b2l_mif_for_display(1);
 	if (off && fPanelSleep && !fPanelAsleep) {
 		fPanelAsleep = dsimShortWrite(0x28);            /* display off */
 		if (!fPanelAsleep) b2l_diag_record("B2L FB: DCS display off FAILED, blanking only\n");
@@ -698,6 +706,7 @@ AppleCLCD::applyBlank(void)
 		bool slept = dsimShortWrite(0x10);              /* sleep in */
 		IOSleep(120);
 		b2l_diag_record("B2L FB: DCS sleep in %s\n", slept ? "sent" : "FAILED");
+		if (slept) b2l_mif_for_display(0);
 	}
 	uint64_t ns = 0;
 	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);

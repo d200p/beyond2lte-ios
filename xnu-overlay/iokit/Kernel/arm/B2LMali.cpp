@@ -232,6 +232,10 @@ class B2LMali : public IOService {
 	void busyDump(unsigned second);
 	bool setCluster(unsigned cluster, uint32_t khz);
 	void memoryClock();
+	uint32_t mifKHz;                /* the last memory clock asked for, 0 unknown */
+public:
+	void displayMemory(bool on);
+private:
 	void clusterBoost();
 	void acpmStart();
 	void gpuClock(bool busy);
@@ -941,6 +945,9 @@ B2LMali::memoryClock()
 	IOSleep(B2L_GPU_LOG_DRAIN_MS);
 	IOLockLock(runtimeLock);
 	int answered = acpmReady && b2l_acpm_set_rate(&acpm, &acpmDvfs, B2L_DVFS_MIF, (uint32_t)khz);
+	if (answered) {
+		mifKHz = (uint32_t)khz;
+	}
 	IOLockUnlock(runtimeLock);
 	uint64_t after = b2l_copy_bandwidth(from, to);
 	b2l_diag_record("B2L ACPM: mif reply=%d, copy %llu MB/s after\n", answered, after >> 20);
@@ -1030,18 +1037,8 @@ B2LMali::clusterBoost()
 			b2l_diag_record("B2L ACPM: display %s, CPUs %s\n", standby ? "off" : "on",
 			    standby ? "at standby clocks, no boost" : "back to load-driven clocks");
 			wasStandby = standby;
-			/* S10: the memory clock too. S-Boot leaves it at its top rate and
-			 * nothing lowered it (boot 31 standby: 410-620 mA). 546 MHz is an
-			 * entry of the MIF FVMAP table that boot 32 logged (421..2093). */
-			int mif = B2L_MIF_KHZ;
-			PE_parse_boot_argn("b2l_mif_khz", &mif, sizeof(mif));
-			uint32_t want = standby ? B2L_MIF_STANDBY_KHZ : (uint32_t)mif;
-			if (mif > 0) {
-				IOLockLock(runtimeLock);
-				int answered = acpmReady && b2l_acpm_set_rate(&acpm, &acpmDvfs, B2L_DVFS_MIF, want);
-				IOLockUnlock(runtimeLock);
-				b2l_diag_record("B2L ACPM: memory %u kHz reply=%d\n", want, answered);
-			}
+			/* The memory clock follows the panel itself: displayMemory, called by
+			 * the framebuffer while the panel sleeps. */
 		}
 		for (unsigned i = 0; i < B2L_CPU_CLUSTERS; i++) {
 			uint32_t want = b2l_cpu_clusters[i].boot_khz;
@@ -2000,6 +1997,45 @@ B2LMali::presentScaled(uint32_t source_id, uint32_t panel_id, uint32_t width, ui
 	}
 	IOLockUnlock(runtimeLock);
 	return done;
+}
+
+/*
+ * S10: the memory clock for the display state, from the framebuffer while the
+ * panel sleeps (see AppleCLCD::applyBlank): S-Boot leaves it at its top rate
+ * and nothing lowered it (boot 31 standby: 410-620 mA); 546 MHz is an entry of
+ * the MIF FVMAP table boot 32 logged (421..2093).
+ */
+void
+B2LMali::displayMemory(bool on)
+{
+	int mif = B2L_MIF_KHZ;
+	PE_parse_boot_argn("b2l_mif_khz", &mif, sizeof(mif));
+	if (mif <= 0) {
+		return;
+	}
+	uint32_t want = on ? (uint32_t)mif : B2L_MIF_STANDBY_KHZ;
+	if (runtimeLock == NULL) {
+		return;         /* before start() finished: ACPM is not up either */
+	}
+	IOLockLock(runtimeLock);
+	bool ready = acpmReady && want != mifKHz;
+	int answered = ready && b2l_acpm_set_rate(&acpm, &acpmDvfs, B2L_DVFS_MIF, want);
+	if (answered) {
+		mifKHz = want;
+	}
+	IOLockUnlock(runtimeLock);
+	if (ready) {
+		b2l_diag_record("B2L ACPM: memory %u kHz, panel asleep, reply=%d\n", want, answered);
+	}
+}
+
+extern "C" void
+b2l_mif_for_display(int on)
+{
+	B2LMali *mali = gB2LMaliPresent;
+	if (mali != NULL) {
+		mali->displayMemory(on != 0);
+	}
 }
 
 extern "C" int
