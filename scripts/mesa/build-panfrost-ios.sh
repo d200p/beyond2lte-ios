@@ -78,7 +78,7 @@ cp "$repo/scripts/mesa/b2l-target/meson.build" "$repo/scripts/mesa/b2l-target/b2
 grep -q "targets/b2l" "$src/src/gallium/meson.build" || printf "\nsubdir('targets/b2l')\n" >> "$src/src/gallium/meson.build"
 meson setup "$build/out" "$src" --cross-file "$cross" --buildtype=release \
   --default-library=static "${args[@]}" 2>&1 | tee "$build/configure.log"
-ninja -C "$build/out" -k 0 2>&1 | tee "$build/build.log"
+ninja -C "$build/out" -k 0 2>&1 | tee "$build/build.log" || true
 # The library, stripped of local symbols and ad-hoc signed like b2l-gpu.dylib.
 lib="$build/out/src/gallium/targets/b2l/libb2l-mesa.dylib"
 mkdir -p "$build/b2l-mesa"

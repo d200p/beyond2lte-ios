@@ -13,7 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#include "main/glheader.h"
+#include "util/glheader.h"
 #include "state_tracker/st_context.h"
 #include "frontend/api.h"
 #include "pipe/p_context.h"
