@@ -74,6 +74,10 @@ enum {
 #define B2L_DSIM_PKTHDR               0x58
 #define B2L_DSIM_FIFOCTRL             0x68
 #define B2L_DSIM_FIFO_EMPTY_PH        (1u << 10)
+/* DECON_F frame triggers and state (Samsung exynos9820 dpu20 regs-decon.h). */
+#define B2L_DECON_GLOBAL_IDLE         (1u << 5)       /* GLOBAL_CONTROL: between frames */
+#define B2L_DECON_TRIG_CONTROL        0x70            /* HW_SW_TRIG_CONTROL */
+#define B2L_DECON_TRIG_MASK           (1u << 4)       /* HW_TRIG_MASK_DECON: TE ignored */
 #define B2L_FB_FORMAT_BGRA            0x42475241
 /* Rows kept black above iOS for the S10+ front-camera hole (top right). 136
  * leaves 1440x2904, exactly 480x968 points at 3x, and keeps every row start
@@ -183,6 +187,9 @@ public:
 	unsigned      fWatchEvents;
 	uint32_t watchRead(unsigned i);
 	void panelWatch(const char *when);
+	/* S10: no frame transfer while the panel gets commands (b2l_fb_hold). */
+	bool          fHoldFrames;
+	bool holdFrames(bool hold);
 	thread_call_t fBlankCall, fRestoreCall;
 	bool          fWakeRestore;     /* the shadow may be shown if no frame comes */
 	uint64_t      fWakeCopies;      /* fPerfCopies when the display came on */
@@ -349,6 +356,9 @@ AppleCLCD::start(IOService *provider)
 		    (status1 >> 26) & 1, fifo, fPanelSleep ? "on" : "off");
 	}
 	panelWatch("at start");
+	int hold = 1;
+	PE_parse_boot_argn("b2l_fb_hold", &hold, sizeof(hold));
+	fHoldFrames = hold == 1 && fDecon != NULL;
 	int scanout = 1;
 	PE_parse_boot_argn("b2l_scanout", &scanout, sizeof(scanout));
 	fScanout = scanout && fDecon != NULL && fDma != NULL;
@@ -698,6 +708,35 @@ AppleCLCD::panelWatch(const char *when)
 	b2l_diag_record("B2L PANEL %s:%s%s\n", when, n ? line : "", shown ? "" : " as at boot");
 }
 
+/*
+ * S10: Samsung's driver stops DECON's frame triggers and waits for it to go
+ * idle before it talks to the panel; boots 33-37 sent DCS commands whenever,
+ * in the middle of a frame transfer as often as not (the register watch saw
+ * DECON busy at random points), and every wake from then on left stripes.
+ * Holding masks the TE trigger and waits up to 50 ms for the frame in flight
+ * to end; releasing unmasks it. Returns whether DECON was idle.
+ */
+bool
+AppleCLCD::holdFrames(bool hold)
+{
+	if (!fHoldFrames) {
+		return false;
+	}
+	uint32_t trig = fDecon[B2L_DECON_TRIG_CONTROL / 4];
+	if (!hold) {
+		fDecon[B2L_DECON_TRIG_CONTROL / 4] = trig & ~B2L_DECON_TRIG_MASK;
+		return true;
+	}
+	fDecon[B2L_DECON_TRIG_CONTROL / 4] = trig | B2L_DECON_TRIG_MASK;
+	for (unsigned i = 0; i < 100; i++) {
+		if (fDecon[0] & B2L_DECON_GLOBAL_IDLE) {
+			return true;
+		}
+		IODelay(500);
+	}
+	return false;
+}
+
 void
 AppleCLCD::applyBlank(void)
 {
@@ -718,10 +757,10 @@ AppleCLCD::applyBlank(void)
 	 */
 	panelWatch(off ? "before off" : "before on");
 	if (!off) b2l_mif_for_display(1);
-	if (off && fPanelSleep && !fPanelAsleep) {
-		fPanelAsleep = dsimShortWrite(0x28);            /* display off */
-		if (!fPanelAsleep) b2l_diag_record("B2L FB: DCS display off FAILED, blanking only\n");
-	}
+	/* Build 37: the black goes out with the frames still running; then the
+	 * frames are held and the panel gets display off + sleep in. On wake it
+	 * gets sleep out + display on, still held, and only then frames resume. */
+	bool sleepPanel = off && fPanelSleep && !fPanelAsleep;
 	auto light = [this]() {
 		if (!fPanelAsleep) return;
 		bool done = false;
@@ -732,7 +771,9 @@ AppleCLCD::applyBlank(void)
 			if (!done) IOSleep(20);
 		}
 		fPanelAsleep = false;
-		b2l_diag_record("B2L FB: DCS sleep out + display on %s\n", done ? "sent" : "FAILED");
+		bool held = holdFrames(false);
+		b2l_diag_record("B2L FB: DCS sleep out + display on %s, frames %s\n", done ? "sent" : "FAILED",
+		    held ? "released" : "never held");
 		panelWatch("lit");
 	};
 
@@ -760,11 +801,18 @@ AppleCLCD::applyBlank(void)
 		}
 	}
 	__asm__ volatile("dsb sy":::"memory");
-	if (off && fPanelAsleep) {
+	if (sleepPanel) {
 		IOSleep(50);                                    /* the black frame reaches the panel */
-		bool slept = dsimShortWrite(0x10);              /* sleep in */
+		bool idle = holdFrames(true);
+		bool dark = dsimShortWrite(0x28);               /* display off */
+		bool slept = dark && dsimShortWrite(0x10);      /* sleep in */
 		IOSleep(120);
-		b2l_diag_record("B2L FB: DCS sleep in %s\n", slept ? "sent" : "FAILED");
+		fPanelAsleep = dark;
+		if (!dark) {
+			holdFrames(false);
+		}
+		b2l_diag_record("B2L FB: DCS display off %s, sleep in %s, DECON %s\n", dark ? "sent" : "FAILED",
+		    slept ? "sent" : "FAILED", !fHoldFrames ? "not held" : idle ? "held idle" : "held, still busy after 50 ms");
 		panelWatch("asleep");
 		if (slept) b2l_mif_for_display(0);
 	}
