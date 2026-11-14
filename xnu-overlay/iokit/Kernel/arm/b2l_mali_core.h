@@ -113,6 +113,9 @@
 #define B2L_MALI_AS_CMD_UPDATE     1u
 #define B2L_MALI_AS_CMD_LOCK       2u
 #define B2L_MALI_AS_CMD_FLUSH_PT   4u
+#define B2L_MALI_AS_CMD_FLUSH_MEM  5u
+#define B2L_MALI_CMD_CLEAN_INV_CACHES 0x08
+#define B2L_MALI_IRQ_CLEAN_CACHES_DONE (1u << 17)
 #define B2L_MALI_AS_ACTIVE         1u
 /* AArch64 4 KiB walks, cached page-table reads with read-allocate. */
 #define B2L_MALI_AS_TRANSCFG       (6ull | (2ull << 24) | (1ull << 30))
@@ -394,6 +397,30 @@ b2l_mali_flush_region(const struct b2l_mali_io *io, uint64_t va, unsigned log2_b
 	}
 	b2l_mali_w(io, B2L_MALI_AS0 + B2L_MALI_AS_COMMAND, B2L_MALI_AS_CMD_FLUSH_PT);
 	return b2l_mali_wait(io, B2L_MALI_AS0 + B2L_MALI_AS_STATUS, B2L_MALI_AS_ACTIVE, 0, 100000);
+}
+
+/*
+ * Clean and invalidate all GPU caches (GPU_COMMAND CLEAN_INV_CACHES), then
+ * drop every TLB entry of address space 0 with FLUSH_MEM over the region
+ * 2^log2_bytes from 0. The GPU must be idle. Returns 1 when both finished.
+ */
+static inline int
+b2l_mali_flush_everything(const struct b2l_mali_io *io, unsigned log2_bytes)
+{
+	b2l_mali_w(io, B2L_MALI_GPU_IRQ_CLEAR, B2L_MALI_IRQ_CLEAN_CACHES_DONE);
+	b2l_mali_w(io, B2L_MALI_GPU_COMMAND, B2L_MALI_CMD_CLEAN_INV_CACHES);
+	int cleaned = b2l_mali_wait(io, B2L_MALI_GPU_IRQ_RAWSTAT, B2L_MALI_IRQ_CLEAN_CACHES_DONE,
+	    B2L_MALI_IRQ_CLEAN_CACHES_DONE, 100000);
+	b2l_mali_w(io, B2L_MALI_GPU_IRQ_CLEAR, B2L_MALI_IRQ_CLEAN_CACHES_DONE);
+	uint64_t lock = (uint64_t)(log2_bytes - 1);
+	b2l_mali_w(io, B2L_MALI_AS0 + B2L_MALI_AS_LOCKADDR_LO, (uint32_t)lock);
+	b2l_mali_w(io, B2L_MALI_AS0 + B2L_MALI_AS_LOCKADDR_HI, (uint32_t)(lock >> 32));
+	b2l_mali_w(io, B2L_MALI_AS0 + B2L_MALI_AS_COMMAND, B2L_MALI_AS_CMD_LOCK);
+	if (!b2l_mali_wait(io, B2L_MALI_AS0 + B2L_MALI_AS_STATUS, B2L_MALI_AS_ACTIVE, 0, 100000)) {
+		return 0;
+	}
+	b2l_mali_w(io, B2L_MALI_AS0 + B2L_MALI_AS_COMMAND, B2L_MALI_AS_CMD_FLUSH_MEM);
+	return cleaned && b2l_mali_wait(io, B2L_MALI_AS0 + B2L_MALI_AS_STATUS, B2L_MALI_AS_ACTIVE, 0, 100000);
 }
 
 /*

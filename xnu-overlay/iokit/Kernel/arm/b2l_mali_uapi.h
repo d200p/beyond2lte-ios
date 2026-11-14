@@ -40,6 +40,9 @@ enum {
 #define B2L_MALI_BO_HEAP_RESIDENT (32u << 20)
 #define B2L_MALI_MAX_BOS        8192
 #define B2L_MALI_REQ_FS         1u      /* = PANFROST_JD_REQ_FS: fragment slot */
+/* S10 port, experiment: clean and invalidate every GPU cache and drop the
+ * whole TLB before the chain (libdrm sets it when B2L_DRM_FLUSH is set). */
+#define B2L_MALI_REQ_FLUSH      2u
 
 #define B2L_MALI_BUFFER_CODE    1u      /* executable by the GPU */
 #define B2L_MALI_MAX_LOG        256

@@ -1816,12 +1816,20 @@ B2LMali::boMemory(void *owner, uint32_t handle)
 IOReturn
 B2LMali::jobSubmit(uint64_t jc, uint64_t requirements, uint64_t *out)
 {
-	if (jc == 0 || (requirements & ~(uint64_t)B2L_MALI_REQ_FS)) {
+	if (jc == 0 || (requirements & ~(uint64_t)(B2L_MALI_REQ_FS | B2L_MALI_REQ_FLUSH))) {
 		return kIOReturnBadArgument;
 	}
 	__asm__ volatile("dsb sy" ::: "memory");        /* the client's write-combined stores */
 	if (!coresUp()) {
 		return kIOReturnNotReady;
+	}
+	if (requirements & B2L_MALI_REQ_FLUSH) {
+		static unsigned flushNotes;
+		int flushed = b2l_mali_flush_everything(&io, B2L_MALI_VA_LOG2);
+		if (flushNotes++ < 4 || !flushed) {
+			b2l_diag_record("B2L GPU BO: caches cleaned and TLB dropped before job 0x%llx: %s\n", jc,
+			    flushed ? "done" : "TIMED OUT");
+		}
 	}
 	checkTemperature();
 	unsigned slot = (requirements & B2L_MALI_REQ_FS) ? B2L_MALI_SLOT_FRAGMENT : B2L_MALI_SLOT_TILER;

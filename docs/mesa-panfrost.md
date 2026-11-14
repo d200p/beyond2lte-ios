@@ -44,6 +44,17 @@ runs the plain case once more with `PAN_MESA_DEBUG=trace`: every job chain
 decoded by pandecode to `/private/var/tmp/b2l-pandecode.ctx-*`, read from
 TWRP with `tools/hfs_adb.py`, to compare a lost draw with a right one.
 
+Boot 41 trace: the trace run fails exactly like the others (so not a race
+with submission). A lost triangle and a right one have identical
+descriptors (tiler heap, tiler context, framebuffer, attributes) and
+identical shader code; only addresses differ. With AFBC the clear itself is
+right (clear colour 0xffbf8040 in the render target descriptor); what is
+lost is the draw of Mesa's readback blit, whose linear target stays 0. So
+some draws run on memory the GPU does not see as the CPU wrote it. Boot 42
+compares in one boot: plain, plain with every GPU cache cleaned and the
+whole TLB dropped before each job (`B2L_MALI_REQ_FLUSH`), Mesa's buffer
+cache off (`nocache`), and noafbc with the flush.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer

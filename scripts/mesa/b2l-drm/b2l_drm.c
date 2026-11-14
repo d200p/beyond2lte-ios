@@ -796,6 +796,11 @@ submit(struct drm_panfrost_submit *args)
 		return fail(ENOENT);
 	}
 	uint64_t in[2] = { args->jc, args->requirements & PANFROST_JD_REQ_FS ? B2L_MALI_REQ_FS : 0 };
+	/* Experiment (boot 42): the kernel cleans every GPU cache and drops the TLB first. */
+	const char *flush = getenv("B2L_DRM_FLUSH");
+	if (flush != NULL && flush[0] == '1') {
+		in[1] |= B2L_MALI_REQ_FLUSH;
+	}
 	uint64_t out[2] = { 0, 0 };
 	uint32_t count = 2;
 	kern_return_t kr = IOConnectCallMethod(drm.connection, kB2LMaliJobSubmit, in, 2, NULL, 0, out, &count, NULL,

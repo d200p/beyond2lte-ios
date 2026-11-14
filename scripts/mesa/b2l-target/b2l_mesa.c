@@ -348,10 +348,16 @@ probe_target(struct pipe_frontend_screen *fscreen, struct st_context *st, const 
  * layout ones). Everything is released afterwards.
  */
 static int
-probe_variant(const char *flags)
+probe_variant(const char *flags, int flush)
 {
-	const char *name = flags[0] ? flags : "plain";
+	char name[48];
+	snprintf(name, sizeof(name), "%s%s", flags[0] ? flags : "plain", flush ? "+flush" : "");
 	setenv("PAN_MESA_DEBUG", flags, 1);
+	if (flush) {
+		setenv("B2L_DRM_FLUSH", "1", 1);
+	} else {
+		unsetenv("B2L_DRM_FLUSH");
+	}
 	int fd = b2l_drm_open();
 	if (fd < 0) {
 		return 0;
@@ -404,7 +410,7 @@ probe_variant(const char *flags)
  * <base>.ctx-<context>.<frame>, read off the phone from TWRP. */
 #define B2L_PANDECODE_BASE "/private/var/tmp/b2l-pandecode"
 
-static void
+static void __attribute__((unused))
 trace_files_note(void)
 {
 	unsigned files = 0;
@@ -424,29 +430,34 @@ trace_files_note(void)
 }
 
 /*
- * The Mesa run on the phone. Boot 39: CRC on or off made no difference, and
- * the whole-space TLB flush none either. Plain (AFBC) loses the clear colour
- * (reads back 0) but draws the triangle; noafbc keeps the clear but loses the
- * first triangle of the context; every later linear target is right. The
- * trace run repeats plain with every job chain decoded to a file (and each
- * submit waited for), to compare a lost draw with a right one.
+ * The Mesa run on the phone. Boot 41's pandecode trace: a lost draw and a
+ * right one have identical descriptors and identical shader code, only other
+ * addresses; the AFBC "clear read back as 0" is the readback blit's draw
+ * being lost, not the clear. So some draws run on memory the GPU does not see
+ * as the CPU wrote it. Boot 42 compares, in one boot: plain; plain with every
+ * GPU cache cleaned and the whole TLB dropped before each job (B2L_DRM_FLUSH,
+ * B2L_MALI_REQ_FLUSH); Mesa's buffer cache off (nocache, every buffer fresh
+ * from the kernel); noafbc with the flush.
  * Returns a bit per variant that came out right.
  */
 B2L_EXPORT int
 b2l_mesa_probe(void)
 {
-	static const char *const variants[] = { "", "noafbc", "trace" };
+	static const struct { const char *flags; int flush; } variants[] = {
+		{ "", 0 }, { "", 1 }, { "nocache", 0 }, { "noafbc", 1 },
+	};
 	uint64_t start = now_us();
 	int passed = 0;
 	setenv("PANDECODE_DUMP_FILE", B2L_PANDECODE_BASE, 1);
 	for (unsigned i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
-		if (probe_variant(variants[i])) {
+		if (probe_variant(variants[i].flags, variants[i].flush)) {
 			passed |= 1 << i;
 		}
 	}
 	unsetenv("PAN_MESA_DEBUG");
-	trace_files_note();
-	b2l_drm_note("mesa: probe done in %llu ms, right: plain %d noafbc %d trace %d",
-	    (unsigned long long)((now_us() - start) / 1000), passed & 1, (passed >> 1) & 1, (passed >> 2) & 1);
+	unsetenv("B2L_DRM_FLUSH");
+	b2l_drm_note("mesa: probe done in %llu ms, right: plain %d plain+flush %d nocache %d noafbc+flush %d",
+	    (unsigned long long)((now_us() - start) / 1000), passed & 1, (passed >> 1) & 1, (passed >> 2) & 1,
+	    (passed >> 3) & 1);
 	return passed;
 }
