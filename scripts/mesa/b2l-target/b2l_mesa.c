@@ -356,15 +356,15 @@ probe_target(struct pipe_frontend_screen *fscreen, struct st_context *st, const 
  * layout ones). Everything is released afterwards.
  */
 static int
-probe_variant(const char *flags, int flush, const char *dump, int noidvs)
+probe_variant(const char *flags, int flush, const char *dump, int idvs)
 {
 	char name[48];
 	snprintf(name, sizeof(name), "%s%s%s", flags[0] ? flags : "plain", flush ? "+flush" : "",
-	    noidvs ? "+noidvs" : "");
-	if (noidvs) {
-		setenv("B2L_NOIDVS", "1", 1);
+	    idvs ? "+idvs" : "");
+	if (idvs) {
+		setenv("B2L_IDVS", "1", 1);
 	} else {
-		unsetenv("B2L_NOIDVS");
+		unsetenv("B2L_IDVS");
 	}
 	setenv("PAN_MESA_DEBUG", flags, 1);
 	if (flush) {
@@ -462,30 +462,29 @@ trace_files_note(void)
 B2L_EXPORT int
 b2l_mesa_probe(void)
 {
-	/* Boot 43 (build 42's dump and redraws): every IDVS draw tiles the
-	 * positions its position shader found in memory before it ran (zeros at
-	 * first, the previous draw's after; a redraw of a lost triangle comes out
-	 * right, or as the previous full-screen blit). Boot 44: plain with IDVS,
-	 * then plain and noafbc with IDVS off (B2L_NOIDVS, patch_pan_shader_idvs.py:
-	 * separate vertex and tiler jobs). No disk shader cache, so every shader
-	 * is compiled here. */
-	static const struct { const char *flags; int flush; const char *dump; int noidvs; } variants[] = {
-		{ "", 0, NULL, 0 }, { "", 0, NULL, 1 }, { "noafbc", 0, NULL, 1 },
+	/* Boot 43 (build 42's dump and redraws): every IDVS draw tiled the
+	 * positions its position shader found in memory before it ran. Boot 44:
+	 * with IDVS off (separate vertex and tiler jobs) every target came out
+	 * right, with AFBC and without; it is now off unless B2L_IDVS is set
+	 * (patch_pan_shader_idvs.py). The probe keeps checking both layouts at
+	 * each boot. No disk shader cache, so every shader is compiled here. */
+	static const struct { const char *flags; int flush; const char *dump; int idvs; } variants[] = {
+		{ "", 0, NULL, 0 }, { "noafbc", 0, NULL, 0 },
 	};
 	uint64_t start = now_us();
 	int passed = 0;
 	setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
 	setenv("PANDECODE_DUMP_FILE", B2L_PANDECODE_BASE, 1);
 	for (unsigned i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
-		if (probe_variant(variants[i].flags, variants[i].flush, variants[i].dump, variants[i].noidvs)) {
+		if (probe_variant(variants[i].flags, variants[i].flush, variants[i].dump, variants[i].idvs)) {
 			passed |= 1 << i;
 		}
 	}
 	unsetenv("PAN_MESA_DEBUG");
 	unsetenv("B2L_DRM_FLUSH");
 	unsetenv("B2L_DRM_DUMP");
-	unsetenv("B2L_NOIDVS");
-	b2l_drm_note("mesa: probe done in %llu ms, right: plain %d plain+noidvs %d noafbc+noidvs %d",
-	    (unsigned long long)((now_us() - start) / 1000), passed & 1, (passed >> 1) & 1, (passed >> 2) & 1);
+	unsetenv("B2L_IDVS");
+	b2l_drm_note("mesa: probe done in %llu ms, right: plain %d noafbc %d",
+	    (unsigned long long)((now_us() - start) / 1000), passed & 1, (passed >> 1) & 1);
 	return passed;
 }

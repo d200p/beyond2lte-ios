@@ -69,7 +69,7 @@ echo '--- libdrm calls'; cat "$build/libdrm-calls.txt"; echo '--- DRM ioctls'; c
 # os_mmap/os_munmap (src/util/os_mman.h) go to b2l_drm_mmap/b2l_drm_munmap,
 # which fall back to mmap/munmap for any other descriptor.
 python3 "$repo/scripts/mesa/b2l-drm/patch_os_mman.py" "$src/src/util/os_mman.h"
-# IDVS can be switched off per compile (B2L_NOIDVS): see the script.
+# No IDVS on this GPU (B2L_IDVS=1 brings it back): see the script.
 python3 "$repo/scripts/mesa/b2l-drm/patch_pan_shader_idvs.py" "$src/src/gallium/drivers/panfrost/pan_shader.c"
 # Our target, built by Mesa's own meson like the OSMesa one.
 target="$src/src/gallium/targets/b2l"

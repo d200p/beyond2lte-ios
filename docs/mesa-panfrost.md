@@ -76,6 +76,15 @@ plain with IDVS against plain and noafbc with IDVS off (`B2L_NOIDVS`,
 jobs), and logs JM_CONFIG (IDVS group size), SHADER_CONFIG and TILER_CONFIG
 at the first job.
 
+Boot 44: with IDVS off every probe target is right, with AFBC and without
+(clears, triangles, linear targets, readback blits); with IDVS the same
+losses as before. JM_CONFIG read 0xf0000 (IDVS group size 0xf, as the
+Android driver sets it), SHADER_CONFIG 0x20000 (TLS hashing), TILER_CONFIG
+0: the configuration is not at fault, IDVS just does not work on this
+G76 r0p0. Our Mesa now compiles vertex shaders without IDVS unless
+`B2L_IDVS` is set. Next: IOSurface import for buffer-object clients, then
+the EAGL layer.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
