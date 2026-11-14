@@ -23,6 +23,8 @@ enum {
 	kB2LMaliBoCreate      = 7,      /* in: bytes, B2L_MALI_BO_*; out: handle, GPU VA */
 	kB2LMaliBoFree        = 8,      /* in: handle */
 	kB2LMaliJobSubmit     = 9,      /* in: job chain VA, B2L_MALI_REQ_*; out: status, ns */
+	kB2LMaliBoImport      = 10,     /* in: IOSurface id; out: handle, GPU VA, bytes,
+	                                 * bytes per row, width, height, pixel format, offset */
 };
 
 #define B2L_MALI_CLIENT_DRAW    0u      /* IOServiceOpen types */

@@ -60,7 +60,15 @@ struct bo {
 	uint32_t flags, maps;
 	uint8_t *cpu;
 	int live;
+	uint32_t surface;               /* imported IOSurface id, 0 for our own */
 };
+
+/* Fds standing for IOSurfaces (b2l_drm_surface_fd), found again by fstat. */
+#define SURFACE_FDS 64
+static struct {
+	pthread_mutex_t lock;
+	struct { int fd; dev_t dev; ino_t ino; uint32_t id; } e[SURFACE_FDS];
+} surface_fds = { .lock = PTHREAD_MUTEX_INITIALIZER };
 
 static struct {
 	pthread_mutex_t lock;
@@ -407,8 +415,11 @@ b2l_drm_mmap(void *addr, size_t length, int prot, int flags, int fd, int64_t off
 		if (bo->cpu == NULL) {
 			mach_vm_address_t address = 0;
 			mach_vm_size_t size = 0;
+			/* An IOSurface keeps its own (cacheable) mode, like every other
+			 * mapping of it; the kernel cleans it around each job. */
+			uint32_t options = bo->surface != 0 ? 0x1u /* kIOMapAnywhere */ : MAP_OPTIONS;
 			if (IOConnectMapMemory64(drm.connection, B2L_MALI_BO_MEMORY(handle), mach_task_self(),
-			    &address, &size, MAP_OPTIONS) == KERN_SUCCESS) {
+			    &address, &size, options) == KERN_SUCCESS) {
 				bo->cpu = (uint8_t *)address;
 			}
 		}
@@ -682,7 +693,56 @@ drmSyncobjFDToHandle(int fd, int obj_fd, uint32_t *handle)
 	SYNC_ENTRY(sync_new(SYNC_SIGNALED, handle));
 }
 
-/* Buffer sharing goes through IOSurfaces in the EAGL layer, not prime fds. */
+/*
+ * Buffer sharing: IOSurfaces come in as "prime" fds made by
+ * b2l_drm_surface_fd (an unlinked sparse file of the surface's size, so
+ * Mesa's lseek finds the size); exporting is not supported.
+ */
+int
+b2l_drm_surface_fd(uint32_t surface_id, uint64_t bytes)
+{
+	char path[] = "/private/var/tmp/b2l-surface-XXXXXX";
+	int fd = mkstemp(path);
+	if (fd < 0) {
+		return -1;
+	}
+	unlink(path);
+	struct stat st;
+	if (ftruncate(fd, (off_t)bytes) != 0 || fstat(fd, &st) != 0) {
+		close(fd);
+		return -1;
+	}
+	pthread_mutex_lock(&surface_fds.lock);
+	unsigned i = 0;
+	while (i < SURFACE_FDS && surface_fds.e[i].id != 0) {
+		i++;
+	}
+	if (i < SURFACE_FDS) {
+		surface_fds.e[i].fd = fd;
+		surface_fds.e[i].dev = st.st_dev;
+		surface_fds.e[i].ino = st.st_ino;
+		surface_fds.e[i].id = surface_id;
+	}
+	pthread_mutex_unlock(&surface_fds.lock);
+	if (i == SURFACE_FDS) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+void
+b2l_drm_surface_fd_close(int fd)
+{
+	pthread_mutex_lock(&surface_fds.lock);
+	for (unsigned i = 0; i < SURFACE_FDS; i++) {
+		if (surface_fds.e[i].id != 0 && surface_fds.e[i].fd == fd) {
+			surface_fds.e[i].id = 0;
+		}
+	}
+	pthread_mutex_unlock(&surface_fds.lock);
+	close(fd);
+}
 
 int
 drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
@@ -697,10 +757,53 @@ drmPrimeHandleToFD(int fd, uint32_t handle, uint32_t flags, int *prime_fd)
 int
 drmPrimeFDToHandle(int fd, int prime_fd, uint32_t *handle)
 {
-	(void)fd;
-	(void)prime_fd;
-	(void)handle;
-	return fail(ENOSYS);
+	struct stat st;
+	uint32_t id = 0;
+	if (!ours(fd) || fstat(prime_fd, &st) != 0) {
+		return fail(EBADF);
+	}
+	pthread_mutex_lock(&surface_fds.lock);
+	for (unsigned i = 0; i < SURFACE_FDS; i++) {
+		if (surface_fds.e[i].id != 0 && surface_fds.e[i].dev == st.st_dev && surface_fds.e[i].ino == st.st_ino) {
+			id = surface_fds.e[i].id;
+		}
+	}
+	pthread_mutex_unlock(&surface_fds.lock);
+	if (id == 0) {
+		return fail(EBADF);
+	}
+	uint64_t in[1] = { id }, out[8] = { 0 };
+	uint32_t count = 8;
+	pthread_mutex_lock(&drm.lock);
+	/* As DRM does for one dma-buf: the same handle while it is open
+	 * (panfrost_bo_import asks twice, then closes it once). */
+	for (uint32_t h = 1; h <= B2L_MALI_MAX_BOS; h++) {
+		if (drm.bos[h].live && drm.bos[h].surface == id) {
+			*handle = h;
+			pthread_mutex_unlock(&drm.lock);
+			return 0;
+		}
+	}
+	kern_return_t kr = IOConnectCallMethod(drm.connection, kB2LMaliBoImport, in, 1, NULL, 0, out, &count, NULL, NULL);
+	if (kr != KERN_SUCCESS || out[0] == 0 || out[0] > B2L_MALI_MAX_BOS) {
+		pthread_mutex_unlock(&drm.lock);
+		b2l_drm_note("libdrm: surface %u import refused kr=0x%x", id, kr);
+		return fail(ENOMEM);
+	}
+	struct bo *bo = &drm.bos[out[0]];
+	memset(bo, 0, sizeof(*bo));
+	bo->va = out[1];
+	bo->size = out[2];
+	bo->flags = PANFROST_BO_NOEXEC;
+	bo->live = 1;
+	bo->surface = id;
+	*handle = (uint32_t)out[0];
+	pthread_mutex_unlock(&drm.lock);
+	b2l_drm_note("libdrm: surface %u (%llux%llu, %llu bytes a row, format %c%c%c%c) is handle %llu at 0x%llx",
+	    id, (unsigned long long)out[4], (unsigned long long)out[5], (unsigned long long)out[3],
+	    (char)(out[6] >> 24), (char)(out[6] >> 16), (char)(out[6] >> 8), (char)out[6],
+	    (unsigned long long)out[0], (unsigned long long)out[1]);
+	return 0;
 }
 
 /* The ioctls. */

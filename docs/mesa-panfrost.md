@@ -82,8 +82,19 @@ losses as before. JM_CONFIG read 0xf0000 (IDVS group size 0xf, as the
 Android driver sets it), SHADER_CONFIG 0x20000 (TLS hashing), TILER_CONFIG
 0: the configuration is not at fault, IDVS just does not work on this
 G76 r0p0. Our Mesa now compiles vertex shaders without IDVS unless
-`B2L_IDVS` is set. Next: IOSurface import for buffer-object clients, then
-the EAGL layer.
+`B2L_IDVS` is set.
+
+Build 44, IOSurface import (piece 4's first half): `kB2LMaliBoImport` maps
+an IOSurface's pages at a fresh buffer-object address and keeps the surface
+until the handle is freed; imported surfaces are cleaned and invalidated in
+the CPU caches around every job, since IOSurface memory is cacheable. In
+libdrm, `b2l_drm_surface_fd(id, bytes)` makes the "dma-buf" Mesa wants (an
+unlinked sparse file whose size lseek finds) and `drmPrimeFDToHandle` turns
+it into that buffer object, returning the same handle while it is open as
+DRM does; CPU mappings of an imported surface keep its cacheable mode. The
+probe draws a clear and the triangle into a 64 x 64 BGRA IOSurface through
+`resource_from_handle` and checks it through `IOSurfaceLock`. Next: the EAGL
+layer.
 
 ## Why
 
