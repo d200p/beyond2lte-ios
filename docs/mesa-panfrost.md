@@ -55,6 +55,15 @@ compares in one boot: plain, plain with every GPU cache cleaned and the
 whole TLB dropped before each job (`B2L_MALI_REQ_FLUSH`), Mesa's buffer
 cache off (`nocache`), and noafbc with the flush.
 
+Boot 42: all four identical, so neither stale GPU caches or TLB entries nor
+buffer reuse explain it. The lost draws are blit 1 (vertices at the very
+start of a fresh 1 MiB upload buffer; blit 2 reads them 128 bytes further on
+and works) and the first linear triangle; blit 1's tiler context is left
+untouched by the GPU (state word 4 stays 0, 1 for every other draw). Boot 43
+dumps every CPU-mapped buffer after each submit (`B2L_DRM_DUMP`, libdrm) in
+a traced plain run, and draws a lost triangle once more to see whether a
+repeat succeeds.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer

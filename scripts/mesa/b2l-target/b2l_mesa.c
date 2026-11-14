@@ -333,6 +333,14 @@ probe_target(struct pipe_frontend_screen *fscreen, struct st_context *st, const 
 		b2l_drm_note("mesa: [%s] %s triangle: %u wrong, compile %llu us, draw+read %llu us, tiles %s %s, error 0x%x",
 		    variant, layout, wrong_triangle, (unsigned long long)compile_us, (unsigned long long)(now_us() - t0),
 		    map, first, CALL_GetError(disp, ()));
+		if (wrong_triangle) {
+			/* Boot 42: the same draw once more, same program and buffer, no clear. */
+			CALL_DrawArrays(disp, (GL_TRIANGLES, 0, 3));
+			memset(pixels, 0x5a, sizeof(pixels));
+			CALL_ReadPixels(disp, (0, 0, PROBE_SIZE, PROBE_SIZE, GL_RGBA, GL_UNSIGNED_BYTE, pixels));
+			unsigned again = probe_check(pixels, true, map, first);
+			b2l_drm_note("mesa: [%s] %s triangle drawn again: %u wrong, tiles %s %s", variant, layout, again, map, first);
+		}
 		CALL_DeleteBuffers(disp, (1, &buffer));
 	}
 	st_api_make_current(st, NULL, NULL);
@@ -348,7 +356,7 @@ probe_target(struct pipe_frontend_screen *fscreen, struct st_context *st, const 
  * layout ones). Everything is released afterwards.
  */
 static int
-probe_variant(const char *flags, int flush)
+probe_variant(const char *flags, int flush, const char *dump)
 {
 	char name[48];
 	snprintf(name, sizeof(name), "%s%s", flags[0] ? flags : "plain", flush ? "+flush" : "");
@@ -357,6 +365,11 @@ probe_variant(const char *flags, int flush)
 		setenv("B2L_DRM_FLUSH", "1", 1);
 	} else {
 		unsetenv("B2L_DRM_FLUSH");
+	}
+	if (dump != NULL) {
+		setenv("B2L_DRM_DUMP", dump, 1);
+	} else {
+		unsetenv("B2L_DRM_DUMP");
 	}
 	int fd = b2l_drm_open();
 	if (fd < 0) {
@@ -410,7 +423,7 @@ probe_variant(const char *flags, int flush)
  * <base>.ctx-<context>.<frame>, read off the phone from TWRP. */
 #define B2L_PANDECODE_BASE "/private/var/tmp/b2l-pandecode"
 
-static void __attribute__((unused))
+static void
 trace_files_note(void)
 {
 	unsigned files = 0;
@@ -443,21 +456,25 @@ trace_files_note(void)
 B2L_EXPORT int
 b2l_mesa_probe(void)
 {
-	static const struct { const char *flags; int flush; } variants[] = {
-		{ "", 0 }, { "", 1 }, { "nocache", 0 }, { "noafbc", 1 },
+	/* Boot 42 (build 41's result): the full cache and TLB flush and nocache
+	 * changed nothing, so the losses are not stale memory. Now plain, noafbc,
+	 * and plain traced with every buffer dumped after each submit. */
+	static const struct { const char *flags; int flush; const char *dump; } variants[] = {
+		{ "", 0, NULL }, { "noafbc", 0, NULL }, { "trace", 0, "/private/var/tmp/b2l-drm-dump.txt" },
 	};
 	uint64_t start = now_us();
 	int passed = 0;
 	setenv("PANDECODE_DUMP_FILE", B2L_PANDECODE_BASE, 1);
 	for (unsigned i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
-		if (probe_variant(variants[i].flags, variants[i].flush)) {
+		if (probe_variant(variants[i].flags, variants[i].flush, variants[i].dump)) {
 			passed |= 1 << i;
 		}
 	}
 	unsetenv("PAN_MESA_DEBUG");
 	unsetenv("B2L_DRM_FLUSH");
-	b2l_drm_note("mesa: probe done in %llu ms, right: plain %d plain+flush %d nocache %d noafbc+flush %d",
-	    (unsigned long long)((now_us() - start) / 1000), passed & 1, (passed >> 1) & 1, (passed >> 2) & 1,
-	    (passed >> 3) & 1);
+	unsetenv("B2L_DRM_DUMP");
+	trace_files_note();
+	b2l_drm_note("mesa: probe done in %llu ms, right: plain %d noafbc %d trace %d",
+	    (unsigned long long)((now_us() - start) / 1000), passed & 1, (passed >> 1) & 1, (passed >> 2) & 1);
 	return passed;
 }

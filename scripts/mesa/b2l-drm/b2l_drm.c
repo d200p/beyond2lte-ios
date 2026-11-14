@@ -783,6 +783,45 @@ chain_note(const struct drm_panfrost_submit *args, uint64_t status)
 	b2l_drm_note("%s", line);
 }
 
+/*
+ * Boot 42 diagnostic: after every submit, every CPU-mapped buffer object
+ * (not the tiler heap, which has no CPU mapping) written to the file named by
+ * B2L_DRM_DUMP, 16 bytes a line, all-zero lines left out. Boot 41's trace
+ * showed lost and right draws with identical descriptors; this shows the
+ * vertex data, the positions the vertex shaders wrote and the targets.
+ */
+static FILE *dump_file;
+static void
+dump_bos(const struct drm_panfrost_submit *args, uint64_t status)
+{
+	const char *path = getenv("B2L_DRM_DUMP");
+	if (path == NULL || path[0] != '/') {
+		return;
+	}
+	if (dump_file == NULL && (dump_file = fopen(path, "w")) == NULL) {
+		return;
+	}
+	fprintf(dump_file, "=== submit %llu req=%u jc=%llx status=%llx\n", (unsigned long long)drm.jobs,
+	    args->requirements, (unsigned long long)args->jc, (unsigned long long)status);
+	for (uint32_t h = 1; h <= B2L_MALI_MAX_BOS; h++) {
+		struct bo *bo = &drm.bos[h];
+		if (!bo->live || bo->cpu == NULL || (bo->flags & PANFROST_BO_HEAP)) {
+			continue;
+		}
+		fprintf(dump_file, "bo %u va %llx size %llx flags %x\n", h, (unsigned long long)bo->va,
+		    (unsigned long long)bo->size, bo->flags);
+		const volatile uint32_t *w = (const volatile uint32_t *)bo->cpu;
+		for (uint64_t i = 0; i + 4 <= bo->size / 4; i += 4) {
+			uint32_t a = w[i], b = w[i + 1], c = w[i + 2], d = w[i + 3];
+			if (a | b | c | d) {
+				fprintf(dump_file, "%llx: %08x %08x %08x %08x\n", (unsigned long long)(bo->va + i * 4), a, b, c,
+				    d);
+			}
+		}
+	}
+	fflush(dump_file);
+}
+
 static int
 submit(struct drm_panfrost_submit *args)
 {
@@ -820,6 +859,7 @@ submit(struct drm_panfrost_submit *args)
 	if (drm.jobs <= CHAIN_LOGGED) {
 		chain_note(args, out[0]);
 	}
+	dump_bos(args, out[0]);
 	if (args->out_sync != 0) {
 		drm.syncs[args->out_sync] = SYNC_SIGNALED;
 	}

@@ -226,6 +226,7 @@ public:
 	uint64_t      fLastGpuFrame;    /* fGpuFrames after it; 0 once a CPU copy followed */
 	thread_call_t fScanCall;
 	unsigned      fScanStep, fScans;
+	bool          fScanWanted;      /* b2l_fb_scan=1: scans after each wake (build 42: off) */
 	void stripeScan(const char *when, bool locked);
 	static void scanWorker(thread_call_param_t owner, thread_call_param_t unused);
 	thread_call_t fBlankCall, fRestoreCall;
@@ -369,6 +370,9 @@ AppleCLCD::start(IOService *provider)
 	fBlankCall = blank ? thread_call_allocate(&AppleCLCD::blankWorker, this) : NULL;
 	fRestoreCall = fBlankCall ? thread_call_allocate(&AppleCLCD::restoreWorker, this) : NULL;
 	fScanCall = fBlankCall ? thread_call_allocate(&AppleCLCD::scanWorker, this) : NULL;
+	int scan = 0;
+	PE_parse_boot_argn("b2l_fb_scan", &scan, sizeof(scan));
+	fScanWanted = scan == 1;
 	if (fBlankCall != NULL) gB2LCLCD = this;
 	IOLog("B2L FB: display off by blanking %s\n", fBlankCall ? "on" : "off");
 	IOMemoryDescriptor *regs = IOMemoryDescriptor::withPhysicalAddress(B2L_DECON_BASE, B2L_DECON_BYTES, kIODirectionInOut);
@@ -1032,7 +1036,7 @@ AppleCLCD::applyBlank(void)
 	IOLockUnlock(fLock);
 	if (off) {
 		if (fScanCall != NULL) thread_call_cancel(fScanCall);
-		if (fScans == 0) stripeScan("before the first off", true);
+		if (fScans == 0 && fScanWanted) stripeScan("before the first off", true);
 	}
 	uint64_t start = mach_absolute_time();
 	if (off) {
@@ -1085,7 +1089,7 @@ AppleCLCD::applyBlank(void)
 		clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
 		thread_call_enter_delayed(fRestoreCall, deadline);
 	}
-	if (!off && fScanCall != NULL) {
+	if (!off && fScanCall != NULL && fScanWanted) {
 		uint64_t deadline;
 		fScanStep = 0;
 		clock_interval_to_deadline(1500, NSEC_PER_MSEC, &deadline);
