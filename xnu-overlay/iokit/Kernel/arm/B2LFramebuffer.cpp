@@ -75,6 +75,15 @@ enum {
 #define B2L_DSIM_PAYLOAD              0x5c
 #define B2L_DSIM_FIFOCTRL             0x68
 #define B2L_DSIM_FIFO_EMPTY_PH        (1u << 10)
+#define B2L_DSIM_RXFIFO               0x60
+#define B2L_DSIM_FIFO_EMPTY_RX        (1u << 12)
+#define B2L_DSIM_INT_RX_DATA_DONE     (1u << 18)
+#define B2L_DSIM_INT_UNDER_RUN        (1u << 19)
+#define B2L_DSIM_INT_BTA_TOUT         (1u << 20)
+#define B2L_DSIM_INT_LPRX_TOUT        (1u << 21)
+/* The black painted while the panel sleeps: black to the eye, but no iOS
+ * frame holds it across a row, so rows that keep it after a wake are found. */
+#define B2L_FB_SLEEP_PAINT            0xff010101u
 /* DECON_F frame triggers and state (Samsung exynos9820 dpu20 regs-decon.h). */
 #define B2L_DECON_GLOBAL_IDLE         (1u << 5)       /* GLOBAL_CONTROL: between frames */
 #define B2L_DECON_TRIG_CONTROL        0x70            /* HW_SW_TRIG_CONTROL */
@@ -206,6 +215,19 @@ public:
 	/* S10: no frame transfer while the panel gets commands (b2l_fb_hold). */
 	bool          fHoldFrames;
 	bool holdFrames(bool hold);
+	/* S10, build 40: the stripes after a wake, located. The panel's own state
+	 * read over DSI (power mode, signal mode, DSI error count, error flags),
+	 * and the scanout compared with the frame the GPU last put there. */
+	unsigned      fPanelReads;
+	bool dsimRead(uint8_t reg, uint8_t *buf, unsigned want, unsigned *got, uint32_t *intsrc, uint32_t *report);
+	void panelRead(const char *when, bool hold);
+	B2LSurface   *fLastSource;      /* surface of the last GPU present, retained */
+	uint32_t      fLastSeed;
+	uint64_t      fLastGpuFrame;    /* fGpuFrames after it; 0 once a CPU copy followed */
+	thread_call_t fScanCall;
+	unsigned      fScanStep, fScans;
+	void stripeScan(const char *when, bool locked);
+	static void scanWorker(thread_call_param_t owner, thread_call_param_t unused);
 	thread_call_t fBlankCall, fRestoreCall;
 	bool          fWakeRestore;     /* the shadow may be shown if no frame comes */
 	uint64_t      fWakeCopies;      /* fPerfCopies when the display came on */
@@ -346,6 +368,7 @@ AppleCLCD::start(IOService *provider)
 	PE_parse_boot_argn("b2l_fb_blank", &blank, sizeof(blank));
 	fBlankCall = blank ? thread_call_allocate(&AppleCLCD::blankWorker, this) : NULL;
 	fRestoreCall = fBlankCall ? thread_call_allocate(&AppleCLCD::restoreWorker, this) : NULL;
+	fScanCall = fBlankCall ? thread_call_allocate(&AppleCLCD::scanWorker, this) : NULL;
 	if (fBlankCall != NULL) gB2LCLCD = this;
 	IOLog("B2L FB: display off by blanking %s\n", fBlankCall ? "on" : "off");
 	IOMemoryDescriptor *regs = IOMemoryDescriptor::withPhysicalAddress(B2L_DECON_BASE, B2L_DECON_BYTES, kIODirectionInOut);
@@ -971,6 +994,7 @@ AppleCLCD::applyBlank(void)
 			}
 		}
 		fPanelAsleep = false;
+		panelRead("lit", false);
 		bool held = holdFrames(false);
 		b2l_diag_record("B2L FB: DCS sleep out + display on %s, frames %s\n", done ? "sent" : "FAILED",
 		    held ? "released" : "never held");
@@ -992,18 +1016,23 @@ AppleCLCD::applyBlank(void)
 	IOLockLock(fLock);
 	bool shadowValid = fShadowValid;
 	IOLockUnlock(fLock);
+	if (off) {
+		if (fScanCall != NULL) thread_call_cancel(fScanCall);
+		if (fScans == 0) stripeScan("before the first off", true);
+	}
 	uint64_t start = mach_absolute_time();
 	if (off) {
 		/* Whole rows, so every write is 64-byte aligned like all other panel writes. */
 		for (uint32_t y = 0; y < fOutHeight; y++) {
 			volatile uint64_t *row = (volatile uint64_t *)(fPixels + (uintptr_t)y * fRowBytes);
-			for (uint32_t x = 0; x < fRowBytes / 8; x++) row[x] = 0xff000000ff000000ull;
+			for (uint32_t x = 0; x < fRowBytes / 8; x++) row[x] = ((uint64_t)B2L_FB_SLEEP_PAINT << 32) | B2L_FB_SLEEP_PAINT;
 		}
 	}
 	__asm__ volatile("dsb sy":::"memory");
 	if (sleepPanel) {
 		IOSleep(50);                                    /* the black frame reaches the panel */
 		bool idle = holdFrames(true);
+		panelRead("before off", false);
 		bool dark, slept;
 		if (fPanelInit) {
 			unsigned sent = panelOff();
@@ -1042,8 +1071,253 @@ AppleCLCD::applyBlank(void)
 		clock_interval_to_deadline(1000, NSEC_PER_MSEC, &deadline);
 		thread_call_enter_delayed(fRestoreCall, deadline);
 	}
+	if (!off && fScanCall != NULL) {
+		uint64_t deadline;
+		fScanStep = 0;
+		clock_interval_to_deadline(1500, NSEC_PER_MSEC, &deadline);
+		thread_call_enter_delayed(fScanCall, deadline);
+	}
 	b2l_diag_record("B2L FB: display %s, panel %s in %llu us\n", off ? "off" : "on",
 	    off ? (fPanelAsleep ? "blanked and asleep" : "blanked") : "black until the next frame", ns / 1000);
+}
+
+/*
+ * One DCS read (Samsung's dsim_read_data): the largest reply allowed, the
+ * read request with a bus turnaround, then the reply from the RX FIFO.
+ * Short replies carry 1-2 bytes in the header, long ones a length and payload
+ * words; an acknowledge-and-error report (0x02) is returned in *report. Only
+ * with DECON held, so nothing else is on the link. Up to 20 ms.
+ */
+bool
+AppleCLCD::dsimRead(uint8_t reg, uint8_t *buf, unsigned want, unsigned *got, uint32_t *intsrc, uint32_t *report)
+{
+	*got = 0;
+	*intsrc = 0;
+	*report = 0;
+	if (fDsim == NULL || !fPanelSleep || want == 0 || want > 8) return false;
+	for (unsigned i = 0; i < 32 && !(fDsim[B2L_DSIM_FIFOCTRL / 4] & B2L_DSIM_FIFO_EMPTY_RX); i++) {
+		(void)fDsim[B2L_DSIM_RXFIFO / 4];
+	}
+	fDsim[B2L_DSIM_INTSRC / 4] = B2L_DSIM_INT_RX_DATA_DONE | B2L_DSIM_INT_BTA_TOUT | B2L_DSIM_INT_LPRX_TOUT;
+	const uint8_t size[2] = { (uint8_t)want, 0 };
+	if (!dsimPacket(0x37, size, 2)) return false;           /* set maximum return packet size */
+	if (!(fDsim[B2L_DSIM_FIFOCTRL / 4] & B2L_DSIM_FIFO_EMPTY_PH)) return false;
+	fDsim[B2L_DSIM_INTSRC / 4] = B2L_DSIM_INT_PH_FIFO_EMPTY;
+	fDsim[B2L_DSIM_PKTHDR / 4] = (1u << 24) | 0x06u | (uint32_t)reg << 8;   /* DCS read + bus turnaround */
+	__asm__ volatile("dsb sy":::"memory");
+	uint32_t status = 0;
+	for (unsigned i = 0; i < 200; i++) {
+		status = fDsim[B2L_DSIM_INTSRC / 4];
+		if (status & (B2L_DSIM_INT_RX_DATA_DONE | B2L_DSIM_INT_BTA_TOUT | B2L_DSIM_INT_LPRX_TOUT)) break;
+		IODelay(100);
+	}
+	*intsrc = status;
+	if (!(status & B2L_DSIM_INT_RX_DATA_DONE)) return false;
+	unsigned n = 0;
+	for (unsigned w = 0; w < 16 && !(fDsim[B2L_DSIM_FIFOCTRL / 4] & B2L_DSIM_FIFO_EMPTY_RX); w++) {
+		uint32_t v = fDsim[B2L_DSIM_RXFIFO / 4];
+		uint8_t type = (uint8_t)v;
+		if (type == 0x21 || type == 0x11 || type == 0x22 || type == 0x12) {
+			unsigned bytes = (type == 0x22 || type == 0x12) ? 2 : 1;
+			for (unsigned b = 0; b < bytes && n < want; b++) buf[n++] = (uint8_t)(v >> (8 + 8 * b));
+		} else if (type == 0x1c || type == 0x1a) {
+			unsigned length = (v >> 8) & 0xffff;
+			for (unsigned i = 0; i < length && w < 16; i += 4) {
+				if (fDsim[B2L_DSIM_FIFOCTRL / 4] & B2L_DSIM_FIFO_EMPTY_RX) break;
+				uint32_t word = fDsim[B2L_DSIM_RXFIFO / 4];
+				w++;
+				for (unsigned b = 0; b < 4 && i + b < length && n < want; b++) buf[n++] = (uint8_t)(word >> (8 * b));
+			}
+		} else if (type == 0x02) {
+			*report = (v >> 8) & 0xffff;
+		}
+	}
+	fDsim[B2L_DSIM_INTSRC / 4] = B2L_DSIM_INT_RX_DATA_DONE;
+	*got = n;
+	return n > 0;
+}
+
+/* RDDPM 0x0a, RDDSM 0x0e, DSI error count 0x05, ERR_FG 0xee, ERR 0xea: what
+ * Samsung's driver dumps when the panel misbehaves. */
+void
+AppleCLCD::panelRead(const char *when, bool hold)
+{
+	static const struct { uint8_t reg, length; } regs[] = {
+		{ 0x0a, 1 }, { 0x0e, 1 }, { 0x05, 1 }, { 0xee, 1 }, { 0xea, 3 },
+	};
+	if (fDsim == NULL || !fPanelSleep || fPanelAsleep || fPanelReads >= 40) return;
+	fPanelReads++;
+	bool held = hold && holdFrames(true);
+	char line[200];
+	int n = 0;
+	for (unsigned r = 0; r < sizeof(regs) / sizeof(regs[0]) && n < (int)sizeof(line) - 24; r++) {
+		uint8_t b[8];
+		unsigned got = 0;
+		uint32_t intsrc = 0, report = 0;
+		bool ok = dsimRead(regs[r].reg, b, regs[r].length, &got, &intsrc, &report);
+		n += snprintf(line + n, sizeof(line) - n, " %02x=", regs[r].reg);
+		if (ok) {
+			for (unsigned i = 0; i < got; i++) n += snprintf(line + n, sizeof(line) - n, "%02x", b[i]);
+		} else {
+			n += snprintf(line + n, sizeof(line) - n, "?(int %08x)", intsrc);
+		}
+		if (report) n += snprintf(line + n, sizeof(line) - n, "!%04x", report);
+	}
+	if (held) holdFrames(false);
+	uint32_t intsrc = fDsim[B2L_DSIM_INTSRC / 4];
+	b2l_diag_record("B2L PANEL READ %s:%s dsim intsrc=%08x%s\n", when, line, intsrc,
+	    (intsrc & B2L_DSIM_INT_UNDER_RUN) ? " UNDERRUN" : "");
+}
+
+/* The scanout pixel within the 3x3 source texels around (sx, sy), per colour
+ * channel, give or take 12: what a bilinear GPU upscale can produce. */
+static bool
+b2l_near_source(uint32_t v, const uint8_t *src, uint32_t bpr, uint32_t w, uint32_t h, uint32_t sx, uint32_t sy)
+{
+	int lo[3] = { 255, 255, 255 }, hi[3] = { 0, 0, 0 };
+	for (int dy = -1; dy <= 1; dy++) {
+		int y = (int)sy + dy;
+		if (y < 0 || y >= (int)h) continue;
+		const uint32_t *row = (const uint32_t *)(src + (uint64_t)y * bpr);
+		for (int dx = -1; dx <= 1; dx++) {
+			int x = (int)sx + dx;
+			if (x < 0 || x >= (int)w) continue;
+			uint32_t t = row[x];
+			for (int c = 0; c < 3; c++) {
+				int k = (int)((t >> (8 * c)) & 0xff);
+				if (k < lo[c]) lo[c] = k;
+				if (k > hi[c]) hi[c] = k;
+			}
+		}
+	}
+	for (int c = 0; c < 3; c++) {
+		int k = (int)((v >> (8 * c)) & 0xff);
+		if (k < lo[c] - 12 || k > hi[c] + 12) return false;
+	}
+	return true;
+}
+
+/*
+ * Every row of the scanout, every 8th pixel: rows still holding the sleep
+ * paint, and rows unlike the surface the GPU last presented (when nothing
+ * was drawn since). Runs of such rows are listed as first+count. With locked,
+ * the caller holds fBusy already.
+ */
+void
+AppleCLCD::stripeScan(const char *when, bool locked)
+{
+	if (fPixels == 0 || !fScaled || fScans >= 24) return;
+	if (!locked) {
+		IOLockLock(fLock);
+		while (fBusy) IOLockSleep(fLock, &fBusy, THREAD_UNINT);
+		if (fBlanked) {
+			IOLockUnlock(fLock);
+			return;
+		}
+		fBusy = true;
+		IOLockUnlock(fLock);
+		panelRead(when, true);
+	}
+	fScans++;
+	IOLockLock(fLock);
+	B2LSurface *src = fLastSource;
+	bool current = src != NULL && fLastGpuFrame != 0 && fLastGpuFrame == fGpuFrames;
+	uint32_t seed = fLastSeed;
+	if (src != NULL) src->retain();
+	IOLockUnlock(fLock);
+	const uint8_t *sp = NULL;
+	uint32_t sw = 0, sh = 0, sbpr = 0;
+	if (current && b2l_surface_current_seed(src) == seed && src->kernelAddress() != 0 &&
+	    src->width == fWidth && src->height == fHeight && src->bytesPerElement == 4 && src->bytesPerRow >= fWidth * 4) {
+		sp = (const uint8_t *)src->kernelAddress() + src->offset;
+		sw = src->width;
+		sh = src->height;
+		sbpr = src->bytesPerRow;
+	}
+	uint64_t start = mach_absolute_time();
+	unsigned paintRows = 0, badRows = 0, runs = 0, samples = 0;
+	char list[120];
+	int n = 0;
+	list[0] = 0;
+	bool inRun = false;
+	uint32_t runStart = 0, firstX = 0, firstY = UINT32_MAX, firstPanel = 0, firstFrame = 0;
+	for (uint32_t y = 0; y <= fOutHeight; y++) {
+		bool stripe = false;
+		if (y < fOutHeight) {
+			const volatile uint32_t *row = (const volatile uint32_t *)(fPixels + (uintptr_t)y * fRowBytes);
+			uint32_t sy = sp ? (uint32_t)(((uint64_t)y * 2 + 1) * sh / (2ull * fOutHeight)) : 0;
+			unsigned paint = 0, bad = 0, count = 0;
+			for (uint32_t x = 4; x < fOutWidth; x += 8) {
+				uint32_t v = row[x];
+				count++;
+				if (v == B2L_FB_SLEEP_PAINT) paint++;
+				if (sp) {
+					uint32_t sx = (uint32_t)(((uint64_t)x * 2 + 1) * sw / (2ull * fOutWidth));
+					if (!b2l_near_source(v, sp, sbpr, sw, sh, sx, sy)) {
+						if (bad++ == 0 && firstY == UINT32_MAX) {
+							firstX = x;
+							firstY = y;
+							firstPanel = v & 0xffffff;
+							firstFrame = ((const uint32_t *)(sp + (uint64_t)sy * sbpr))[sx] & 0xffffff;
+						}
+					}
+				}
+			}
+			samples += count;
+			bool painted = paint * 2 > count;
+			bool unlike = bad * 8 > count;
+			paintRows += painted;
+			badRows += unlike;
+			stripe = painted || unlike;
+		}
+		if (stripe && !inRun) {
+			inRun = true;
+			runStart = y;
+		} else if (!stripe && inRun) {
+			inRun = false;
+			if (runs++ < 8 && n < (int)sizeof(list) - 16) {
+				n += snprintf(list + n, sizeof(list) - n, " %u+%u", runStart, y - runStart);
+			}
+		}
+	}
+	uint32_t intsrc = fDsim != NULL ? fDsim[B2L_DSIM_INTSRC / 4] : 0;
+	if (!locked) {
+		IOLockLock(fLock);
+		fBusy = false;
+		IOLockWakeup(fLock, &fBusy, false);
+		IOLockUnlock(fLock);
+	}
+	if (src != NULL) src->release();
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - start, &ns);
+	if (!sp) {
+		b2l_diag_record("B2L STRIPES %s: %u rows sleep-painted, %u runs%s; no frame to compare (%s), %u samples in %llu us\n",
+		    when, paintRows, runs, list, src == NULL ? "no GPU frame yet" : current ? "redrawn since" : "CPU copy since",
+		    samples, ns / 1000);
+		return;
+	}
+	b2l_diag_record("B2L STRIPES %s: %u rows unlike the frame, %u sleep-painted, %u runs%s; first (%u,%u) panel %06x frame %06x; "
+	    "dsim intsrc=%08x; %u samples in %llu us\n", when, badRows, paintRows, runs, list, firstX,
+	    firstY == UINT32_MAX ? 0 : firstY, firstPanel, firstFrame, intsrc, samples, ns / 1000);
+}
+
+/* 1.5, 5, 20 and 60 s after the display came on. */
+void
+AppleCLCD::scanWorker(thread_call_param_t owner, thread_call_param_t unused __unused)
+{
+	static const unsigned at_ms[] = { 1500, 5000, 20000, 60000 };
+	AppleCLCD *fb = (AppleCLCD *)owner;
+	unsigned step = fb->fScanStep;
+	if (step >= sizeof(at_ms) / sizeof(at_ms[0])) return;
+	char when[40];
+	snprintf(when, sizeof(when), "%u.%u s after on", at_ms[step] / 1000, at_ms[step] % 1000 / 100);
+	fb->stripeScan(when, false);
+	if (step + 1 < sizeof(at_ms) / sizeof(at_ms[0]) && __atomic_load_n(&fb->fBlankWanted, __ATOMIC_ACQUIRE) == 0) {
+		uint64_t deadline;
+		fb->fScanStep = step + 1;
+		clock_interval_to_deadline(at_ms[step + 1] - at_ms[step], NSEC_PER_MSEC, &deadline);
+		thread_call_enter_delayed(fb->fScanCall, deadline);
+	}
 }
 
 void
@@ -1402,9 +1676,13 @@ AppleCLCD::runCopy(void)
 					b2l_diag_record("B2L FB: GPU present %ux%u -> %ux%u in %llu us (GPU %llu us)\n", fWidth, fHeight,
 					    fOutWidth, fOutHeight, ns / 1000, gpuNS / 1000);
 				}
-				s->release();
+				uint32_t seed = b2l_surface_current_seed(s);
 				IOLockLock(fLock);
+				B2LSurface *drop = fLastSource;
+				fLastSource = s;        /* keeps the job's reference */
+				fLastSeed = seed;
 				fGpuFrames++;
+				fLastGpuFrame = fGpuFrames;
 				fShadowValid = false;
 				fPerfCopies++;
 				fPerfFull++;
@@ -1414,6 +1692,7 @@ AppleCLCD::runCopy(void)
 				fBusy = false;
 				IOLockWakeup(fLock, &fBusy, false);
 				IOLockUnlock(fLock);
+				if (drop != NULL) drop->release();
 				return;
 			}
 			if (fGpuFallbacks++ < 8) {
@@ -1442,6 +1721,7 @@ AppleCLCD::runCopy(void)
 		if (scaledCopies) b2l_fb_copy_note(scaledTicks);
 		IOLockLock(fLock);
 		if (coveredAll) fShadowValid = true;
+		if (scaledCopies) fLastGpuFrame = 0;    /* the CPU wrote the panel since */
 		fPerfCopies += scaledCopies;
 		fPerfFull += scaledFull;
 		fPerfPixels += scaledPixels;
