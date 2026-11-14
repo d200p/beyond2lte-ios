@@ -174,6 +174,15 @@ public:
 	bool          fPanelSleep;      /* DSIM accepted commands at start */
 	bool          fPanelAsleep;
 	bool dsimShortWrite(uint8_t command);
+	/* S10: stripes from the second wake on (boots 33-36). DSIM 0x000-0x0fc and
+	 * DECON 0x000-0x0fc, 0x200-0x27c as the boot chain left them; at every
+	 * display change the words that differ are logged. Reads only, and not
+	 * DSIM 0x58-0x60 (packet FIFOs: a read could pop the RX FIFO). */
+	uint32_t      fWatch[160];
+	bool          fWatchReady;
+	unsigned      fWatchEvents;
+	uint32_t watchRead(unsigned i);
+	void panelWatch(const char *when);
 	thread_call_t fBlankCall, fRestoreCall;
 	bool          fWakeRestore;     /* the shadow may be shown if no frame comes */
 	uint64_t      fWakeCopies;      /* fPerfCopies when the display came on */
@@ -339,6 +348,7 @@ AppleCLCD::start(IOService *provider)
 		IOLog("B2L FB: DSIM link_status1=0x%x (cmd mode %u) fifoctrl=0x%x: panel sleep %s\n", status1,
 		    (status1 >> 26) & 1, fifo, fPanelSleep ? "on" : "off");
 	}
+	panelWatch("at start");
 	int scanout = 1;
 	PE_parse_boot_argn("b2l_scanout", &scanout, sizeof(scanout));
 	fScanout = scanout && fDecon != NULL && fDma != NULL;
@@ -641,6 +651,53 @@ AppleCLCD::dsimShortWrite(uint8_t command)
 	return false;
 }
 
+uint32_t
+AppleCLCD::watchRead(unsigned i)
+{
+	if (i < 64) {
+		unsigned off = i * 4;
+		return fDsim == NULL || (off >= 0x58 && off <= 0x60) ? 0 : fDsim[i];
+	}
+	if (fDecon == NULL) {
+		return 0;
+	}
+	return i < 128 ? fDecon[i - 64] : fDecon[0x200 / 4 + (i - 128)];
+}
+
+void
+AppleCLCD::panelWatch(const char *when)
+{
+	static const unsigned count = sizeof(fWatch) / sizeof(fWatch[0]);
+	if (!fWatchReady) {
+		for (unsigned i = 0; i < count; i++) {
+			fWatch[i] = watchRead(i);
+		}
+		fWatchReady = true;
+		b2l_diag_record("B2L PANEL %s: dsim status1=%08x intsrc=%08x decon global=%08x pend=%08x %08x\n", when,
+		    fWatch[0x0c / 4], fWatch[0x50 / 4], fWatch[64], fWatch[64 + 0x4c / 4], fWatch[64 + 0x50 / 4]);
+		return;
+	}
+	if (fWatchEvents++ > 400) {
+		return;
+	}
+	char line[200];
+	int n = 0, shown = 0;
+	for (unsigned i = 0; i < count && shown < 40; i++) {
+		uint32_t now = watchRead(i);
+		if (now == fWatch[i]) {
+			continue;
+		}
+		unsigned off = i < 64 ? i * 4 : i < 128 ? (i - 64) * 4 : 0x200 + (i - 128) * 4;
+		n += snprintf(line + n, sizeof(line) - n, " %s+%03x %x>%x", i < 64 ? "dsim" : "decon", off, fWatch[i], now);
+		shown++;
+		if (n > 150) {
+			b2l_diag_record("B2L PANEL %s:%s\n", when, line);
+			n = 0;
+		}
+	}
+	b2l_diag_record("B2L PANEL %s:%s%s\n", when, n ? line : "", shown ? "" : " as at boot");
+}
+
 void
 AppleCLCD::applyBlank(void)
 {
@@ -659,6 +716,7 @@ AppleCLCD::applyBlank(void)
 	 * left striped bars until reboot: boots 33, 34 and 35 each got them on the
 	 * wake where the panel came back before the memory clock rose.
 	 */
+	panelWatch(off ? "before off" : "before on");
 	if (!off) b2l_mif_for_display(1);
 	if (off && fPanelSleep && !fPanelAsleep) {
 		fPanelAsleep = dsimShortWrite(0x28);            /* display off */
@@ -675,6 +733,7 @@ AppleCLCD::applyBlank(void)
 		}
 		fPanelAsleep = false;
 		b2l_diag_record("B2L FB: DCS sleep out + display on %s\n", done ? "sent" : "FAILED");
+		panelWatch("lit");
 	};
 
 	IOLockLock(fLock);
@@ -706,6 +765,7 @@ AppleCLCD::applyBlank(void)
 		bool slept = dsimShortWrite(0x10);              /* sleep in */
 		IOSleep(120);
 		b2l_diag_record("B2L FB: DCS sleep in %s\n", slept ? "sent" : "FAILED");
+		panelWatch("asleep");
 		if (slept) b2l_mif_for_display(0);
 	}
 	uint64_t ns = 0;
@@ -741,6 +801,7 @@ AppleCLCD::restoreWorker(thread_call_param_t owner, thread_call_param_t unused _
 void
 AppleCLCD::restoreAfterWake(void)
 {
+	panelWatch("1 s after on");
 	IOLockLock(fLock);
 	while (fBusy) IOLockSleep(fLock, &fBusy, THREAD_UNINT);
 	if (fBlanked || !fWakeRestore || fPerfCopies != fWakeCopies || fShadow == NULL) {

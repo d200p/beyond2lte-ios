@@ -151,6 +151,10 @@ extern "C" pmap_t get_task_pmap(task_t task);
 #define B2L_CPU_BIG_PER_C      4               /* and one more step for each of these */
 #define B2L_MIF_KHZ            2093000         /* Android's boot memory clock; 0 leaves it */
 #define B2L_MIF_STANDBY_KHZ    546000          /* display off (MIF table 421..2093 MHz) */
+/* S10: off for now. Stripes came with this switch (build 32) and stayed when it
+ * happened only while the panel slept (build 35, boot 36): build 36 keeps the
+ * memory clock up to tell. b2l_mif_standby=1 brings the switch back. */
+#define B2L_MIF_STANDBY_DEFAULT 0
 #define B2L_MIF_TEST_BYTES     (8u << 20)
 #define B2L_CPU_ALL_HOT_C      88              /* any sensor: every cluster goes to its boot rate */
 #define B2L_CPU_ALL_COOL_C     78
@@ -2011,6 +2015,11 @@ B2LMali::displayMemory(bool on)
 	int mif = B2L_MIF_KHZ;
 	PE_parse_boot_argn("b2l_mif_khz", &mif, sizeof(mif));
 	if (mif <= 0) {
+		return;
+	}
+	int standby = B2L_MIF_STANDBY_DEFAULT;
+	PE_parse_boot_argn("b2l_mif_standby", &standby, sizeof(standby));
+	if (!standby) {
 		return;
 	}
 	uint32_t want = on ? (uint32_t)mif : B2L_MIF_STANDBY_KHZ;
