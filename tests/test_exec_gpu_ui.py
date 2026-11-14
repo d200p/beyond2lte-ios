@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Run the real exec hook that loads the GPU library into backboardd.
+"""Run the real exec hook that loads the GPU library into backboardd and the
+keyboard library into every app.
 
 Only the exact executable gets the setting, only once the library is published,
 a caller's own value wins, the boot argument turns it off, and running out of
@@ -60,11 +61,30 @@ int main(void) {
  const char *others[] = { "/usr/libexec/backboardd2", "/usr/libexec/backboard", "/System/backboardd",
   "/System/Library/CoreServices/SpringBoard.app/SpringBoard" };
  for (unsigned k = 0; k < 4; k++) { i = setup(others[k], NULL); assert(!b2l_exec_gpu_ui(&i, 8) && !added); }
- /* MobileNotes gets the keyboard library, only once it is published. */
+ /* Every app gets the keyboard library, only once it is published. */
  const char *notes = "/Applications/MobileNotes.app/MobileNotes";
  i = setup(notes, NULL); assert(!b2l_exec_gpu_ui(&i, 8) && !added);
  kbd_ready = 1; i = setup(notes, NULL); assert(!b2l_exec_gpu_ui(&i, 8) && added == 1);
- assert(!strcmp(i.ip_strendp - sizeof(b2l_kbd_setting), b2l_kbd_setting)); kbd_ready = 0;
+ assert(!strcmp(i.ip_strendp - sizeof(b2l_kbd_setting), b2l_kbd_setting));
+ const char *apps[] = { "/Applications/Preferences.app/Preferences", "/Applications/InputUI.app/InputUI",
+  "/private/preboot/Cryptexes/App/Applications/MobileSafari.app/MobileSafari",
+  "/private/var/containers/Bundle/Application/0A1B/Game.app/Game",
+  "/var/containers/Bundle/Application/0A1B/Game.app/Game",
+  "/System/Library/CoreServices/SpringBoard.app/SpringBoard" };
+ for (unsigned k = 0; k < 6; k++) {
+  i = setup(apps[k], NULL); assert(!b2l_exec_gpu_ui(&i, 8) && added == 1);
+  assert(!strcmp(i.ip_strendp - sizeof(b2l_kbd_setting), b2l_kbd_setting));
+ }
+ /* Daemons, extensions and anything outside an app bundle do not. */
+ const char *not_apps[] = { "/usr/libexec/securityd", "/Applications/MobileNotes.app",
+  "/Applications/Foo.app/PlugIns/Bar.appex/Bar", "/Applications/notes",
+  "/System/Library/PrivateFrameworks/IDS.framework/identityservicesd.app/identityservicesd",
+  "/System/Library/ExtensionKit/Extensions/ClockPosterExtension.appex/ClockPosterExtension",
+  "/System/Library/CoreServices/SpringBoard.app/SpringBoard2", "/Applications/.app/x", "/Applications/" };
+ for (unsigned k = 0; k < 9; k++) { i = setup(not_apps[k], NULL); assert(!b2l_exec_gpu_ui(&i, 8) && !added); }
+ /* backboardd keeps the GPU library while the keyboard one is published. */
+ i = setup(bbd, NULL); assert(!b2l_exec_gpu_ui(&i, 8) && added == 1);
+ assert(!strcmp(i.ip_strendp - sizeof(b2l_gpu_ui_setting), b2l_gpu_ui_setting)); kbd_ready = 0;
  /* A caller's value stands. */
  i = setup(bbd, "DYLD_INSERT_LIBRARIES=/x"); assert(!b2l_exec_gpu_ui(&i, 8) && !added && i.ip_envc == 1);
  /* Not published, or switched off. */

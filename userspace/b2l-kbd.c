@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: BSD-2-Clause
 /*
- * S10: keyboard relief, loaded into MobileNotes only (the kernel adds it with
- * DYLD_INSERT_LIBRARIES, bsd/kern/b2l_exec_gpu_ui.h).
+ * S10: keyboard relief, loaded into every app and SpringBoard (the kernel adds
+ * it with DYLD_INSERT_LIBRARIES, bsd/kern/b2l_exec_gpu_ui.h and
+ * b2l_kbd_paths.h). Builds 37-39 had it in MobileNotes only, where it fixed typing;
+ * the system keyboard runs inside each app, so every app needs it.
  *
  * Boots 35-37: Notes' main thread spent its time in one chain.
  * AFNetworkAvailability reports every network-state change to the dictation

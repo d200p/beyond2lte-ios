@@ -46,7 +46,7 @@ def main():
         raise SystemExit('library exceeds the publication limit')
     tag = hashlib.sha256(data).hexdigest()[:12]
     rows = [','.join('0x%02x' % b for b in data[i:i + 20]) for i in range(0, len(data), 20)]
-    # S10 port: the keyboard relief library for MobileNotes (userspace/b2l-kbd.c),
+    # S10 port: the keyboard relief library for every app (userspace/b2l-kbd.c),
     # in /usr/lib, which app sandboxes may read and map.
     kbd_out = a.output.parent / 'b2l-kbd.dylib'
     subprocess.run(['xcrun', '--sdk', 'iphoneos', 'clang', '-target', 'arm64e-apple-ios26.0', '-isysroot', sdk,

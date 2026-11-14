@@ -6,11 +6,13 @@
 #ifndef B2L_EXEC_GPU_UI_H
 #define B2L_EXEC_GPU_UI_H
 #define B2L_GPU_UI_EXECUTABLE "/usr/libexec/backboardd"
-#define B2L_KBD_EXECUTABLE "/Applications/MobileNotes.app/MobileNotes"
+#include "b2l_kbd_paths.h"
 extern int b2l_gpu_ui_is_ready(void);
 extern const char b2l_gpu_ui_setting[];
-/* S10 port: the keyboard relief library goes into MobileNotes only (see
- * userspace/b2l-kbd.c); AMFI lets that process ignore a failed insertion. */
+/* S10 port: the keyboard relief library goes into every app (b2l_kbd_paths.h,
+ * userspace/b2l-kbd.c); AMFI lets those processes ignore a failed insertion.
+ * Builds 37-39 had it in MobileNotes only, and every other app kept the slow
+ * keyboard. */
 extern int b2l_kbd_is_ready(void);
 extern const char b2l_kbd_setting[];
 static int
@@ -27,9 +29,11 @@ b2l_exec_gpu_ui(struct image_params *imgp, int pointer_size)
 	if (pointer_size != 8 || !b2l_gpu_ui_enabled()) return 0;
 	const char *path = imgp->ip_strings + strlen(EXECUTABLE_KEY);
 	const char *setting = b2l_gpu_ui_setting;
-	if (!strcmp(path, B2L_KBD_EXECUTABLE) && b2l_kbd_is_ready() && b2l_kbd_setting[0]) {
+	if (!strcmp(path, B2L_GPU_UI_EXECUTABLE)) {
+		setting = b2l_gpu_ui_setting;
+	} else if (b2l_kbd_app_path(path) && b2l_kbd_is_ready() && b2l_kbd_setting[0]) {
 		setting = b2l_kbd_setting;
-	} else if (strcmp(path, B2L_GPU_UI_EXECUTABLE)) {
+	} else {
 		return 0;
 	}
 	const char *cursor = imgp->ip_endargv;
@@ -46,7 +50,10 @@ b2l_exec_gpu_ui(struct image_params *imgp, int pointer_size)
 	if (error) return error;
 	imgp->ip_argspace -= pointer_size;
 	imgp->ip_envc++;
-	b2l_early_trace("B2L GPU UI: library selected for %s\n", setting == b2l_kbd_setting ? "MobileNotes" : "backboardd");
+	static int traced;
+	if (setting != b2l_kbd_setting || traced++ < 24) {
+		b2l_early_trace("B2L GPU UI: library selected for %s\n", setting == b2l_kbd_setting ? path : "backboardd");
+	}
 	return 0;
 }
 #endif

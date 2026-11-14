@@ -106,7 +106,7 @@ static int b2l_apps_publish(const char *final,const char *staging,const unsigned
 static int b2l_gpu_ui_ready;
 int b2l_gpu_ui_is_ready(void){return b2l_gpu_ui_ready;}
 const char b2l_gpu_ui_setting[]="DYLD_INSERT_LIBRARIES=" B2L_GPU_UI_LIBRARY;
-/* S10 port: the keyboard relief library for MobileNotes (userspace/b2l-kbd.c),
+/* S10 port: the keyboard relief library for every app (userspace/b2l-kbd.c),
  * published in /usr/lib with the GPU library; b2l_kbd=0 leaves it out. */
 static int b2l_kbd_ready;
 int b2l_kbd_is_ready(void){return b2l_kbd_ready;}
