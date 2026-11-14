@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: MIT
 /*
  * S10 port: Mesa on iOS over B2LMali. A minimal GL frontend in the manner of
- * OSMesa: one Panfrost screen on the B2LMali libdrm, OpenGL ES contexts that
+ * OSMesa: Panfrost screens on the B2LMali libdrm, OpenGL ES contexts that
  * draw into pipe resources this file owns. It is the base of the EAGL layer
- * that will serve Core Animation; for now b2l_mesa_probe() is the first test
- * on the phone: an OpenGL ES 3 context, a clear and a shader-drawn triangle
- * into a 64 x 64 RGBA target, read back and checked, each step logged to the
+ * that will serve Core Animation; for now b2l_mesa_probe() tests it on the
+ * phone: OpenGL ES 3 contexts, a clear and a shader-drawn triangle into
+ * 64 x 64 RGBA targets, read back and checked, each step logged to the
  * kernel log ("B2L GPU UI: mesa: ...").
  */
 #include <mach/mach_time.h>
@@ -27,6 +27,8 @@
 #include "glapi/glapi.h"
 #include "main/dispatch.h"
 #include "panfrost/drm/panfrost_drm_public.h"
+#include "panfrost/pan_public.h"
+#include <stdlib.h>
 #include "renderonly/renderonly.h"
 #include "b2l_drm.h"
 
@@ -90,8 +92,8 @@ fscreen_get_param(struct pipe_frontend_screen *fscreen, enum st_manager_param pa
 	return 0;
 }
 
-/* The screen, once per process. */
-static struct pipe_frontend_screen *
+/* The screen, once per process (for the EAGL layer; the probe makes its own). */
+__attribute__((unused)) static struct pipe_frontend_screen *
 b2l_fscreen(void)
 {
 	if (b2l.fscreen.screen != NULL) {
@@ -210,58 +212,91 @@ probe_shader(struct _glapi_table *disp, GLenum kind, const char *source)
 	return shader;
 }
 
-/* Pixels equal to rgba (with 1 of rounding slack), in the 64 x 64 readback. */
-static unsigned
-probe_count(const uint8_t *pixels, const uint8_t rgba[4])
+/*
+ * What the 64 x 64 readback should hold: the clear colour everywhere after
+ * the clear; after the triangle, red where x + y < 63 (its lower-left half,
+ * GL's origin at the bottom), the clear colour where x + y > 63, either on
+ * the diagonal. Returns the wrong pixels and writes a 4 x 4 map of the 16 x 16
+ * tiles ('.' none wrong, else wrong/16 in hex, 'g' for a whole tile), top row
+ * first, and the first wrong pixel.
+ */
+static const uint8_t probe_clear[4] = { 64, 128, 191, 255 }, probe_red[4] = { 255, 0, 0, 255 };
+
+static bool
+probe_same(const uint8_t *p, const uint8_t rgba[4])
 {
-	unsigned n = 0;
-	for (unsigned i = 0; i < PROBE_SIZE * PROBE_SIZE; i++) {
-		const uint8_t *p = pixels + 4 * i;
-		bool same = true;
-		for (unsigned c = 0; c < 4; c++) {
-			int d = (int)p[c] - (int)rgba[c];
-			same &= d >= -1 && d <= 1;
+	for (unsigned c = 0; c < 4; c++) {
+		int d = (int)p[c] - (int)rgba[c];
+		if (d < -1 || d > 1) {
+			return false;
 		}
-		n += same;
 	}
-	return n;
+	return true;
+}
+
+static unsigned
+probe_check(const uint8_t *pixels, bool triangle, char map[20], char first[48])
+{
+	unsigned wrong = 0, tiles[16] = { 0 };
+	first[0] = 0;
+	for (unsigned y = 0; y < PROBE_SIZE; y++) {
+		for (unsigned x = 0; x < PROBE_SIZE; x++) {
+			const uint8_t *p = pixels + 4 * (y * PROBE_SIZE + x);
+			bool ok;
+			if (!triangle || x + y > 63) {
+				ok = probe_same(p, probe_clear);
+			} else if (x + y < 63) {
+				ok = probe_same(p, probe_red);
+			} else {
+				ok = probe_same(p, probe_clear) || probe_same(p, probe_red);
+			}
+			if (!ok) {
+				if (wrong++ == 0) {
+					snprintf(first, 48, "(%u,%u)=%02x%02x%02x%02x", x, y, p[0], p[1], p[2], p[3]);
+				}
+				tiles[(y / 16) * 4 + x / 16]++;
+			}
+		}
+	}
+	unsigned n = 0;
+	for (int ty = 3; ty >= 0; ty--) {
+		for (unsigned tx = 0; tx < 4; tx++) {
+			unsigned t = tiles[ty * 4 + tx];
+			map[n++] = t == 0 ? '.' : t >= 256 ? 'g' : "0123456789abcdef"[t / 16];
+		}
+		map[n++] = ty ? '/' : 0;
+	}
+	return wrong;
 }
 
 /* One render target: a clear, then a triangle over its lower-left half
- * (compiler, vertex, tiler and fragment jobs), each read back and counted. */
+ * (compiler, vertex, tiler and fragment jobs), each read back and checked. */
 static int
-probe_target(struct pipe_frontend_screen *fscreen, struct st_context *st, bool linear)
+probe_target(struct pipe_frontend_screen *fscreen, struct st_context *st, const char *variant, bool linear)
 {
 	struct b2l_drawable drawable;
 	const char *layout = linear ? "linear" : "default";
 	drawable_init(&drawable, fscreen, PROBE_SIZE, PROBE_SIZE, linear);
 	if (!st_api_make_current(st, &drawable.base, &drawable.base)) {
-		b2l_drm_note("mesa: %s: make current failed", layout);
+		b2l_drm_note("mesa: [%s] %s: make current failed", variant, layout);
 		return 0;
 	}
 	struct _glapi_table *disp = GET_DISPATCH();
-	b2l_drm_note("mesa: %s | %s | GLSL %s", (const char *)CALL_GetString(disp, (GL_RENDERER)),
-	    (const char *)CALL_GetString(disp, (GL_VERSION)),
-	    (const char *)CALL_GetString(disp, (GL_SHADING_LANGUAGE_VERSION)));
-
 	static uint8_t pixels[PROBE_SIZE * PROBE_SIZE * 4];
-	static const uint8_t clear[4] = { 64, 128, 191, 255 }, red[4] = { 255, 0, 0, 255 };
-	int result = 1;
+	char map[20], first[48];
 
 	/* 1. A clear: one fragment job. */
 	uint64_t t0 = now_us();
 	CALL_Viewport(disp, (0, 0, PROBE_SIZE, PROBE_SIZE));
 	CALL_ClearColor(disp, (64 / 255.0f, 128 / 255.0f, 191 / 255.0f, 1.0f));
 	CALL_Clear(disp, (GL_COLOR_BUFFER_BIT));
-	memset(pixels, 0, sizeof(pixels));
+	memset(pixels, 0x5a, sizeof(pixels));
 	CALL_ReadPixels(disp, (0, 0, PROBE_SIZE, PROBE_SIZE, GL_RGBA, GL_UNSIGNED_BYTE, pixels));
-	unsigned cleared = probe_count(pixels, clear);
-	b2l_drm_note("mesa: %s: clear %u/%u pixels right in %llu us, first %02x%02x%02x%02x, error 0x%x", layout, cleared,
-	    PROBE_SIZE * PROBE_SIZE, (unsigned long long)(now_us() - t0), pixels[0], pixels[1], pixels[2], pixels[3],
-	    CALL_GetError(disp, ()));
-	result &= cleared == PROBE_SIZE * PROBE_SIZE;
+	unsigned wrong_clear = probe_check(pixels, false, map, first);
+	b2l_drm_note("mesa: [%s] %s clear: %u wrong in %llu us, tiles %s %s, error 0x%x", variant, layout, wrong_clear,
+	    (unsigned long long)(now_us() - t0), map, first, CALL_GetError(disp, ()));
 
-	/* 2. A triangle over the lower-left half: compiler, vertex and tiler jobs. */
+	/* 2. The triangle. */
 	t0 = now_us();
 	GLuint vs = probe_shader(disp, GL_VERTEX_SHADER,
 	    "#version 300 es\nlayout(location = 0) in vec2 p;\nvoid main() { gl_Position = vec4(p, 0.0, 1.0); }\n");
@@ -277,9 +312,9 @@ probe_target(struct pipe_frontend_screen *fscreen, struct st_context *st, bool l
 		CALL_GetProgramiv(disp, (program, GL_LINK_STATUS, &linked));
 	}
 	uint64_t compile_us = now_us() - t0;
+	unsigned wrong_triangle = PROBE_SIZE * PROBE_SIZE;
 	if (!linked) {
-		b2l_drm_note("mesa: %s: shaders not ready (vs %u fs %u program %u)", layout, vs, fs, program);
-		result = 0;
+		b2l_drm_note("mesa: [%s] %s: shaders not ready (vs %u fs %u program %u)", variant, layout, vs, fs, program);
 	} else {
 		static const float vertices[6] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f };
 		GLuint buffer = 0;
@@ -291,42 +326,47 @@ probe_target(struct pipe_frontend_screen *fscreen, struct st_context *st, bool l
 		CALL_VertexAttribPointer(disp, (0, 2, GL_FLOAT, GL_FALSE, 0, NULL));
 		CALL_EnableVertexAttribArray(disp, (0));
 		CALL_DrawArrays(disp, (GL_TRIANGLES, 0, 3));
-		memset(pixels, 0, sizeof(pixels));
+		memset(pixels, 0x5a, sizeof(pixels));
 		CALL_ReadPixels(disp, (0, 0, PROBE_SIZE, PROBE_SIZE, GL_RGBA, GL_UNSIGNED_BYTE, pixels));
-		unsigned reds = probe_count(pixels, red), rest = probe_count(pixels, clear);
-		const uint8_t *corner = pixels + 4 * (PROBE_SIZE * PROBE_SIZE - 1);
-		b2l_drm_note("mesa: %s: triangle red %u clear %u of %u (half is %u) compile %llu us draw+read %llu us, "
-		    "corners %02x%02x%02x %02x%02x%02x, error 0x%x", layout, reds, rest, PROBE_SIZE * PROBE_SIZE,
-		    PROBE_SIZE * PROBE_SIZE / 2, (unsigned long long)compile_us, (unsigned long long)(now_us() - t0),
-		    pixels[0], pixels[1], pixels[2], corner[0], corner[1], corner[2], CALL_GetError(disp, ()));
-		result &= reds > PROBE_SIZE * PROBE_SIZE * 2 / 5 && rest > PROBE_SIZE * PROBE_SIZE * 2 / 5 &&
-		    reds + rest == PROBE_SIZE * PROBE_SIZE;
+		wrong_triangle = probe_check(pixels, true, map, first);
+		b2l_drm_note("mesa: [%s] %s triangle: %u wrong, compile %llu us, draw+read %llu us, tiles %s %s, error 0x%x",
+		    variant, layout, wrong_triangle, (unsigned long long)compile_us, (unsigned long long)(now_us() - t0),
+		    map, first, CALL_GetError(disp, ()));
+		CALL_DeleteBuffers(disp, (1, &buffer));
 	}
-
-	b2l_drm_note("mesa: %s: %s", layout, result ? "right" : "WRONG");
 	st_api_make_current(st, NULL, NULL);
 	drawable_release(&drawable);
-	return result;
+	return wrong_clear == 0 && wrong_triangle == 0;
 }
 
 /*
- * The first Mesa run on the phone. Returns 1 when the clear and the triangle
- * both read back right, 0 otherwise; every step is logged.
+ * One Panfrost screen with PAN_MESA_DEBUG set to flags (Panfrost reads it when
+ * the screen is made), an ES 3 context on it, and three targets: default,
+ * linear, linear again (boot 38 showed default right only for the triangle
+ * and linear right only for the clear; the order tells first-use effects from
+ * layout ones). Everything is released afterwards.
  */
-B2L_EXPORT int
-b2l_mesa_probe(void)
+static int
+probe_variant(const char *flags)
 {
-	uint64_t start = now_us();
-	struct pipe_frontend_screen *fscreen = b2l_fscreen();
-	if (fscreen == NULL) {
+	const char *name = flags[0] ? flags : "plain";
+	setenv("PAN_MESA_DEBUG", flags, 1);
+	int fd = b2l_drm_open();
+	if (fd < 0) {
 		return 0;
 	}
-	uint64_t screen_us = now_us() - start;
-
-	int core = 0, compat = 0, es1 = 0, es2 = 0;
-	struct st_config_options options;
-	memset(&options, 0, sizeof(options));
-	st_api_query_versions(fscreen, &options, &core, &compat, &es1, &es2);
+	static driOptionCache info, options;
+	driParseOptionInfo(&info, pan_driconf, ARRAY_SIZE(pan_driconf));
+	struct pipe_screen_config config = { false, &options, &info };
+	uint64_t start = now_us();
+	struct pipe_screen *screen = panfrost_create_screen(fd, &config, NULL);
+	if (screen == NULL) {
+		b2l_drm_note("mesa: [%s] panfrost screen creation failed", name);
+		return 0;
+	}
+	struct pipe_frontend_screen *fscreen = CALLOC_STRUCT(pipe_frontend_screen);
+	fscreen->screen = screen;
+	fscreen->get_param = fscreen_get_param;
 
 	struct st_context_attribs attribs;
 	memset(&attribs, 0, sizeof(attribs));
@@ -340,20 +380,44 @@ b2l_mesa_probe(void)
 	attribs.visual.samples = 1;
 	enum st_context_error error = ST_CONTEXT_SUCCESS;
 	struct st_context *st = st_api_create_context(fscreen, &attribs, &error, NULL);
-	b2l_drm_note("mesa: screen in %llu us, versions core %d compat %d es1 %d es2 %d, context %s (error %d)",
-	    (unsigned long long)screen_us, core, compat, es1, es2, st ? "ok" : "FAILED", (int)error);
+	int result = 0;
 	if (st == NULL) {
-		return 0;
+		b2l_drm_note("mesa: [%s] context FAILED (error %d)", name, (int)error);
+	} else {
+		b2l_drm_note("mesa: [%s] %s, screen and context in %llu us", name, screen->get_name(screen),
+		    (unsigned long long)(now_us() - start));
+		result = probe_target(fscreen, st, name, false);
+		result &= probe_target(fscreen, st, name, true);
+		result &= probe_target(fscreen, st, name, true);
+		st_api_make_current(NULL, NULL, NULL);
+		st_destroy_context(st);
 	}
-
-	/* Boot 37: on the default (AFBC) target the triangle drew right but the
-	 * clear read back as zeros. Linear first, as IOSurfaces will be; then the
-	 * default layout again, to see which one loses the clear. */
-	int result = probe_target(fscreen, st, true);
-	result &= probe_target(fscreen, st, false);
-	st_api_make_current(NULL, NULL, NULL);
-	st_destroy_context(st);
-	b2l_drm_note("mesa: probe %s in %llu ms", result ? "PASSED" : "FAILED",
-	    (unsigned long long)((now_us() - start) / 1000));
+	st_screen_destroy(fscreen);
+	FREE(fscreen);
+	screen->destroy(screen);
+	b2l_drm_note("mesa: [%s] %s", name, result ? "all right" : "WRONG");
 	return result;
+}
+
+/*
+ * The Mesa run on the phone: the same three targets with transaction
+ * elimination (CRC) and AFBC each on and off, to find which one loses the
+ * clear or the triangle. Returns a bit per variant that came out right.
+ */
+B2L_EXPORT int
+b2l_mesa_probe(void)
+{
+	static const char *const variants[] = { "", "nocrc", "noafbc", "nocrc,noafbc" };
+	uint64_t start = now_us();
+	int passed = 0;
+	for (unsigned i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
+		if (probe_variant(variants[i])) {
+			passed |= 1 << i;
+		}
+	}
+	unsetenv("PAN_MESA_DEBUG");
+	b2l_drm_note("mesa: probe done in %llu ms, right: plain %d nocrc %d noafbc %d both %d",
+	    (unsigned long long)((now_us() - start) / 1000), passed & 1, (passed >> 1) & 1, (passed >> 2) & 1,
+	    (passed >> 3) & 1);
+	return passed;
 }
