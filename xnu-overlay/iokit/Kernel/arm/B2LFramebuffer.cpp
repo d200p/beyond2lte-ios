@@ -72,6 +72,7 @@ enum {
 #define B2L_DSIM_INTSRC               0x50
 #define B2L_DSIM_INT_PH_FIFO_EMPTY    (1u << 28)
 #define B2L_DSIM_PKTHDR               0x58
+#define B2L_DSIM_PAYLOAD              0x5c
 #define B2L_DSIM_FIFOCTRL             0x68
 #define B2L_DSIM_FIFO_EMPTY_PH        (1u << 10)
 /* DECON_F frame triggers and state (Samsung exynos9820 dpu20 regs-decon.h). */
@@ -178,6 +179,13 @@ public:
 	bool          fPanelSleep;      /* DSIM accepted commands at start */
 	bool          fPanelAsleep;
 	bool dsimShortWrite(uint8_t command);
+	/* S10: any command packet (short, DCS long, DSC PPS) and the panel's own
+	 * power-on sequence (b2l_fb_panel_init, default on). */
+	bool          fPanelInit;
+	bool dsimPacket(uint8_t type, const uint8_t *data, uint32_t length);
+	bool dcsWrite(const uint8_t *data, uint32_t length);
+	unsigned panelOn(void);
+	unsigned panelOff(void);
 	/* S10: stripes from the second wake on (boots 33-36). DSIM 0x000-0x0fc and
 	 * DECON 0x000-0x0fc, 0x200-0x27c as the boot chain left them; at every
 	 * display change the words that differ are logged. Reads only, and not
@@ -356,6 +364,9 @@ AppleCLCD::start(IOService *provider)
 		    (status1 >> 26) & 1, fifo, fPanelSleep ? "on" : "off");
 	}
 	panelWatch("at start");
+	int panelInit = 1;
+	PE_parse_boot_argn("b2l_fb_panel_init", &panelInit, sizeof(panelInit));
+	fPanelInit = panelInit == 1;
 	int hold = 1;
 	PE_parse_boot_argn("b2l_fb_hold", &hold, sizeof(hold));
 	fHoldFrames = hold == 1 && fDecon != NULL;
@@ -661,6 +672,131 @@ AppleCLCD::dsimShortWrite(uint8_t command)
 	return false;
 }
 
+/*
+ * One command packet, as Samsung's dsim_write_data: long ones (DCS long write
+ * 0x39, PPS 0x0a) put their bytes in the payload FIFO four at a time, little
+ * end first, and give the length in the header; short ones carry up to two
+ * bytes in the header. Waits up to 50 ms for the header FIFO to drain.
+ */
+bool
+AppleCLCD::dsimPacket(uint8_t type, const uint8_t *data, uint32_t length)
+{
+	if (fDsim == NULL || !fPanelSleep) return false;
+	uint32_t fifo = fDsim[B2L_DSIM_FIFOCTRL / 4];
+	if (fifo == UINT32_MAX || !(fifo & B2L_DSIM_FIFO_EMPTY_PH)) return false;
+	fDsim[B2L_DSIM_INTSRC / 4] = B2L_DSIM_INT_PH_FIFO_EMPTY;
+	uint32_t header;
+	if (type == 0x39 || type == 0x0a) {
+		for (uint32_t i = 0; i < length; i += 4) {
+			uint32_t word = 0;
+			for (uint32_t b = 0; b < 4 && i + b < length; b++) {
+				word |= (uint32_t)data[i + b] << (8 * b);
+			}
+			fDsim[B2L_DSIM_PAYLOAD / 4] = word;
+		}
+		header = type | (length & 0xffu) << 8 | ((length >> 8) & 0xffu) << 16;
+	} else {
+		header = type | (uint32_t)(length > 0 ? data[0] : 0) << 8 | (uint32_t)(length > 1 ? data[1] : 0) << 16;
+	}
+	fDsim[B2L_DSIM_PKTHDR / 4] = header;
+	__asm__ volatile("dsb sy":::"memory");
+	for (unsigned i = 0; i < 500; i++) {
+		if (fDsim[B2L_DSIM_FIFOCTRL / 4] & B2L_DSIM_FIFO_EMPTY_PH) return true;
+		IODelay(100);
+	}
+	return false;
+}
+
+/* A DCS write the way Samsung's panel driver sends one: 1 byte short, 2 bytes
+ * short with a parameter, longer as a DCS long write. */
+bool
+AppleCLCD::dcsWrite(const uint8_t *data, uint32_t length)
+{
+	return dsimPacket(length == 1 ? 0x05 : length == 2 ? 0x15 : 0x39, data, length);
+}
+
+/*
+ * The S10 panel (S6E3HA9, beyond1_a3_s0 in Samsung's kernel,
+ * drivers/video/fbdev/exynos/panel/s6e3ha9/s6e3ha9_beyond1_a3_s0_panel.h).
+ * Its init sequence sends the compression setup and the PPS before sleep out
+ * and the scaler, address window, area, TE, error flag, FFC and TSP sync
+ * after it; display on and off are wrapped in the level-1 key. Build 37 sent
+ * bare sleep out + display on, and every wake left stripes: the panel had
+ * lost its setup. The values are those for 1440x3040 with the scaler off;
+ * brightness and the offset-addressed registers (ISC, STM, gamma mode) are
+ * not resent. Returns the number of packets that went out.
+ */
+static const uint8_t kPanelKey1On[] = { 0x9f, 0xa5, 0xa5 }, kPanelKey1Off[] = { 0x9f, 0x5a, 0x5a };
+static const uint8_t kPanelKey2On[] = { 0xf0, 0x5a, 0x5a }, kPanelKey2Off[] = { 0xf0, 0xa5, 0xa5 };
+static const uint8_t kPanelKey3On[] = { 0xfc, 0x5a, 0x5a }, kPanelKey3Off[] = { 0xfc, 0xa5, 0xa5 };
+static const uint8_t kPanelDscOn[] = { 0x01 };
+static const uint8_t kPanelPps[128] = {          /* 1440x3040, slices 720x40 */
+	0x11, 0x00, 0x00, 0x89, 0x30, 0x80, 0x0B, 0xE0, 0x05, 0xA0, 0x00, 0x28, 0x02, 0xD0, 0x02, 0xD0,
+	0x02, 0x00, 0x02, 0x68, 0x00, 0x20, 0x04, 0x6C, 0x00, 0x0A, 0x00, 0x0C, 0x02, 0x77, 0x01, 0xE9,
+	0x18, 0x00, 0x10, 0xF0, 0x03, 0x0C, 0x20, 0x00, 0x06, 0x0B, 0x0B, 0x33, 0x0E, 0x1C, 0x2A, 0x38,
+	0x46, 0x54, 0x62, 0x69, 0x70, 0x77, 0x79, 0x7B, 0x7D, 0x7E, 0x01, 0x02, 0x01, 0x00, 0x09, 0x40,
+	0x09, 0xBE, 0x19, 0xFC, 0x19, 0xFA, 0x19, 0xF8, 0x1A, 0x38, 0x1A, 0x78, 0x1A, 0xB6, 0x2A, 0xF6,
+	0x2B, 0x34, 0x2B, 0x74, 0x3B, 0x74, 0x6B, 0xF4,
+};
+static const uint8_t kPanelSleepOut[] = { 0x11 }, kPanelSleepIn[] = { 0x10 };
+static const uint8_t kPanelDisplayOn[] = { 0x29 }, kPanelDisplayOff[] = { 0x28 };
+static const uint8_t kPanelScaler[] = { 0xba, 0x01, 0x26, 0x08, 0x08, 0xf3 };
+static const uint8_t kPanelCaset[] = { 0x2a, 0x00, 0x00, 0x05, 0x9f };
+static const uint8_t kPanelPaset[] = { 0x2b, 0x00, 0x00, 0x0b, 0xdf };
+static const uint8_t kPanelSetArea[] = { 0x1a, 0x1f, 0x00, 0x00, 0x00, 0x00 };
+static const uint8_t kPanelTeOn[] = { 0x35, 0x00 };
+static const uint8_t kPanelErrFg[] = { 0xed, 0x04, 0x4c };
+static const uint8_t kPanelFfc[] = { 0xc5, 0x0d, 0x10, 0xb4, 0x3e, 0x01 };
+static const uint8_t kPanelTspHsync[] = { 0xb9, 0x01, 0xb0, 0xe1, 0x09, 0x00, 0x00, 0x00, 0x11, 0x03 };
+
+#define B2L_DCS(table) dcsWrite(table, sizeof(table))
+
+unsigned
+AppleCLCD::panelOn(void)
+{
+	unsigned sent = 0;
+	sent += B2L_DCS(kPanelKey1On);
+	sent += dsimPacket(0x07, kPanelDscOn, sizeof(kPanelDscOn));     /* compression mode */
+	sent += dsimPacket(0x0a, kPanelPps, sizeof(kPanelPps));         /* picture parameter set */
+	sent += B2L_DCS(kPanelKey1Off);
+	sent += B2L_DCS(kPanelSleepOut);
+	IOSleep(120);
+	sent += B2L_DCS(kPanelKey2On);
+	sent += B2L_DCS(kPanelScaler);
+	sent += B2L_DCS(kPanelKey2Off);
+	sent += B2L_DCS(kPanelCaset);
+	sent += B2L_DCS(kPanelPaset);
+	sent += B2L_DCS(kPanelKey1On);
+	sent += B2L_DCS(kPanelSetArea);
+	sent += B2L_DCS(kPanelTeOn);
+	sent += B2L_DCS(kPanelKey1Off);
+	sent += B2L_DCS(kPanelKey2On);
+	sent += B2L_DCS(kPanelErrFg);
+	sent += B2L_DCS(kPanelKey3On);
+	sent += B2L_DCS(kPanelFfc);
+	sent += B2L_DCS(kPanelKey3Off);
+	sent += B2L_DCS(kPanelTspHsync);
+	sent += B2L_DCS(kPanelKey2Off);
+	sent += B2L_DCS(kPanelKey1On);
+	sent += B2L_DCS(kPanelDisplayOn);
+	sent += B2L_DCS(kPanelKey1Off);
+	return sent;            /* 24 when all went out */
+}
+
+/* Display off, then sleep in, each inside the level-1 key. */
+unsigned
+AppleCLCD::panelOff(void)
+{
+	unsigned sent = 0;
+	sent += B2L_DCS(kPanelKey1On);
+	sent += B2L_DCS(kPanelDisplayOff);
+	sent += B2L_DCS(kPanelKey1Off);
+	sent += B2L_DCS(kPanelKey1On);
+	sent += B2L_DCS(kPanelSleepIn);
+	sent += B2L_DCS(kPanelKey1Off);
+	return sent;            /* 6 */
+}
+
 uint32_t
 AppleCLCD::watchRead(unsigned i)
 {
@@ -764,11 +900,21 @@ AppleCLCD::applyBlank(void)
 	auto light = [this]() {
 		if (!fPanelAsleep) return;
 		bool done = false;
-		for (unsigned attempt = 0; attempt < 3 && !done; attempt++) {
-			bool out = dsimShortWrite(0x11);        /* sleep out (harmless if awake) */
-			IOSleep(120);
-			done = dsimShortWrite(0x29) && out;     /* display on */
-			if (!done) IOSleep(20);
+		if (fPanelInit) {
+			unsigned sent = 0;
+			for (unsigned attempt = 0; attempt < 2 && !done; attempt++) {
+				sent = panelOn();
+				done = sent == 24;
+				if (!done) IOSleep(20);
+			}
+			b2l_diag_record("B2L FB: panel power-on sequence, %u of 24 packets\n", sent);
+		} else {
+			for (unsigned attempt = 0; attempt < 3 && !done; attempt++) {
+				bool out = dsimShortWrite(0x11);        /* sleep out (harmless if awake) */
+				IOSleep(120);
+				done = dsimShortWrite(0x29) && out;     /* display on */
+				if (!done) IOSleep(20);
+			}
 		}
 		fPanelAsleep = false;
 		bool held = holdFrames(false);
@@ -804,8 +950,15 @@ AppleCLCD::applyBlank(void)
 	if (sleepPanel) {
 		IOSleep(50);                                    /* the black frame reaches the panel */
 		bool idle = holdFrames(true);
-		bool dark = dsimShortWrite(0x28);               /* display off */
-		bool slept = dark && dsimShortWrite(0x10);      /* sleep in */
+		bool dark, slept;
+		if (fPanelInit) {
+			unsigned sent = panelOff();
+			dark = sent >= 3;
+			slept = sent == 6;
+		} else {
+			dark = dsimShortWrite(0x28);            /* display off */
+			slept = dark && dsimShortWrite(0x10);   /* sleep in */
+		}
 		IOSleep(120);
 		fPanelAsleep = dark;
 		if (!dark) {
