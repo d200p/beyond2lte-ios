@@ -777,6 +777,19 @@ static const uint8_t kPanelPps[128] = {          /* 1440x3040, slices 720x40 */
 static const uint8_t kPanelSleepOut[] = { 0x11 }, kPanelSleepIn[] = { 0x10 };
 static const uint8_t kPanelDisplayOn[] = { 0x29 }, kPanelDisplayOff[] = { 0x28 };
 static const uint8_t kPanelScaler[] = { 0xba, 0x01, 0x26, 0x08, 0x08, 0xf3 };
+/*
+ * Boot 41 (build 40): the scanout was right after every wake (0 rows unlike
+ * the frame) and the panel reported normal mode, display on, no DSI errors,
+ * yet the photos showed the top and bottom bands black or striped, the rest
+ * right. Those bands are S-Boot's self mask (s6e3ha9_enable_self_mask): with
+ * level 2 open it loads a mask image into the panel's SRAM (memory writes
+ * 4C/5C), then switches the mask on with 7A for rows 0-149 and 2890-3039.
+ * Sleep in evidently loses the SRAM while the mask stays on, and the bands
+ * show whatever the SRAM holds. The image is S-Boot's own
+ * data and stays out of this tree: after a wake the mask is switched off
+ * (7A 00); the corners then come straight from iOS's frame.
+ */
+static const uint8_t kPanelMaskOff[] = { 0x7a, 0x00 };
 static const uint8_t kPanelCaset[] = { 0x2a, 0x00, 0x00, 0x05, 0x9f };
 static const uint8_t kPanelPaset[] = { 0x2b, 0x00, 0x00, 0x0b, 0xdf };
 static const uint8_t kPanelSetArea[] = { 0x1a, 0x1f, 0x00, 0x00, 0x00, 0x00 };
@@ -840,6 +853,7 @@ AppleCLCD::panelOn(void)
 	IOSleep(120);
 	sent += B2L_DCS(kPanelKey2On);
 	sent += B2L_DCS(kPanelScaler);
+	sent += B2L_DCS(kPanelMaskOff);
 	sent += B2L_DCS(kPanelKey2Off);
 	sent += B2L_DCS(kPanelCaset);
 	sent += B2L_DCS(kPanelPaset);
@@ -981,10 +995,10 @@ AppleCLCD::applyBlank(void)
 			unsigned sent = 0;
 			for (unsigned attempt = 0; attempt < 2 && !done; attempt++) {
 				sent = panelOn();
-				done = sent == 24;
+				done = sent == 25;
 				if (!done) IOSleep(20);
 			}
-			b2l_diag_record("B2L FB: panel power-on sequence, %u of 24 packets\n", sent);
+			b2l_diag_record("B2L FB: panel power-on sequence, %u of 25 packets (self mask off)\n", sent);
 		} else {
 			for (unsigned attempt = 0; attempt < 3 && !done; attempt++) {
 				bool out = dsimShortWrite(0x11);        /* sleep out (harmless if awake) */
@@ -1143,11 +1157,12 @@ void
 AppleCLCD::panelRead(const char *when, bool hold)
 {
 	static const struct { uint8_t reg, length; } regs[] = {
-		{ 0x0a, 1 }, { 0x0e, 1 }, { 0x05, 1 }, { 0xee, 1 }, { 0xea, 3 },
+		{ 0x0a, 1 }, { 0x0e, 1 }, { 0x05, 1 }, { 0xee, 1 }, { 0xea, 3 }, { 0x7a, 4 },
 	};
 	if (fDsim == NULL || !fPanelSleep || fPanelAsleep || fPanelReads >= 40) return;
 	fPanelReads++;
 	bool held = hold && holdFrames(true);
+	dcsWrite(kPanelKey2On, sizeof(kPanelKey2On));          /* 0x7a sits behind level 2 */
 	char line[200];
 	int n = 0;
 	for (unsigned r = 0; r < sizeof(regs) / sizeof(regs[0]) && n < (int)sizeof(line) - 24; r++) {
@@ -1163,6 +1178,7 @@ AppleCLCD::panelRead(const char *when, bool hold)
 		}
 		if (report) n += snprintf(line + n, sizeof(line) - n, "!%04x", report);
 	}
+	dcsWrite(kPanelKey2Off, sizeof(kPanelKey2Off));
 	if (held) holdFrames(false);
 	uint32_t intsrc = fDsim[B2L_DSIM_INTSRC / 4];
 	b2l_diag_record("B2L PANEL READ %s:%s dsim intsrc=%08x%s\n", when, line, intsrc,
@@ -1301,11 +1317,11 @@ AppleCLCD::stripeScan(const char *when, bool locked)
 	    firstY == UINT32_MAX ? 0 : firstY, firstPanel, firstFrame, intsrc, samples, ns / 1000);
 }
 
-/* 1.5, 5, 20 and 60 s after the display came on. */
+/* 1.5 and 20 s after the display came on (boot 41 found the scanout right). */
 void
 AppleCLCD::scanWorker(thread_call_param_t owner, thread_call_param_t unused __unused)
 {
-	static const unsigned at_ms[] = { 1500, 5000, 20000, 60000 };
+	static const unsigned at_ms[] = { 1500, 20000 };
 	AppleCLCD *fb = (AppleCLCD *)owner;
 	unsigned step = fb->fScanStep;
 	if (step >= sizeof(at_ms) / sizeof(at_ms[0])) return;
