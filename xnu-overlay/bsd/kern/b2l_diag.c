@@ -27,8 +27,27 @@ void b2l_diag_record(const char *fmt,...)
     if((size_t)n>=sizeof(text))text[used-1]='\n';
     b2l_log_append_bytes(text,used);
 }
+/* S10: the b2l_diag boot argument, read once in the kernel. Its callers run
+ * on every system call and Mach message; parsing the boot arguments each time
+ * cost backboardd two scans of the whole command line per system call. The
+ * host tests change it between cases and read it every time. */
+static int b2l_diag_on(void)
+{
+#ifndef B2L_DIAG_HOST_TEST
+    static int cached=-1;
+    int v=__atomic_load_n(&cached,__ATOMIC_RELAXED);
+    if(v>=0)return v;
+#endif
+    int requested=0;PE_parse_boot_argn("b2l_diag",&requested,sizeof(requested));
+    int on=requested==1;
+#ifndef B2L_DIAG_HOST_TEST
+    __atomic_store_n(&cached,on,__ATOMIC_RELAXED);
+#endif
+    return on;
+}
 static int progress_role(void)
 {
+    if(!b2l_diag_on())return -1;
     proc_t p=current_proc();if(!p||!proc_is64bit(p))return -1;
     int r=-1;
     if(!strcmp(p->p_comm,"SpringBoard"))r=0;
@@ -37,9 +56,7 @@ static int progress_role(void)
     else if(!strcmp(p->p_comm,"configd"))r=3;       /* InterfaceNamer: IOKit quiesce / network stack waits */
     else if(!strcmp(p->p_comm,"assetsd"))r=4;
     else if(!strcmp(p->p_comm,"tccd"))r=5;
-    if(r<0)return -1;
-    int requested=0;PE_parse_boot_argn("b2l_diag",&requested,sizeof(requested));
-    return requested==1?r:-1;
+    return r;
 }
 static int role(void)
 {
@@ -115,7 +132,7 @@ static void progress_note(int r,unsigned event,uint64_t a,uint64_t b,uint64_t c,
 }
 void b2l_diag_progress(void)
 {
-    int requested=0;PE_parse_boot_argn("b2l_diag",&requested,sizeof(requested));if(requested!=1)return;
+    int requested=b2l_diag_on();if(requested!=1)return;
     static const char *const names[]={"SpringBoard","backboardd","Preferences","configd","assetsd","tccd"};
     uint64_t now=progress_seconds();unsigned records=0,busy=0;
     for(unsigned r=0;r<B2L_PROGRESS_ROLES;r++)for(unsigned i=0;i<B2L_PROGRESS_SLOTS;i++){
@@ -229,7 +246,7 @@ static void tcc_ipc(int rx,uint64_t addr,uint32_t n,uint32_t bits,int32_t id,
     proc_t p=current_proc();if(!p||!proc_is64bit(p))return;
     int slot=!strcmp(p->p_comm,"assetsd")?0:!strcmp(p->p_comm,"tccd")?1:-1;
     if(slot<0)return;
-    int requested=0;PE_parse_boot_argn("b2l_diag",&requested,sizeof(requested));
+    int requested=b2l_diag_on();
     if(requested!=1)return;
     uint32_t h[7]={0};
     if(rx){
@@ -465,7 +482,7 @@ static void tcc_result(unsigned code,int error,const uint64_t *args)
     proc_t p=current_proc();if(!p||!proc_is64bit(p))return;
     int slot=!strcmp(p->p_comm,"assetsd")?0:!strcmp(p->p_comm,"tccd")?1:-1;
     if(slot<0)return;
-    int requested=0;PE_parse_boot_argn("b2l_diag",&requested,sizeof(requested));
+    int requested=b2l_diag_on();
     if(requested!=1)return;
     if(code==SYS___mac_syscall){
         char policy[8];size_t n=0;

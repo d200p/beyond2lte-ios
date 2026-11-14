@@ -310,6 +310,16 @@ read_fvmap(void)
         }
         dlog("%s: %u validated rates, MHz%s\n", k->name, k->nrates, line);
     }
+    /* S10: memory and internal bus tables, logged only (standby clocks). */
+    static const char *const other[] = { "mif", "int" };
+    for (unsigned d = 0; d < 2; d++) {
+        uint32_t khz[B2L_ACPM_MAX_RATES]; unsigned n = 0;
+        char line[200]; size_t at = 0;
+        if (b2l_acpm_read_domain_rates(&reader, base, d, khz, &n)) { dlog("%s: FVMAP table invalid\n", other[d]); continue; }
+        for (unsigned l = 0; l < n && at < sizeof(line) - 12; l++)
+            at += (size_t)snprintf(line + at, sizeof(line) - at, " %u", khz[l] / 1000);
+        dlog("%s: %u validated rates, MHz%s\n", other[d], n, line);
+    }
     return 0;
 }
 

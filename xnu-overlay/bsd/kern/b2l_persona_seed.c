@@ -175,10 +175,54 @@ close:
     {int close_error=vnode_close(vp,FREAD|FWRITE,ctx);if(!error)error=close_error;}
     return error;
 }
+/* S10 port, b2l_ax_seed=0: the managed layer forces its values over Settings,
+ * so Reduce Motion, Reduce Transparency and cross-fade transitions could not be
+ * turned off. When the managed file is exactly the seeded one, it is rewritten
+ * as an empty dictionary: nothing forced, Settings decides. Any other content
+ * is left alone. Returns 0 cleared, ENOENT absent, EEXIST not ours, or an error. */
+static const char ax_empty_plist[]=
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+    "<plist version=\"1.0\"><dict/></plist>\n";
+static int ax_unseed(const char *path,vfs_context_t ctx)
+{
+    const size_t n=sizeof(ax_plist)-1,e=sizeof(ax_empty_plist)-1;static char verify[sizeof(ax_plist)];
+    struct vnode_attr va;vnode_t vp=NULL;int resid=0;
+    int error=vnode_open(path,FREAD|FWRITE,0,VNODE_LOOKUP_NOFOLLOW_ANY,&vp,ctx);
+    if(error)return error;
+    if(!root_type(vp,VREG)){error=EINVAL;goto close;}
+    VATTR_INIT(&va);VATTR_WANTED(&va,va_data_size);VATTR_WANTED(&va,va_nlink);
+    error=vnode_getattr(vp,&va,ctx);if(error)goto close;
+    if(!VATTR_IS_SUPPORTED(&va,va_data_size)||!VATTR_IS_SUPPORTED(&va,va_nlink)||
+       va.va_nlink!=1||va.va_data_size!=(off_t)n){error=EEXIST;goto close;}
+    error=vn_rdwr(UIO_READ,vp,verify,(int)n,0,UIO_SYSSPACE,0,kauth_cred_get(),&resid,current_proc());
+    if(error)goto close;
+    if(resid||memcmp(verify,ax_plist,n)){error=EEXIST;goto close;}
+    VATTR_INIT(&va);VATTR_SET(&va,va_data_size,0);
+    error=vnode_setattr(vp,&va,ctx);if(error)goto close;
+    error=vn_rdwr(UIO_WRITE,vp,(caddr_t)ax_empty_plist,(int)e,0,UIO_SYSSPACE,IO_SYNC,
+        kauth_cred_get(),&resid,current_proc());
+    if(!error&&resid)error=EIO;
+    if(error)goto close;
+    error=VNOP_FSYNC(vp,MNT_WAIT,ctx);if(error)goto close;
+    error=vn_rdwr(UIO_READ,vp,verify,(int)e,0,UIO_SYSSPACE,0,kauth_cred_get(),&resid,current_proc());
+    if(!error&&(resid||memcmp(verify,ax_empty_plist,e)))error=EIO;
+close:
+    {int close_error=vnode_close(vp,FREAD|FWRITE,ctx);if(!error)error=close_error;}
+    return error;
+}
 static void b2l_accessibility_before_init(vfs_context_t ctx)
 {
     int seed=0;
-    if(!PE_parse_boot_argn("b2l_ax_seed",&seed,sizeof(seed))||seed!=1){
+    bool given=PE_parse_boot_argn("b2l_ax_seed",&seed,sizeof(seed));
+    if(given&&seed==0){
+        int cleared=ax_unseed(ax_managed_path,ctx);
+        int error=cleared?0:VFS_SYNC(vnode_mount(rootvnode),MNT_WAIT,ctx);
+        printf("B2L AXSEED: managed accessibility defaults cleared=%d sync=%d (0 cleared, %d absent, %d not ours); Settings decides\n",
+            cleared,error,ENOENT,EEXIST);
+        return;
+    }
+    if(!given||seed!=1){
         printf("B2L AXSEED: disabled; accessibility defaults untouched\n");return;
     }
     int managed=ax_directory(ax_managed_dir,0,0,0755,ctx);
@@ -188,6 +232,59 @@ static void b2l_accessibility_before_init(vfs_context_t ctx)
     int error=VFS_SYNC(vnode_mount(rootvnode),MNT_WAIT,ctx);
     printf("B2L AXSEED: reduce motion/transparency defaults managed=%d user=%d sync=%d (0 seeded, %d preserved different file)\n",
         managed,user,error,EEXIST);
+}
+/* S10 port, b2l_mg_refresh=1: MobileGestalt keeps what it computed once, so a
+ * new device-tree value (display-corner-radius) is only read after its cache
+ * is rebuilt. The cache is renamed once to .b2l-before-corner-v2.plist in the
+ * same folder; MobileGestalt then recreates it natively. Once the backup
+ * exists nothing more happens. Returns 0 renamed, EEXIST already done. */
+static const char mg_cache_path[]="/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist";
+static const char mg_cache_backup[]="/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.b2l-before-corner-v2.plist";
+static int b2l_mg_cache_refresh(vfs_context_t ctx)
+{
+    vnode_t saved=NULLVP;
+    int error=vnode_lookup(mg_cache_backup,0,&saved,ctx);
+    if(!error){vnode_put(saved);return EEXIST;}
+    if(error!=ENOENT)return error;
+    struct nameidata from,to;bool have_to=false;
+    NDINIT(&from,DELETE,OP_UNLINK,WANTPARENT,UIO_SYSSPACE,CAST_USER_ADDR_T(mg_cache_path),ctx);
+    error=namei(&from);if(error)return error;
+    if(!root_type(from.ni_vp,VREG)||!root_type(from.ni_dvp,VDIR)){error=EINVAL;goto done;}
+    NDINIT(&to,RENAME,OP_RENAME,WANTPARENT,UIO_SYSSPACE,CAST_USER_ADDR_T(mg_cache_backup),ctx);
+    error=namei(&to);if(error)goto done;have_to=true;
+    if(to.ni_vp){error=EEXIST;goto done;}
+    if(to.ni_dvp!=from.ni_dvp){error=EXDEV;goto done;}
+    error=vn_rename(from.ni_dvp,&from.ni_vp,&from.ni_cnd,NULL,to.ni_dvp,&to.ni_vp,&to.ni_cnd,NULL,VFS_RENAME_EXCL,ctx);
+    if(!error)error=VNOP_FSYNC(from.ni_dvp,MNT_WAIT,ctx);
+done:
+    if(have_to)lookup_done(&to);
+    lookup_done(&from);
+    return error;
+}
+static void b2l_mg_before_init(vfs_context_t ctx)
+{
+    int refresh=0;
+    if(!PE_parse_boot_argn("b2l_mg_refresh",&refresh,sizeof(refresh))||refresh!=1)return;
+    int error=b2l_mg_cache_refresh(ctx);
+    int sync=error?0:VFS_SYNC(vnode_mount(rootvnode),MNT_WAIT,ctx);
+    printf("B2L MG: MobileGestalt cache refresh error=%d sync=%d (0 moved aside, %d already done, %d no cache)\n",
+        error,sync,EEXIST,ENOENT);
+}
+/*
+ * S10: TextInput's key image cache (TIImageCache) lives in
+ * ~mobile/Library/Caches/com.apple.keyboards/images/, which this root never
+ * had. Without it every key image is drawn again on every press: in boot 30
+ * Notes kept a whole core busy in TIImageCacheClient and UIKit image lookups
+ * while typing 3 or 4 letters a minute. Created once, mobile-owned; an
+ * existing directory is left alone.
+ */
+static void b2l_keyboard_cache_before_init(vfs_context_t ctx)
+{
+    static const char base[]="/private/var/mobile/Library/Caches/com.apple.keyboards";
+    static const char images[]="/private/var/mobile/Library/Caches/com.apple.keyboards/images";
+    int error=ax_directory(base,501,501,0755,ctx);
+    if(!error)error=ax_directory(images,501,501,0755,ctx);
+    printf("B2L KEYBOARD: key image cache directory error=%d\n",error);
 }
 #endif
 #ifndef B2L_PERSONA_HOST_TEST
@@ -201,8 +298,11 @@ void b2l_persona_before_init(void)
     b2l_acpm_dvfs_start();
     b2l_wifi_diag_start();
     if(rootvnode&&!vfs_isrdonly(vnode_mount(rootvnode))&&
-       !strcmp(vfs_statfs(vnode_mount(rootvnode))->f_fstypename,"hfs"))
+       !strcmp(vfs_statfs(vnode_mount(rootvnode))->f_fstypename,"hfs")){
         b2l_accessibility_before_init(vfs_context_current());
+        b2l_mg_before_init(vfs_context_current());
+        b2l_keyboard_cache_before_init(vfs_context_current());
+    }
 #endif
     if(!b2l_amfi_active()||!rootvnode||vfs_isrdonly(vnode_mount(rootvnode))||
        strcmp(vfs_statfs(vnode_mount(rootvnode))->f_fstypename,"hfs"))return;

@@ -55,6 +55,9 @@ public:
 /* Retained surface for an id, or NULL. */
 B2LSurface *b2l_surface_copy(uint32_t id);
 
+/* Modification seed: changes each time a client unlocks after writing. */
+uint32_t b2l_surface_current_seed(B2LSurface *s);
+
 /*
  * Publish physical memory (the panel framebuffer) as a surface. Returns a
  * retained surface that stays in the id table until released by the caller

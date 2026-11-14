@@ -137,6 +137,14 @@ int b2l_build_device_tree(void *buffer, b2l_size capacity,
     text_prop(&w, &product, "artwork-display-gamut", "sRGB");
     text_prop(&w, &product, "graphics-featureset-class", "GLES2,0");
     text_prop(&w, &product, "graphics-featureset-fallbacks", "GLES2,0");
+    /* S10 port: MobileGestalt's DeviceCornerRadius, in points, is this
+     * 8-byte CFData, numerator/denominator (u32 each); absent or under 1 it
+     * falls back to a fixed 39 points (the iPhone X radius). The S10 panel's
+     * corners are about 140 physical pixels, so with 393 points across 1440
+     * pixels about 38 points. (Radius 1, boot 24, did not reduce draw kind 52:
+     * that kind is not the display corner mask.) */
+    b2l_u32 corner_radius[2] = { 38, 1 };
+    prop(&w, &product, "display-corner-radius", corner_radius, sizeof(corner_radius));
     end(&w, &product);
     /* Native MG HomeButtonType reads this four-byte CFData as a number.
      * Absent metadata defaults to mechanical Home (0). This device has none. */

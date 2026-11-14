@@ -383,13 +383,48 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 "cs_enforcement_disable=1 launchd_unsecure_cache=1 "
                 "b2l_system_log=1 b2l_native_cache=1 b2l_precompiled=1 "
                 "b2l_rtc_wait=0 b2l_boot_timing=1 b2l_console_quiet=1 "
-                "b2l_cache_interactive=1 b2l_ax_seed=1 b2l_dvfs=2 "
-                "b2l_dvfs_cl0=1950000 b2l_dvfs_cl1=2002000 b2l_dvfs_cl2=2080000 "
-                "b2l_wifi_diag=5 "
+                /* b2l_dvfs=1: tables and measured clocks only, no mailbox: the
+                 * Mali driver (B2LMali) owns the ACPM mailbox for GPU, memory
+                 * and CPU clocks; two clients would race. Mode 1 logs the
+                 * FVMAP tables, memory (MIF) included, for standby clocks. */
+                /* b2l_ax_seed=0: clear the seeded managed accessibility file,
+                 * so Reduce Motion/Transparency and cross-fades follow Settings. */
+                "b2l_cache_interactive=1 b2l_ax_seed=0 b2l_dvfs=1 "
+                /* S10: the development kernel's interrupt-masked and
+                 * preemption-disabled measurements are off, as in release
+                 * kernels; boot 30 showed them on every context switch. */
+                "interrupt-masked-debug-mode=0 sched_preemption_disable_debug_mode=0 "
+                /* Rebuild MobileGestalt's cache once (the old one is kept), so
+                 * the new /product display-corner-radius is read. */
+                "b2l_mg_refresh=1 "
+                /* The GPU translation library is back in backboardd: boot 21,
+                 * without it, showed the same glass-bar stripes. The GPU runs
+                 * at its 702 MHz top when busy (fork default 433); B2LMali
+                 * still drops it above 85 C on the g3d sensor. */
+                "b2l_gpu_khz=702000 "
+                /* Fork build 0148 scanout from surfaces is untested: copy path. */
+                "b2l_scanout=0 "
+                /* The fork keeps 136 black rows for the S10+ camera pill; the
+                 * S10 hole is small, so iOS keeps the whole panel. */
+                "b2l_fb_top_inset=0 "
+                /* iOS draws 1179x2556, the iPhone 15/16 geometry (393x852
+                 * points at 3x, 31% fewer pixels than the panel); the
+                 * framebuffer copy scales it up. UIKit only accepts real iPhone
+                 * geometries: 375x792 and 400x844 points (boot 22) got its red
+                 * fallback status bar. 1200 wide removed the App Library
+                 * stripes but not those in Settings and Maps. */
+                "b2l_fb_render_width=1179 b2l_fb_render_height=2556 "
+                "b2l_wifi_diag=6 "
+                /* S10: the per-syscall/IPC boundary diagnostics are off in
+                 * the working system. With b2l_diag=1 every system call of
+                 * backboardd, SpringBoard and Settings went through them, and
+                 * those three ran with CG_CONTEXT_SHOW_BACKTRACE=1. */
+                "b2l_diag=0 "
 #else
                 "rd=b2l-diagnostic b2l_root_rw=0 b2l_system_log=0 b2l_native_cache=0 "
+                "b2l_diag=1 "
 #endif
-                "b2l_diag=1 b2l_userspace_bootstrap=0 exception_log_max_pid=4096");
+                "b2l_userspace_bootstrap=0 exception_log_max_pid=4096");
     Entry = Base + Mach.entry - Mach.virtual_base;
     if(Kernel){FreePool(Kernel); Kernel = NULL;}
     if (Root) { Root->Close(Root); Root = NULL; }

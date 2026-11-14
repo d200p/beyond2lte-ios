@@ -533,9 +533,35 @@ b2l_hid_key(int key, int down)
 	}
 }
 
+/* Rows of the panel hidden above the presented display (camera band),
+ * set once by the framebuffer before userspace runs. */
+static uint32_t gB2LTouchInset, gB2LTouchPanelRows;
+
+extern "C" void
+b2l_hid_set_display_inset(uint32_t inset_rows, uint32_t panel_rows)
+{
+	if (panel_rows && inset_rows < panel_rows) {
+		gB2LTouchInset = inset_rows;
+		gB2LTouchPanelRows = panel_rows;
+	}
+}
+
+/* Raw 0..4095 panel Y to 0..4095 across the presented area below the band;
+ * a touch inside the band lands on the top edge. */
+extern "C" int
+b2l_hid_touch_display_y(int y, uint32_t inset, uint32_t rows)
+{
+	if (!inset || !rows || inset >= rows) return y;
+	int64_t pixel = ((int64_t)y * (int64_t)rows) / 4095 - (int64_t)inset;
+	if (pixel < 0) pixel = 0;
+	int64_t out = (pixel * 4095) / (int64_t)(rows - inset);
+	return (int)(out > 4095 ? 4095 : out);
+}
+
 extern "C" void
 b2l_hid_touch(int finger, int down, int x, int y)
 {
+	y = b2l_hid_touch_display_y(y, gB2LTouchInset, gB2LTouchPanelRows);
 	if (gB2LTouch) {
 		gB2LTouch->touch(finger, down != 0, x, y);
 	}

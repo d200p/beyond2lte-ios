@@ -200,6 +200,12 @@ b2l_surface_copy(uint32_t id)
 	return s;
 }
 
+uint32_t
+b2l_surface_current_seed(B2LSurface *s)
+{
+	return *b2l_surface_seed(s);
+}
+
 /* The table lock; the framebuffer may publish a surface before the root starts. */
 static void
 b2l_surface_init_lock(void)
@@ -693,8 +699,20 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		IOBufferMemoryDescriptor *mem = NULL;
 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&b2l_surface_wired) +
 		    s->allocSize <= B2L_SURFACE_WIRED_MAX) {
-			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
+			/* Panel-sized BGRA surfaces get contiguous memory under 4 GB, so the
+			 * display controller can scan them out (B2LFramebuffer); the first
+			 * few only, and an ordinary allocation if that fails. */
+			static int scanout_candidates;
+			if (s->pixelFormat == 0x42475241 /* 'BGRA', as B2LFramebuffer */ && s->bytesPerElement == 4 && s->allocSize >= (16u << 20) &&
+			    OSIncrementAtomic(&scanout_candidates) < 6) {
+				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
+				    s->allocSize, 0x00000000FFFFF000ULL);
+			}
+			if (mem == NULL) {
+				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
+			}
 		}
 		if (mem == NULL) {
 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&b2l_surface_wired);

@@ -48,6 +48,14 @@ jobs:
       B2L_KERNEL_ONLY: '1'
       BUILD_JOBS: '2'
       BUILD_MEMORY_BYTES: '6442450944'
+      # S10 port: compiler cache kept between runs (scripts/build-kernel.sh).
+      B2L_CCACHE: '1'
+      CCACHE_DIR: ${{ github.workspace }}/out/ci-env/ccache
+      CCACHE_MAXSIZE: 2G
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_SLOPPINESS: include_file_mtime,include_file_ctime,time_macros
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+      HOMEBREW_NO_INSTALL_CLEANUP: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -62,6 +70,22 @@ jobs:
             out/ci-env/kdk/System/Library/Frameworks
             out/ci-env/kdk/System/Library/KernelSupport
             out/ci-env/kdk/usr
+      # S10 port: Mesa for iOS, from the newest Mesa workflow run that built it
+      # (our code and Mesa, MIT; no Apple payload). Missing: built without it.
+      # Before the preparation, which embeds it (scripts/prepare-xnu.sh).
+      - name: Fetch libb2l-mesa
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          for run in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow mesa-panfrost.yml --branch "$GITHUB_REF_NAME" \
+              --status success --limit 5 --json databaseId -q '.[].databaseId'); do
+            if gh run download "$run" --repo "$GITHUB_REPOSITORY" -n b2l-mesa -D out/b2l-mesa 2>/dev/null; then
+              echo "libb2l-mesa from Mesa run $run"; ls -l out/b2l-mesa; break
+            fi
+          done
+          [[ -f out/b2l-mesa/libb2l-mesa.dylib ]] || echo 'no Mesa library: kernel built without it'
       - name: Prepare pinned kernel dependencies
         shell: bash
         run: |
@@ -78,6 +102,15 @@ jobs:
             out/ci-env/kdk/System/Library/Frameworks
             out/ci-env/kdk/System/Library/KernelSupport
             out/ci-env/kdk/usr
+      - name: Restore compiler cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: b2l-ccache-v1-${{ github.sha }}
+          restore-keys: b2l-ccache-v1-
+          path: out/ci-env/ccache
+      - name: Install ccache
+        shell: bash
+        run: brew install ccache || echo 'ccache unavailable; building without it'
       - name: Validate storage boundaries and build XNU
         shell: bash
         run: |
@@ -99,6 +132,12 @@ jobs:
           python3 tests/test_native_cache_interactive.py
           bash scripts/test-ufs-transport.sh
           bash scripts/ci/kernel.sh build 2>&1 | tee -a out/ci-logs/kernel.log
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          key: b2l-ccache-v1-${{ github.sha }}
+          path: out/ci-env/ccache
       - name: Upload diagnostic reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

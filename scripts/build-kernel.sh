@@ -17,7 +17,23 @@ python3 "$repo_root/scripts/stage-libpthread.py" "$xnu_path"
 python3 "$repo_root/scripts/stage-bearssl.py" "$xnu_path"
 python3 "$repo_root/scripts/stage-hfs.py" "$xnu_path"
 cd "$xnu_path"
-exec make SDKROOT=macosx KDKROOT="$KDKROOT" \
+# S10 port: B2L_CCACHE=1 compiles through ccache (CI keeps its directory between
+# runs); without it, or without ccache, the build is exactly as before.
+compiler_args=()
+if [[ "${B2L_CCACHE:-0}" == 1 ]] && command -v ccache >/dev/null; then
+  # MIG runs $(CC) as a single path, so CC must not contain a space: small
+  # wrapper scripts call ccache with the real compilers.
+  wrap_dir="$build_root/ccache-bin"
+  mkdir -p "$wrap_dir"
+  for tool in clang clang++; do
+    printf '#!/bin/sh\nexec ccache %s "$@"\n' "$(xcrun -sdk macosx -find "$tool")" > "$wrap_dir/$tool"
+    chmod +x "$wrap_dir/$tool"
+  done
+  compiler_args=(CC="$wrap_dir/clang" CXX="$wrap_dir/clang++")
+  ccache --zero-stats >/dev/null || true
+  echo "Compiling through ccache ($(ccache --version | head -1))"
+fi
+exec make SDKROOT=macosx KDKROOT="$KDKROOT" ${compiler_args[@]+"${compiler_args[@]}"} \
   TARGET_CONFIGS='DEVELOPMENT ARM64 B2L' \
   PLATFORM=iPhoneOS PLATFORM_FOR_CONFIG=iPhoneOS SDKVERSION=26.5 BTI_BUILD=0 \
   RC_DARWIN_KERNEL_VERSION=25.5.0 BUILD_LTO=0 BUILD_WERROR=0 \

@@ -9,6 +9,8 @@ s=(root/'xnu-overlay/iokit/Kernel/arm/B2LFramebuffer.cpp').read_text()
 get=s[s.index('static uint32_t\nget32('):s.index('\nbool\nIOMobileFramebufferUserClient::initWithTask')]
 # The b2l_fb_probe diagnostic (IOMemoryDescriptor, IOMallocData) is not part of the present path.
 get=get[:get.index('static uint64_t\nb2l_probe_hash(')]+get[get.index('/* Wait until no presentation is queued or being copied. */'):]
+# The display-controller dump and the scanout flip touch registers; the mock class stubs them out.
+get=get[:get.index('void\nAppleCLCD::deconDumpMain(')]+get[get.index('/* Copy the queued layers into the panel, then release them and go idle. */'):]
 code=r'''
 #include <cassert>
 #include <cstdint>
@@ -68,7 +70,7 @@ static void IOLockSleep(void*,void*,int){assert(locks==1);++sleeps;--locks;run_w
 static void IOLockWakeup(void*,void*,bool){++wakeups;}
 class AppleCLCD {
  public:
- uintptr_t fPixels;uint32_t fWidth=4,fHeight=3,fRowBytes=20;
+ uintptr_t fPixels;uintptr_t fPanelPixels=0;uint32_t fTopInset=0;uint32_t fWidth=4,fHeight=3,fRowBytes=20;
  B2LSurface *fSurface=nullptr;void *fLock=nullptr;bool fConsolePaused=false;
  uint32_t fPerfSwaps=0,fPerfCopies=0,fPerfFull=0,fPerfReports=0,fPerfWaits=0,fCopyLogs=0;
  uint64_t fPerfPixels=0,fPerfTicks=0,fPerfMaxTicks=0,fPerfWritten=0,fPerfWaitTicks=0;
@@ -77,6 +79,9 @@ class AppleCLCD {
  Job fJob{};bool fBusy=false;thread_call_t fCopyCall=nullptr;uint8_t *fShadow=nullptr;bool fShadowValid=false;
  void swap(const uint8_t*);void waitIdle(void);void runCopy(void);
  static void copyWorker(thread_call_param_t owner, thread_call_param_t unused);
+ /* Scanout is off in this harness: every frame takes the copy path under test. */
+ bool flipTo(B2LSurface*,const Layer*){return false;}
+ void pointAtPanel(){}
 };
 static AppleCLCD *the_fb;
 static void run_worker(){if(pending_owner){pending_owner=nullptr;AppleCLCD::copyWorker(the_fb,nullptr);}}

@@ -1,0 +1,18 @@
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -3005,6 +3005,7 @@
+ extern uint32_t b2l_irq_ack(void);
+ extern void b2l_irq_eoi(uint32_t iar);
+ extern void b2l_irq_record(unsigned intid);
++extern void b2l_pc_sample(arm_saved_state_t *state);
+ #endif
+ 
+ void
+@@ -3020,6 +3021,7 @@
+ 	if (intid < 1020) {
+ 		b2l_irq_record(intid);
+ 		if (intid == B2L_TIMER_INTID) {
++			b2l_pc_sample(state);
+ 			cdp->cpu_decrementer = -1;
+ 			ml_interrupt_masked_debug_start(rtclock_intr, DBG_INTR_TYPE_TIMER);
+ 			rtclock_intr(TRUE);

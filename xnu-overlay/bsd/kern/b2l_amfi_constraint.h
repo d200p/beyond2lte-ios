@@ -49,11 +49,34 @@ b2l_amfi_constraint_reply(user64_addr_t output, uint32_t code,
  * processes. DYLD_* variables, insertion and interposing stay disallowed. */
 #define B2L_AMFI_SYSCALL_DYLD_POLICY_SELF 90
 #define B2L_AMFI_DYLD_OUTPUT_ALLOW_AT_PATH (1ull << 0)
+#define B2L_AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS (1ull << 1)
+#define B2L_AMFI_DYLD_OUTPUT_ALLOW_FAILED_INSERTION (1ull << 5)
 struct b2l_amfi_dyld_policy_args {
     uint64_t input_flags;
     user64_addr_t output;
 };
 _Static_assert(sizeof(struct b2l_amfi_dyld_policy_args) == 16, "AMFI dyld policy ABI");
+/* Only backboardd may honour DYLD_INSERT_LIBRARIES, for the GPU translation
+ * layer, and a library that fails to load must not stop it. */
+extern int b2l_gpu_ui_is_ready(void);
+/* S10 port: and every app, for the keyboard relief library (b2l-kbd.c,
+ * b2l_kbd_paths.h). */
+#include "b2l_kbd_paths.h"
+extern int b2l_kbd_is_ready(void);
+static bool
+b2l_amfi_gpu_ui_process(struct proc *process)
+{
+    char path[256];
+    int length = sizeof(path);
+    if (!b2l_gpu_ui_is_ready()) return false;
+    vnode_t vnode = proc_getexecutablevnode(process);
+    if (vnode == NULLVP) return false;
+    int error = vn_getpath(vnode, path, &length);
+    vnode_put(vnode);
+    return !error && (!strcmp(path, "/usr/libexec/backboardd") ||
+        (b2l_kbd_is_ready() && b2l_kbd_app_path(path)));
+}
+
 static int
 b2l_amfi_dyld_policy(struct proc *process, user_addr_t argument)
 {
@@ -62,6 +85,9 @@ b2l_amfi_dyld_policy(struct proc *process, user_addr_t argument)
     if (error) return error;
     if (!args.output) return EINVAL;
     uint64_t flags = proc_issetugid(process) ? 0 : B2L_AMFI_DYLD_OUTPUT_ALLOW_AT_PATH;
+    if (flags && b2l_amfi_gpu_ui_process(process)) {
+        flags |= B2L_AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS | B2L_AMFI_DYLD_OUTPUT_ALLOW_FAILED_INSERTION;
+    }
     return copyout(&flags, args.output, sizeof(flags));
 }
 
