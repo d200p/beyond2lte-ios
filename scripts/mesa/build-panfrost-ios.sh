@@ -3,8 +3,10 @@
 # ES renderer (CA::OGL::GLESContext, which iOS 26 still tries after Metal).
 # Cross-compiles Mesa's Panfrost (Mali-G76 is Bifrost v7) for iOS arm64e with
 # the same pointer-authentication choices as userspace/b2l-gpu.c, so that the
-# errors of each step show what the port needs. Nothing here runs on the phone
-# yet: the B2LMali libdrm (scripts/mesa/b2l-drm) is built, no EAGL frontend.
+# errors of each step show what the port needs. The product is
+# libb2l-mesa.dylib (scripts/mesa/b2l-target): Panfrost, the GL state tracker
+# and our frontend over the B2LMali libdrm (scripts/mesa/b2l-drm); no EAGL
+# layer yet.
 #
 # Usage: build-panfrost-ios.sh MESA_SOURCE_DIR BUILD_DIR
 set -euo pipefail
@@ -67,10 +69,30 @@ echo '--- libdrm calls'; cat "$build/libdrm-calls.txt"; echo '--- DRM ioctls'; c
 # os_mmap/os_munmap (src/util/os_mman.h) go to b2l_drm_mmap/b2l_drm_munmap,
 # which fall back to mmap/munmap for any other descriptor.
 python3 "$repo/scripts/mesa/b2l-drm/patch_os_mman.py" "$src/src/util/os_mman.h"
+# Our target, built by Mesa's own meson like the OSMesa one.
+target="$src/src/gallium/targets/b2l"
+mkdir -p "$target"
+cp "$repo/scripts/mesa/b2l-target/meson.build" "$repo/scripts/mesa/b2l-target/b2l_mesa.c" \
+  "$repo/scripts/mesa/b2l-drm/b2l_drm.c" "$repo/scripts/mesa/b2l-drm/b2l_drm.h" \
+  "$repo/xnu-overlay/iokit/Kernel/arm/b2l_mali_uapi.h" "$target/"
+grep -q "targets/b2l" "$src/src/gallium/meson.build" || printf "\nsubdir('targets/b2l')\n" >> "$src/src/gallium/meson.build"
 meson setup "$build/out" "$src" --cross-file "$cross" --buildtype=release \
   --default-library=static "${args[@]}" 2>&1 | tee "$build/configure.log"
 ninja -C "$build/out" -k 0 2>&1 | tee "$build/build.log"
-# The B2LMali libdrm, against this release's DRM uapi headers.
+# The library, stripped of local symbols and ad-hoc signed like b2l-gpu.dylib.
+lib="$build/out/src/gallium/targets/b2l/libb2l-mesa.dylib"
+mkdir -p "$build/b2l-mesa"
+if [[ -f "$lib" ]]; then
+  cp "$lib" "$build/b2l-mesa/libb2l-mesa.dylib"
+  "$strip" -x "$build/b2l-mesa/libb2l-mesa.dylib"
+  codesign --force --sign - "$build/b2l-mesa/libb2l-mesa.dylib"
+  { ls -l "$lib" "$build/b2l-mesa/libb2l-mesa.dylib"; xcrun --sdk iphoneos nm -gU "$build/b2l-mesa/libb2l-mesa.dylib" | grep -c ' T ' ;
+    xcrun --sdk iphoneos nm -gU "$build/b2l-mesa/libb2l-mesa.dylib" | grep ' _b2l_'; xcrun --sdk iphoneos otool -L "$build/b2l-mesa/libb2l-mesa.dylib";
+    gzip -9 -c "$build/b2l-mesa/libb2l-mesa.dylib" | wc -c; } 2>&1 | tee "$build/b2l-mesa.log"
+else
+  echo "b2l-mesa: not built" | tee "$build/b2l-mesa.log"
+fi
+# The B2LMali libdrm alone, against this release's DRM uapi headers, with -Werror.
 drm_out="$build/b2l-drm"
 mkdir -p "$drm_out"
 if "$cc" -target arm64e-apple-ios26.0 -isysroot "$sdk" -fno-ptrauth-returns -fno-ptrauth-calls \

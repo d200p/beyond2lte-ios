@@ -10,7 +10,7 @@ on:
     inputs:
       mesa_version:
         description: Mesa release from archive.mesa3d.org
-        default: '24.3.4'
+        default: '25.0.7'
   push:
     branches: [s10-gpu]
     paths:
@@ -29,7 +29,7 @@ jobs:
       - name: Fetch Mesa
         shell: bash
         env:
-          MESA_VERSION: ${{ inputs.mesa_version || '24.3.4' }}
+          MESA_VERSION: ${{ inputs.mesa_version || '25.0.7' }}
         run: |
           set -euo pipefail
           [[ "$MESA_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'bad version'; exit 1; }
@@ -47,7 +47,7 @@ jobs:
       - name: Configure and build Panfrost for iOS arm64e
         shell: bash
         env:
-          MESA_VERSION: ${{ inputs.mesa_version || '24.3.4' }}
+          MESA_VERSION: ${{ inputs.mesa_version || '25.0.7' }}
         run: |
           set -uo pipefail
           export PATH="$PWD/out/mesa/venv/bin:$(brew --prefix bison)/bin:$(brew --prefix flex)/bin:$PATH"
@@ -55,6 +55,7 @@ jobs:
           echo '--- configure tail'; tail -60 out/mesa/ios/configure.log || true
           echo '--- first errors'; grep -n 'error:' out/mesa/ios/build.log | head -80 || true
           echo '--- b2l-drm'; cat out/mesa/ios/b2l-drm.log || true
+          echo '--- b2l-mesa'; cat out/mesa/ios/b2l-mesa.log || true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:
@@ -63,4 +64,11 @@ jobs:
             out/mesa/mesa.sha256
             out/mesa/ios/*.log
             out/mesa/ios/ios-arm64e.txt
+          if-no-files-found: warn
+      # Our code and Mesa (MIT) only, built against the public iOS SDK.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: b2l-mesa
+          path: out/mesa/ios/b2l-mesa/libb2l-mesa.dylib
           if-no-files-found: warn

@@ -75,8 +75,9 @@ static struct {
 	uint64_t jobs, faults;
 } drm = { .lock = PTHREAD_MUTEX_INITIALIZER, .anchor = -1 };
 
-static void
-note(const char *format, ...)
+/* One line in the kernel log, "B2L GPU UI: ..." (B2LMali log selector). */
+void
+b2l_drm_note(const char *format, ...)
 {
 	char text[B2L_MALI_MAX_LOG - 1];
 	va_list ap;
@@ -148,7 +149,7 @@ b2l_drm_open(void)
 		drm.anchor = p[0];
 		drm.dev = st.st_dev;
 		drm.ino = st.st_ino;
-		note("libdrm: panfrost device open in pid %d, gpu 0x%x", getpid(), drm.props.gpu_id);
+		b2l_drm_note("libdrm: panfrost device open in pid %d, gpu 0x%x", getpid(), drm.props.gpu_id);
 	}
 	fd = fcntl(drm.anchor, F_DUPFD_CLOEXEC, 0);
 	pthread_mutex_unlock(&drm.lock);
@@ -762,14 +763,14 @@ submit(struct drm_panfrost_submit *args)
 	    NULL);
 	if (kr != KERN_SUCCESS) {
 		if (drm.faults++ < MAX_LOGGED) {
-			note("libdrm: submit jc=0x%llx refused kr=0x%x", (unsigned long long)args->jc, kr);
+			b2l_drm_note("libdrm: submit jc=0x%llx refused kr=0x%x", (unsigned long long)args->jc, kr);
 		}
 		return fail(EIO);
 	}
 	drm.jobs++;
 	/* A faulted job is reported like Linux does: through the log, not the ioctl. */
 	if (out[0] != B2L_MALI_STATUS_DONE && drm.faults++ < MAX_LOGGED) {
-		note("libdrm: job %llu jc=0x%llx req=%u status=0x%llx", (unsigned long long)drm.jobs,
+		b2l_drm_note("libdrm: job %llu jc=0x%llx req=%u status=0x%llx", (unsigned long long)drm.jobs,
 		    (unsigned long long)args->jc, args->requirements, (unsigned long long)out[0]);
 	}
 	if (args->out_sync != 0) {

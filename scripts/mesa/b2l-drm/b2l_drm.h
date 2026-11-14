@@ -18,6 +18,7 @@ extern "C" {
 int b2l_drm_open(void);
 void *b2l_drm_mmap(void *addr, size_t length, int prot, int flags, int fd, int64_t offset);
 int b2l_drm_munmap(void *addr, size_t length);
+void b2l_drm_note(const char *format, ...) __attribute__((format(printf, 1, 2)));
 
 #ifdef __cplusplus
 }
