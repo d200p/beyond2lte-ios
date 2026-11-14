@@ -100,6 +100,14 @@ fi
 # StachowiakDawid fork). Built from userspace/b2l-gpu.c against the iPhoneOS SDK
 # and embedded in the kernel, which publishes it at boot. B2L_GPU_LIBRARY=0
 # builds a kernel without it; otherwise a failure stops the build.
+# S10 port: Mesa for iOS (scripts/mesa), compressed into the kernel when the
+# workflow fetched the Mesa workflow's library; otherwise a stub header.
+mesa_dylib="${B2L_MESA_DYLIB:-$repo_root/out/b2l-mesa/libb2l-mesa.dylib}"
+if [[ "${B2L_MESA:-1}" == 1 && -f "$mesa_dylib" ]]; then
+  python3 "$repo_root/scripts/build-mesa-payload.py" --xnu "$xnu_path" --input "$mesa_dylib"
+else
+  python3 "$repo_root/scripts/build-mesa-payload.py" --xnu "$xnu_path"
+fi
 if [[ "${B2L_GPU_LIBRARY:-1}" == 1 ]]; then
   python3 "$repo_root/scripts/build-gpu-library.py" --xnu "$xnu_path" --output "$repo_root/out/b2l-gpu/b2l-gpu.dylib"
 else

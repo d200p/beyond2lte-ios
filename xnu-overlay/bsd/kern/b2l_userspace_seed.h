@@ -126,11 +126,20 @@ static void b2l_gpu_ui_publish(vfs_context_t ctx)
 int b2l_gpu_ui_is_ready(void){return 0;}
 const char b2l_gpu_ui_setting[]="";
 #endif /* B2L_HAS_GPU_UI_PAYLOAD */
+/* S10 port: Mesa for iOS beside the GPU library (b2l_mesa_seed.h). */
+#if B2L_SEED_APPS || B2L_HAS_GPU_UI_PAYLOAD
+#include "b2l_mesa_seed.h"
+#else
+#define B2L_HAS_MESA_PAYLOAD 0
+#endif
 #if !B2L_SEED_APPS
 static void b2l_userspace_before_init(void)
 {
 #if B2L_HAS_GPU_UI_PAYLOAD
     b2l_gpu_ui_publish(vfs_context_current());
+#endif
+#if B2L_HAS_MESA_PAYLOAD
+    b2l_mesa_publish(vfs_context_current());
 #endif
     printf("B2L: kernel-only build; userspace bootstrap unavailable\n");
 }
@@ -140,6 +149,9 @@ static void b2l_userspace_before_init(void)
 {
 #if B2L_HAS_GPU_UI_PAYLOAD
     b2l_gpu_ui_publish(vfs_context_current());
+#endif
+#if B2L_HAS_MESA_PAYLOAD
+    b2l_mesa_publish(vfs_context_current());
 #endif
     int requested=0;PE_parse_boot_argn("b2l_userspace_bootstrap",&requested,sizeof(requested));
     if(requested!=1||!b2l_amfi_active()||!rootvnode||vfs_isrdonly(vnode_mount(rootvnode))||strcmp(vfs_statfs(vnode_mount(rootvnode))->f_fstypename,"hfs"))return;

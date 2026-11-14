@@ -25,8 +25,12 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
 #include "b2l_flush_rect.h"
 #include "b2l_mali_draw.h"
 #include "b2l_mali_uapi.h"
@@ -1789,6 +1793,30 @@ prepare_shadow(void)
 #define BO_TEST_BYTES  0x10000u
 #define BO_TEST_COLOUR 0xff2040c0u
 
+/*
+ * 1 when a guarded step may run: its marker is absent, or older than this boot
+ * (that run ended with the boot). A marker from this boot means the step
+ * started and never finished, most likely taking backboardd with it: skip, so
+ * a crash costs one restart per boot at most.
+ */
+static int
+once_per_boot(const char *marker)
+{
+	struct stat st;
+	struct timeval boot = { 0, 0 };
+	size_t size = sizeof(boot);
+	int mib[2] = { CTL_KERN, KERN_BOOTTIME };
+	if (stat(marker, &st) == 0 && sysctl(mib, 2, &boot, &size, NULL, 0) == 0 && st.st_mtime >= boot.tv_sec) {
+		return 0;
+	}
+	unlink(marker);
+	int fd = open(marker, O_CREAT | O_EXCL | O_WRONLY, 0644);
+	if (fd >= 0) {
+		close(fd);
+	}
+	return 1;
+}
+
 static int
 bo_call(io_connect_t c, uint32_t selector, uint64_t a, uint64_t b, uint64_t *out, uint32_t outs)
 {
@@ -1800,13 +1828,9 @@ bo_call(io_connect_t c, uint32_t selector, uint64_t a, uint64_t b, uint64_t *out
 static void
 bo_selftest(void)
 {
-	int marker = open(BO_TEST_MARKER, O_CREAT | O_EXCL | O_WRONLY, 0644);
-	if (marker < 0 && errno == EEXIST) {
-		log_line("BO test: skipped, the last run did not finish (%s)", BO_TEST_MARKER);
+	if (!once_per_boot(BO_TEST_MARKER)) {
+		log_line("BO test: skipped, a run in this boot did not finish (%s)", BO_TEST_MARKER);
 		return;
-	}
-	if (marker >= 0) {
-		close(marker);
 	}
 	io_connect_t c = MACH_PORT_NULL;
 	io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("B2LMali"));
@@ -1948,6 +1972,71 @@ keyboard_dictation_languages(void)
 	    (long)before, (int)synced, (long)dictation_language_count(key, domain, user));
 }
 
+/*
+ * S10: with the language in place (build 35) Notes' main thread still spent
+ * its time in the same chain, now without the rewrite: AssistantServices keeps
+ * reporting a dictation availability change, and each one makes the keyboard
+ * dock rebuild its glyphs, which UIKit looks up by scanning the bundle on
+ * disk. With dictation off ("Enable Dictation" in Settings, the "Dictation
+ * Enabled" key of com.apple.assistant.support) the dock has no microphone and
+ * nothing to follow. Logged before and after; set once.
+ */
+static void
+keyboard_dictation_off(void)
+{
+	CFStringRef domain = CFSTR("com.apple.assistant.support");
+	CFStringRef key = CFSTR("Dictation Enabled");
+	CFStringRef user = CFSTR("mobile");
+	CFPropertyListRef value = CFPreferencesCopyValue(key, domain, user, kCFPreferencesAnyHost);
+	int before = value == NULL ? -1 : CFGetTypeID(value) == CFBooleanGetTypeID() ? CFBooleanGetValue(value) : -2;
+	if (value != NULL) {
+		CFRelease(value);
+	}
+	if (before == 0) {
+		log_line("keyboard: dictation already off");
+		return;
+	}
+	CFPreferencesSetValue(key, kCFBooleanFalse, domain, user, kCFPreferencesAnyHost);
+	Boolean synced = CFPreferencesSynchronize(domain, user, kCFPreferencesAnyHost);
+	log_line("keyboard: dictation was %d (-1 unset), now off: synchronize=%d", before, (int)synced);
+}
+
+/*
+ * S10: Mesa on the phone (libb2l-mesa.dylib, published by the kernel from the
+ * Mesa workflow's build): its probe, once per boot, beside the drawing client
+ * (an OpenGL ES 3 context, a clear and a triangle read back; its own lines
+ * start with "mesa:").
+ */
+#ifdef B2L_MESA_LIBRARY
+#define MESA_MARKER "/private/var/tmp/b2l-mesa-probe.running"
+static void
+mesa_probe(void)
+{
+	if (!once_per_boot(MESA_MARKER)) {
+		log_line("mesa: probe skipped, a run in this boot did not finish (%s)", MESA_MARKER);
+		return;
+	}
+	uint64_t start = mach_absolute_time();
+	void *mesa = dlopen(B2L_MESA_LIBRARY, RTLD_NOW | RTLD_LOCAL);
+	int (*probe)(void) = mesa != NULL ? (int (*)(void))dlsym(mesa, "b2l_mesa_probe") : NULL;
+	const char *error = mesa == NULL ? dlerror() : NULL;
+	mach_timebase_info_data_t tb;
+	mach_timebase_info(&tb);
+	log_line("mesa: %s %s in %llu ms", B2L_MESA_LIBRARY,
+	    mesa == NULL ? (error != NULL ? error : "not loaded") : probe != NULL ? "loaded" : "has no probe",
+	    (unsigned long long)((mach_absolute_time() - start) * tb.numer / tb.denom / 1000000));
+	int result = probe != NULL ? probe() : -1;
+	unlink(MESA_MARKER);
+	log_line("mesa: probe returned %d", result);
+}
+#else
+static void
+mesa_probe(void)
+{
+	log_line("mesa: no library in this build");
+}
+#endif
+
 static void *
 start_thread(void *unused)
 {
@@ -1969,6 +2058,7 @@ start_thread(void *unused)
 	}
 	log_line("library running in pid %d uid %d", getpid(), (int)getuid());
 	keyboard_dictation_languages();
+	keyboard_dictation_off();
 	if (!B2L_GPU_HOOKS) {
 		/* S10: only the GPU client the kernel's screen copy needs (B2LMali runs
 		 * its runtime while a client is open); Core Animation stays untouched. */
@@ -1977,6 +2067,7 @@ start_thread(void *unused)
 		kern_return_t kr = IOConnectCallMethod(connection, kB2LMaliInfo, NULL, 0, NULL, 0, info, &count, NULL, NULL);
 		log_line("GPU client open for the kernel's screen copy (kr=0x%x); Core Animation not hooked", kr);
 		bo_selftest();          /* beside the open drawing client, as Mesa will be */
+		mesa_probe();
 		return NULL;
 	}
 	mach_timebase_info(&timebase);
@@ -1985,6 +2076,7 @@ start_thread(void *unused)
 	install_hook();
 	log_line("translator ready=%d", shadow_ready);
 	bo_selftest();
+	mesa_probe();
 	return NULL;
 }
 

@@ -25,7 +25,15 @@ def main():
     sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
     a.output.parent.mkdir(parents=True, exist_ok=True)
     # Pointer authentication would trap into the kernel emulator on every call.
+    # S10 port: the Mesa library's path (scripts/build-mesa-payload.py runs first).
+    defines = []
+    mesa = a.xnu / 'bsd/kern/b2l_mesa_payload.h'
+    if mesa.is_file():
+        for line in mesa.read_text().splitlines()[:8]:
+            if line.startswith('#define B2L_MESA_LIBRARY '):
+                defines.append('-DB2L_MESA_LIBRARY=' + line.split(' ', 2)[2])
     subprocess.run(['xcrun', '--sdk', 'iphoneos', 'clang', '-target', 'arm64e-apple-ios26.0', '-isysroot', sdk,
+                    *defines,
                     '-O2', '-Wall', '-Wextra', '-Werror', '-dynamiclib', '-fno-ptrauth-returns',
                     '-fno-ptrauth-calls', '-fno-ptrauth-intrinsics',
                     '-I', str(ROOT / 'xnu-overlay/iokit/Kernel/arm'),

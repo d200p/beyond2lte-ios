@@ -20,6 +20,19 @@ Status 2026-11-14: pieces 1 to 3 written, not yet run.
 - libdrm (`scripts/mesa/b2l-drm/b2l_drm.c`) and the `os_mmap` redirect
   (`patch_os_mman.py`), compiled by the Mesa workflow.
 
+Status 2026-11-14 (later): boot 35 ran the kernel check ("BO test") and it
+passed in full (properties, write-combined mapping, fragment clear of 256
+pixels, write-value job, tiler heap, shader object, cleanup). Mesa moved to
+25.0.7 (Panfrost needs no LLVM there, and the source can be read in full).
+The Mesa workflow now builds `libb2l-mesa.dylib` (15.1 MB, 3.7 MB
+compressed): `scripts/mesa/b2l-target` adds an OSMesa-style frontend
+(Panfrost screen on our libdrm, OpenGL ES contexts on our own resources) and
+`b2l_mesa_probe()` (an ES 3 context, a clear and a triangle read back). The
+kernel workflow fetches it, `scripts/build-mesa-payload.py` compresses it into
+the kernel, `bsd/kern/b2l_mesa_seed.h` publishes it at boot in
+/usr/local/lib, and backboardd's library runs the probe once per boot.
+Next: IOSurface import for buffer-object clients, then the EAGL layer.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
