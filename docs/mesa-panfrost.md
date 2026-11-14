@@ -64,6 +64,18 @@ dumps every CPU-mapped buffer after each submit (`B2L_DRM_DUMP`, libdrm) in
 a traced plain run, and draws a lost triangle once more to see whether a
 repeat succeeds.
 
+Boot 43: the repeats settle it. Without AFBC the lost first triangle comes
+out right when drawn again; the lost first linear triangle comes out as a
+full red screen, the shape of the previous blit's quad. Every IDVS draw
+tiles the positions its position shader found in its position buffer
+(0xa812e000/0xa812e040, the same each batch) before it ran: zeros in a
+fresh buffer, the previous draw's positions after. The position shader's
+stores are not seen by the tiler inside one IDVS job. Boot 44 compares
+plain with IDVS against plain and noafbc with IDVS off (`B2L_NOIDVS`,
+`scripts/mesa/b2l-drm/patch_pan_shader_idvs.py`: separate vertex and tiler
+jobs), and logs JM_CONFIG (IDVS group size), SHADER_CONFIG and TILER_CONFIG
+at the first job.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer

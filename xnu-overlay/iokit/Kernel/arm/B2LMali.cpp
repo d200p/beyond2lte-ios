@@ -1824,6 +1824,12 @@ B2LMali::jobSubmit(uint64_t jc, uint64_t requirements, uint64_t *out)
 	if (!coresUp()) {
 		return kIOReturnNotReady;
 	}
+	if (boJobs == 0) {
+		/* Boot 44: IDVS lost its positions; the IDVS group size lives here. */
+		b2l_diag_record("B2L GPU BO: jm_config=0x%x shader_config=0x%x tiler_config=0x%x at the first job\n",
+		    b2l_mali_r(&io, B2L_MALI_JM_CONFIG), b2l_mali_r(&io, B2L_MALI_SHADER_CONFIG),
+		    b2l_mali_r(&io, B2L_MALI_SHADER_CONFIG + 4));
+	}
 	if (requirements & B2L_MALI_REQ_FLUSH) {
 		static unsigned flushNotes;
 		int flushed = b2l_mali_flush_everything(&io, B2L_MALI_VA_LOG2);

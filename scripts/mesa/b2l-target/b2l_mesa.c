@@ -356,10 +356,16 @@ probe_target(struct pipe_frontend_screen *fscreen, struct st_context *st, const 
  * layout ones). Everything is released afterwards.
  */
 static int
-probe_variant(const char *flags, int flush, const char *dump)
+probe_variant(const char *flags, int flush, const char *dump, int noidvs)
 {
 	char name[48];
-	snprintf(name, sizeof(name), "%s%s", flags[0] ? flags : "plain", flush ? "+flush" : "");
+	snprintf(name, sizeof(name), "%s%s%s", flags[0] ? flags : "plain", flush ? "+flush" : "",
+	    noidvs ? "+noidvs" : "");
+	if (noidvs) {
+		setenv("B2L_NOIDVS", "1", 1);
+	} else {
+		unsetenv("B2L_NOIDVS");
+	}
 	setenv("PAN_MESA_DEBUG", flags, 1);
 	if (flush) {
 		setenv("B2L_DRM_FLUSH", "1", 1);
@@ -423,7 +429,7 @@ probe_variant(const char *flags, int flush, const char *dump)
  * <base>.ctx-<context>.<frame>, read off the phone from TWRP. */
 #define B2L_PANDECODE_BASE "/private/var/tmp/b2l-pandecode"
 
-static void
+static void __attribute__((unused))
 trace_files_note(void)
 {
 	unsigned files = 0;
@@ -456,25 +462,30 @@ trace_files_note(void)
 B2L_EXPORT int
 b2l_mesa_probe(void)
 {
-	/* Boot 42 (build 41's result): the full cache and TLB flush and nocache
-	 * changed nothing, so the losses are not stale memory. Now plain, noafbc,
-	 * and plain traced with every buffer dumped after each submit. */
-	static const struct { const char *flags; int flush; const char *dump; } variants[] = {
-		{ "", 0, NULL }, { "noafbc", 0, NULL }, { "trace", 0, "/private/var/tmp/b2l-drm-dump.txt" },
+	/* Boot 43 (build 42's dump and redraws): every IDVS draw tiles the
+	 * positions its position shader found in memory before it ran (zeros at
+	 * first, the previous draw's after; a redraw of a lost triangle comes out
+	 * right, or as the previous full-screen blit). Boot 44: plain with IDVS,
+	 * then plain and noafbc with IDVS off (B2L_NOIDVS, patch_pan_shader_idvs.py:
+	 * separate vertex and tiler jobs). No disk shader cache, so every shader
+	 * is compiled here. */
+	static const struct { const char *flags; int flush; const char *dump; int noidvs; } variants[] = {
+		{ "", 0, NULL, 0 }, { "", 0, NULL, 1 }, { "noafbc", 0, NULL, 1 },
 	};
 	uint64_t start = now_us();
 	int passed = 0;
+	setenv("MESA_SHADER_CACHE_DISABLE", "true", 1);
 	setenv("PANDECODE_DUMP_FILE", B2L_PANDECODE_BASE, 1);
 	for (unsigned i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
-		if (probe_variant(variants[i].flags, variants[i].flush, variants[i].dump)) {
+		if (probe_variant(variants[i].flags, variants[i].flush, variants[i].dump, variants[i].noidvs)) {
 			passed |= 1 << i;
 		}
 	}
 	unsetenv("PAN_MESA_DEBUG");
 	unsetenv("B2L_DRM_FLUSH");
 	unsetenv("B2L_DRM_DUMP");
-	trace_files_note();
-	b2l_drm_note("mesa: probe done in %llu ms, right: plain %d noafbc %d trace %d",
+	unsetenv("B2L_NOIDVS");
+	b2l_drm_note("mesa: probe done in %llu ms, right: plain %d plain+noidvs %d noafbc+noidvs %d",
 	    (unsigned long long)((now_us() - start) / 1000), passed & 1, (passed >> 1) & 1, (passed >> 2) & 1);
 	return passed;
 }
