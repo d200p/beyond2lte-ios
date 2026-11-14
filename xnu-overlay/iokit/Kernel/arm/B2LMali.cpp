@@ -151,10 +151,11 @@ extern "C" pmap_t get_task_pmap(task_t task);
 #define B2L_CPU_BIG_PER_C      4               /* and one more step for each of these */
 #define B2L_MIF_KHZ            2093000         /* Android's boot memory clock; 0 leaves it */
 #define B2L_MIF_STANDBY_KHZ    546000          /* display off (MIF table 421..2093 MHz) */
-/* S10: off for now. Stripes came with this switch (build 32) and stayed when it
- * happened only while the panel slept (build 35, boot 36): build 36 keeps the
- * memory clock up to tell. b2l_mif_standby=1 brings the switch back. */
-#define B2L_MIF_STANDBY_DEFAULT 0
+/* S10: on again (build 41). Builds 36-40 kept the memory clock up while the
+ * panel slept and the stripes stayed: they were S-Boot's self mask losing its
+ * SRAM in panel sleep (see B2LFramebuffer.cpp), not this switch. The clock
+ * changes only while the panel sleeps; b2l_mif_standby=0 keeps it up. */
+#define B2L_MIF_STANDBY_DEFAULT 1
 #define B2L_MIF_TEST_BYTES     (8u << 20)
 #define B2L_CPU_ALL_HOT_C      88              /* any sensor: every cluster goes to its boot rate */
 #define B2L_CPU_ALL_COOL_C     78
@@ -2047,7 +2048,8 @@ B2LMali::displayMemory(bool on)
 	}
 	IOLockUnlock(runtimeLock);
 	if (ready) {
-		b2l_diag_record("B2L ACPM: memory %u kHz, panel asleep, reply=%d\n", want, answered);
+		b2l_diag_record("B2L ACPM: memory %u kHz, %s, reply=%d\n", want,
+		    on ? "before the panel wakes" : "panel asleep", answered);
 	}
 }
 
