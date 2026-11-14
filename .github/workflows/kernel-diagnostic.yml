@@ -70,6 +70,22 @@ jobs:
             out/ci-env/kdk/System/Library/Frameworks
             out/ci-env/kdk/System/Library/KernelSupport
             out/ci-env/kdk/usr
+      # S10 port: Mesa for iOS, from the newest Mesa workflow run that built it
+      # (our code and Mesa, MIT; no Apple payload). Missing: built without it.
+      # Before the preparation, which embeds it (scripts/prepare-xnu.sh).
+      - name: Fetch libb2l-mesa
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          for run in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow mesa-panfrost.yml --branch "$GITHUB_REF_NAME" \
+              --status success --limit 5 --json databaseId -q '.[].databaseId'); do
+            if gh run download "$run" --repo "$GITHUB_REPOSITORY" -n b2l-mesa -D out/b2l-mesa 2>/dev/null; then
+              echo "libb2l-mesa from Mesa run $run"; ls -l out/b2l-mesa; break
+            fi
+          done
+          [[ -f out/b2l-mesa/libb2l-mesa.dylib ]] || echo 'no Mesa library: kernel built without it'
       - name: Prepare pinned kernel dependencies
         shell: bash
         run: |
@@ -95,21 +111,6 @@ jobs:
       - name: Install ccache
         shell: bash
         run: brew install ccache || echo 'ccache unavailable; building without it'
-      # S10 port: Mesa for iOS, from the newest Mesa workflow run that built it
-      # (our code and Mesa, MIT; no Apple payload). Missing: built without it.
-      - name: Fetch libb2l-mesa
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -uo pipefail
-          for run in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow mesa-panfrost.yml --branch "$GITHUB_REF_NAME" \
-              --status success --limit 5 --json databaseId -q '.[].databaseId'); do
-            if gh run download "$run" --repo "$GITHUB_REPOSITORY" -n b2l-mesa -D out/b2l-mesa 2>/dev/null; then
-              echo "libb2l-mesa from Mesa run $run"; ls -l out/b2l-mesa; break
-            fi
-          done
-          [[ -f out/b2l-mesa/libb2l-mesa.dylib ]] || echo 'no Mesa library: kernel built without it'
       - name: Validate storage boundaries and build XNU
         shell: bash
         run: |
