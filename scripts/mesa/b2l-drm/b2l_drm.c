@@ -744,6 +744,45 @@ param(uint32_t which, int *known)
 	}
 }
 
+/* Copy GPU memory at va through the process's mapping of its buffer object. */
+static int
+bo_read(uint64_t va, void *out, size_t bytes)
+{
+	for (uint32_t h = 1; h <= B2L_MALI_MAX_BOS; h++) {
+		struct bo *bo = &drm.bos[h];
+		if (bo->live && bo->cpu != NULL && va >= bo->va && va + bytes <= bo->va + bo->size) {
+			memcpy(out, bo->cpu + (va - bo->va), bytes);
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Boot 39 diagnostic: the jobs of the first submissions as the GPU left them.
+ * Each job header starts with the exception status the GPU writes back (1
+ * done, 0 never reached) and holds the type, the index and the next job.
+ */
+#define CHAIN_LOGGED 300
+static void
+chain_note(const struct drm_panfrost_submit *args, uint64_t status)
+{
+	char line[200];
+	int n = snprintf(line, sizeof(line), "libdrm: sub %llu req=%u st=%llx jc=%llx:", (unsigned long long)drm.jobs,
+	    args->requirements, (unsigned long long)status, (unsigned long long)args->jc);
+	uint64_t va = args->jc;
+	for (unsigned i = 0; i < 12 && va != 0 && n > 0 && n < (int)sizeof(line) - 24; i++) {
+		uint32_t h[8];
+		if (!bo_read(va, h, sizeof(h))) {
+			n += snprintf(line + n, sizeof(line) - n, " ?%llx", (unsigned long long)va);
+			break;
+		}
+		n += snprintf(line + n, sizeof(line) - n, " t%u/%u:%x", (h[4] >> 1) & 0x7f, h[4] >> 16, h[0]);
+		va = (uint64_t)h[6] | (uint64_t)h[7] << 32;
+	}
+	b2l_drm_note("%s", line);
+}
+
 static int
 submit(struct drm_panfrost_submit *args)
 {
@@ -772,6 +811,9 @@ submit(struct drm_panfrost_submit *args)
 	if (out[0] != B2L_MALI_STATUS_DONE && drm.faults++ < MAX_LOGGED) {
 		b2l_drm_note("libdrm: job %llu jc=0x%llx req=%u status=0x%llx", (unsigned long long)drm.jobs,
 		    (unsigned long long)args->jc, args->requirements, (unsigned long long)out[0]);
+	}
+	if (drm.jobs <= CHAIN_LOGGED) {
+		chain_note(args, out[0]);
 	}
 	if (args->out_sync != 0) {
 		drm.syncs[args->out_sync] = SYNC_SIGNALED;
