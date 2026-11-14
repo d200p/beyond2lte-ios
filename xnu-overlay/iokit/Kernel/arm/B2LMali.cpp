@@ -1604,16 +1604,21 @@ B2LMali::submit(const struct b2l_mali_submit *request, uint64_t *out)
  * S10 port, Mesa Panfrost buffer objects. All under runtimeLock; jobs are
  * synchronous, so the GPU is idle whenever these run.
  */
+/*
+ * Boot 39: Mesa's probe lost a clear or a triangle exactly where new buffer
+ * objects took VAs just freed (each screen's start, each first draw with new
+ * shaders), with every job DONE: the GPU kept using the old pages, as the
+ * stripes of boot 30 did until coresUp flushed the whole TLB. A region flush
+ * here evidently does not drop those entries; the whole-space flush that
+ * coresUp uses does. Buffer objects change rarely (Mesa caches them).
+ */
 void
 B2LMali::flushRange(uint64_t va, uint64_t bytes)
 {
-	unsigned log2 = B2L_MALI_LOCK_MIN_LOG2;
-
-	while (log2 < B2L_MALI_VA_LOG2 && (va >> log2) != ((va + bytes - 1) >> log2)) {
-		log2++;
-	}
+	(void)va;
+	(void)bytes;
 	if (coresOn) {          /* otherwise coresUp flushes everything */
-		b2l_mali_flush_region(&io, va, log2);
+		b2l_mali_flush_region(&io, 0, B2L_MALI_VA_LOG2);
 	}
 }
 
