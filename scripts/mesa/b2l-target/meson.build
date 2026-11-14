@@ -17,6 +17,6 @@ libb2l_mesa = shared_library(
   link_whole : [libglapi_static],
   link_with : [libmesa, libgallium, libglapi],
   link_args : ['-framework', 'IOKit', '-framework', 'CoreFoundation'],
-  dependencies : [driver_panfrost, idep_mesautil, dep_thread],
+  dependencies : [driver_panfrost, idep_mesautil, idep_xmlconfig, dep_thread],
   install : false,
 )
