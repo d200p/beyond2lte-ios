@@ -106,6 +106,15 @@ static int b2l_apps_publish(const char *final,const char *staging,const unsigned
 static int b2l_gpu_ui_ready;
 int b2l_gpu_ui_is_ready(void){return b2l_gpu_ui_ready;}
 const char b2l_gpu_ui_setting[]="DYLD_INSERT_LIBRARIES=" B2L_GPU_UI_LIBRARY;
+/* S10 port: the keyboard relief library for MobileNotes (userspace/b2l-kbd.c),
+ * published in /usr/lib with the GPU library; b2l_kbd=0 leaves it out. */
+static int b2l_kbd_ready;
+int b2l_kbd_is_ready(void){return b2l_kbd_ready;}
+#ifdef B2L_HAS_KBD_PAYLOAD
+const char b2l_kbd_setting[]="DYLD_INSERT_LIBRARIES=" B2L_KBD_LIBRARY;
+#else
+const char b2l_kbd_setting[]="";
+#endif
 static void b2l_gpu_ui_publish(vfs_context_t ctx)
 {
     int enabled=1;PE_parse_boot_argn("b2l_gpu_ui",&enabled,sizeof(enabled));
@@ -121,10 +130,21 @@ static void b2l_gpu_ui_publish(vfs_context_t ctx)
     if(!error)error=VFS_SYNC(vnode_mount(rootvnode),MNT_WAIT,ctx);
     if(!error)b2l_gpu_ui_ready=1;
     printf("B2L GPU UI: library publication error=%d bytes=%lu\n",error,(unsigned long)sizeof(b2l_gpu_library));
+#ifdef B2L_HAS_KBD_PAYLOAD
+    int kbd=1;PE_parse_boot_argn("b2l_kbd",&kbd,sizeof(kbd));
+    if(!error&&kbd==1){
+        error=b2l_apps_publish(B2L_KBD_LIBRARY,B2L_KBD_STAGING,b2l_kbd_library,sizeof(b2l_kbd_library),0755,ctx);
+        if(!error)error=VFS_SYNC(vnode_mount(rootvnode),MNT_WAIT,ctx);
+        if(!error)b2l_kbd_ready=1;
+        printf("B2L KBD: %s publication error=%d bytes=%lu\n",B2L_KBD_LIBRARY,error,(unsigned long)sizeof(b2l_kbd_library));
+    }
+#endif
 }
 #else
 int b2l_gpu_ui_is_ready(void){return 0;}
 const char b2l_gpu_ui_setting[]="";
+int b2l_kbd_is_ready(void){return 0;}
+const char b2l_kbd_setting[]="";
 #endif /* B2L_HAS_GPU_UI_PAYLOAD */
 /* S10 port: Mesa for iOS beside the GPU library (b2l_mesa_seed.h). */
 #if B2L_SEED_APPS || B2L_HAS_GPU_UI_PAYLOAD

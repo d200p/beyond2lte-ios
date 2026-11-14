@@ -36,6 +36,9 @@ static int exec_add_user_string(struct image_params *i, const char *s, int seg, 
 }
 int b2l_gpu_ui_is_ready(void) { return ready; }
 const char b2l_gpu_ui_setting[] = "DYLD_INSERT_LIBRARIES=/usr/local/lib/b2l-gpu-test.dylib";
+static int kbd_ready;
+int b2l_kbd_is_ready(void) { return kbd_ready; }
+const char b2l_kbd_setting[] = "DYLD_INSERT_LIBRARIES=/usr/lib/b2l-kbd-test.dylib";
 #include "b2l_exec_gpu_ui.h"
 static char area[4096];
 static struct image_params setup(const char *path, const char *env) {
@@ -57,6 +60,11 @@ int main(void) {
  const char *others[] = { "/usr/libexec/backboardd2", "/usr/libexec/backboard", "/System/backboardd",
   "/System/Library/CoreServices/SpringBoard.app/SpringBoard" };
  for (unsigned k = 0; k < 4; k++) { i = setup(others[k], NULL); assert(!b2l_exec_gpu_ui(&i, 8) && !added); }
+ /* MobileNotes gets the keyboard library, only once it is published. */
+ const char *notes = "/Applications/MobileNotes.app/MobileNotes";
+ i = setup(notes, NULL); assert(!b2l_exec_gpu_ui(&i, 8) && !added);
+ kbd_ready = 1; i = setup(notes, NULL); assert(!b2l_exec_gpu_ui(&i, 8) && added == 1);
+ assert(!strcmp(i.ip_strendp - sizeof(b2l_kbd_setting), b2l_kbd_setting)); kbd_ready = 0;
  /* A caller's value stands. */
  i = setup(bbd, "DYLD_INSERT_LIBRARIES=/x"); assert(!b2l_exec_gpu_ui(&i, 8) && !added && i.ip_envc == 1);
  /* Not published, or switched off. */

@@ -59,6 +59,8 @@ _Static_assert(sizeof(struct b2l_amfi_dyld_policy_args) == 16, "AMFI dyld policy
 /* Only backboardd may honour DYLD_INSERT_LIBRARIES, for the GPU translation
  * layer, and a library that fails to load must not stop it. */
 extern int b2l_gpu_ui_is_ready(void);
+/* S10 port: and MobileNotes, for the keyboard relief library (b2l-kbd.c). */
+extern int b2l_kbd_is_ready(void);
 static bool
 b2l_amfi_gpu_ui_process(struct proc *process)
 {
@@ -69,7 +71,8 @@ b2l_amfi_gpu_ui_process(struct proc *process)
     if (vnode == NULLVP) return false;
     int error = vn_getpath(vnode, path, &length);
     vnode_put(vnode);
-    return !error && !strcmp(path, "/usr/libexec/backboardd");
+    return !error && (!strcmp(path, "/usr/libexec/backboardd") ||
+        (b2l_kbd_is_ready() && !strcmp(path, "/Applications/MobileNotes.app/MobileNotes")));
 }
 
 static int
