@@ -29,6 +29,7 @@
 #include "panfrost/drm/panfrost_drm_public.h"
 #include "panfrost/pan_public.h"
 #include <stdlib.h>
+#include <sys/stat.h>
 #include "renderonly/renderonly.h"
 #include "b2l_drm.h"
 
@@ -399,25 +400,53 @@ probe_variant(const char *flags)
 	return result;
 }
 
+/* Where the trace run's decoded job chains go: pandecode writes
+ * <base>.ctx-<context>.<frame>, read off the phone from TWRP. */
+#define B2L_PANDECODE_BASE "/private/var/tmp/b2l-pandecode"
+
+static void
+trace_files_note(void)
+{
+	unsigned files = 0;
+	unsigned long long bytes = 0;
+	for (unsigned c = 0; c < 4; c++) {
+		for (unsigned f = 0; f < 64; f++) {
+			char path[128];
+			struct stat st;
+			snprintf(path, sizeof(path), "%s.ctx-%u.%04u", B2L_PANDECODE_BASE, c, f);
+			if (stat(path, &st) == 0) {
+				files++;
+				bytes += (unsigned long long)st.st_size;
+			}
+		}
+	}
+	b2l_drm_note("mesa: [trace] %u decoded job files, %llu bytes, at %s.*", files, bytes, B2L_PANDECODE_BASE);
+}
+
 /*
- * The Mesa run on the phone: the same three targets with transaction
- * elimination (CRC) and AFBC each on and off, to find which one loses the
- * clear or the triangle. Returns a bit per variant that came out right.
+ * The Mesa run on the phone. Boot 39: CRC on or off made no difference, and
+ * the whole-space TLB flush none either. Plain (AFBC) loses the clear colour
+ * (reads back 0) but draws the triangle; noafbc keeps the clear but loses the
+ * first triangle of the context; every later linear target is right. The
+ * trace run repeats plain with every job chain decoded to a file (and each
+ * submit waited for), to compare a lost draw with a right one.
+ * Returns a bit per variant that came out right.
  */
 B2L_EXPORT int
 b2l_mesa_probe(void)
 {
-	static const char *const variants[] = { "", "nocrc", "noafbc", "nocrc,noafbc" };
+	static const char *const variants[] = { "", "noafbc", "trace" };
 	uint64_t start = now_us();
 	int passed = 0;
+	setenv("PANDECODE_DUMP_FILE", B2L_PANDECODE_BASE, 1);
 	for (unsigned i = 0; i < sizeof(variants) / sizeof(variants[0]); i++) {
 		if (probe_variant(variants[i])) {
 			passed |= 1 << i;
 		}
 	}
 	unsetenv("PAN_MESA_DEBUG");
-	b2l_drm_note("mesa: probe done in %llu ms, right: plain %d nocrc %d noafbc %d both %d",
-	    (unsigned long long)((now_us() - start) / 1000), passed & 1, (passed >> 1) & 1, (passed >> 2) & 1,
-	    (passed >> 3) & 1);
+	trace_files_note();
+	b2l_drm_note("mesa: probe done in %llu ms, right: plain %d noafbc %d trace %d",
+	    (unsigned long long)((now_us() - start) / 1000), passed & 1, (passed >> 1) & 1, (passed >> 2) & 1);
 	return passed;
 }

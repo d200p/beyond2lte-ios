@@ -33,6 +33,17 @@ the kernel, `bsd/kern/b2l_mesa_seed.h` publishes it at boot in
 /usr/local/lib, and backboardd's library runs the probe once per boot.
 Next: IOSurface import for buffer-object clients, then the EAGL layer.
 
+Status 2026-11-14 (boots 38-40): Mesa runs on the phone ("Mali-G76
+(Panfrost)", ES 3.1). Every job completes (status DONE, no MMU fault), but
+the pictures are not all right, and the same way every time: with AFBC the
+clear colour reads back as 0 while the triangle is drawn; without AFBC the
+clear is right but the first triangle of a context is missing; every later
+linear target is right. Transaction elimination (CRC) changes nothing, and
+neither did a whole-address-space TLB flush on every buffer change. Boot 41
+runs the plain case once more with `PAN_MESA_DEBUG=trace`: every job chain
+decoded by pandecode to `/private/var/tmp/b2l-pandecode.ctx-*`, read from
+TWRP with `tools/hfs_adb.py`, to compare a lost draw with a right one.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
