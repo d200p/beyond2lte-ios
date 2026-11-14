@@ -182,6 +182,14 @@ public:
 	/* S10: any command packet (short, DCS long, DSC PPS) and the panel's own
 	 * power-on sequence (b2l_fb_panel_init, default on). */
 	bool          fPanelInit;
+	/* S10: DECON's DSC encoders (DSC0 at +0x4000, DSC1 at +0x5000) hold the
+	 * picture parameter set the boot chain programmed; the panel must get
+	 * that one, not a table's. Bytes 0-59 come from DSC_PPS00_03..56_59. */
+	IOMemoryMap  *fDscMap;
+	volatile uint32_t *fDsc;
+	uint8_t       fPps[128];
+	bool          fPpsFromDecon;
+	void readPps(void);
 	bool dsimPacket(uint8_t type, const uint8_t *data, uint32_t length);
 	bool dcsWrite(const uint8_t *data, uint32_t length);
 	unsigned panelOn(void);
@@ -364,6 +372,11 @@ AppleCLCD::start(IOService *provider)
 		    (status1 >> 26) & 1, fifo, fPanelSleep ? "on" : "off");
 	}
 	panelWatch("at start");
+	regs = IOMemoryDescriptor::withPhysicalAddress(B2L_DECON_BASE + 0x4000, 0x2000, kIODirectionIn);
+	fDscMap = regs ? regs->map(kIOMapInhibitCache) : NULL;
+	OSSafeReleaseNULL(regs);
+	fDsc = fDscMap ? (volatile uint32_t *)fDscMap->getVirtualAddress() : NULL;
+	readPps();
 	int panelInit = 1;
 	PE_parse_boot_argn("b2l_fb_panel_init", &panelInit, sizeof(panelInit));
 	fPanelInit = panelInit == 1;
@@ -751,13 +764,54 @@ static const uint8_t kPanelTspHsync[] = { 0xb9, 0x01, 0xb0, 0xe1, 0x09, 0x00, 0x
 
 #define B2L_DCS(table) dcsWrite(table, sizeof(table))
 
+/* Boot 39: with Samsung's 1440x3040 table the stripes changed texture but
+ * stayed. The encoder's own parameters are what the panel decoder must get. */
+void
+AppleCLCD::readPps(void)
+{
+	memcpy(fPps, kPanelPps, sizeof(fPps));
+	fPpsFromDecon = false;
+	if (fDsc == NULL) {
+		b2l_diag_record("B2L PANEL DSC: not mapped, Samsung's PPS\n");
+		return;
+	}
+	uint8_t dsc0[60], dsc1[60];
+	for (unsigned w = 0; w < 15; w++) {
+		uint32_t a = fDsc[(0x20 + 4 * w) / 4], b = fDsc[(0x1000 + 0x20 + 4 * w) / 4];
+		for (unsigned i = 0; i < 4; i++) {
+			dsc0[4 * w + i] = (uint8_t)(a >> (24 - 8 * i));
+			dsc1[4 * w + i] = (uint8_t)(b >> (24 - 8 * i));
+		}
+	}
+	unsigned differ = 0, between = 0;
+	for (unsigned i = 0; i < 60; i++) {
+		differ += dsc0[i] != kPanelPps[i];
+		between += dsc0[i] != dsc1[i];
+	}
+	unsigned height = (unsigned)dsc0[6] << 8 | dsc0[7], width = (unsigned)dsc0[8] << 8 | dsc0[9];
+	char hex[124];
+	for (unsigned i = 0; i < 60; i++) {
+		snprintf(hex + 2 * i, 3, "%02x", dsc0[i]);
+	}
+	b2l_diag_record("B2L PANEL DSC: control0=%08x control3=%08x dsc1 differs in %u bytes, Samsung's table in %u\n",
+	    fDsc[0], fDsc[3], between, differ);
+	b2l_diag_record("B2L PANEL DSC: pps %s\n", hex);
+	/* Version 1.1, the panel's size, two equal encoders: use it. */
+	if (dsc0[0] == 0x11 && width == 1440 && height >= 2960 && height <= 3040 && between == 0) {
+		memcpy(fPps, dsc0, sizeof(dsc0));
+		fPpsFromDecon = true;
+	}
+	b2l_diag_record("B2L PANEL DSC: %ux%u, panel gets %s PPS\n", width, height,
+	    fPpsFromDecon ? "DECON's" : "Samsung's");
+}
+
 unsigned
 AppleCLCD::panelOn(void)
 {
 	unsigned sent = 0;
 	sent += B2L_DCS(kPanelKey1On);
 	sent += dsimPacket(0x07, kPanelDscOn, sizeof(kPanelDscOn));     /* compression mode */
-	sent += dsimPacket(0x0a, kPanelPps, sizeof(kPanelPps));         /* picture parameter set */
+	sent += dsimPacket(0x0a, fPps, sizeof(fPps));                   /* picture parameter set */
 	sent += B2L_DCS(kPanelKey1Off);
 	sent += B2L_DCS(kPanelSleepOut);
 	IOSleep(120);
