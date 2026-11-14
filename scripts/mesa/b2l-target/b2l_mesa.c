@@ -62,6 +62,7 @@ struct b2l_drawable {
 	struct pipe_frontend_drawable base;
 	struct st_visual visual;
 	unsigned width, height;
+	bool linear;                    /* PIPE_BIND_LINEAR, as IOSurfaces will be */
 	struct pipe_resource *textures[ST_ATTACHMENT_COUNT];
 };
 
@@ -148,7 +149,8 @@ drawable_validate(struct st_context *st, struct pipe_frontend_drawable *drawable
 				templat.bind = PIPE_BIND_DEPTH_STENCIL;
 			} else {
 				templat.format = d->visual.color_format;
-				templat.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
+				templat.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW |
+				    (d->linear ? PIPE_BIND_LINEAR : 0);
 			}
 			d->textures[a] = screen->resource_create(screen, &templat);
 			if (d->textures[a] == NULL) {
@@ -161,7 +163,8 @@ drawable_validate(struct st_context *st, struct pipe_frontend_drawable *drawable
 }
 
 static void
-drawable_init(struct b2l_drawable *d, struct pipe_frontend_screen *fscreen, unsigned width, unsigned height)
+drawable_init(struct b2l_drawable *d, struct pipe_frontend_screen *fscreen, unsigned width, unsigned height,
+    bool linear)
 {
 	static uint32_t ids;
 	memset(d, 0, sizeof(*d));
@@ -172,6 +175,7 @@ drawable_init(struct b2l_drawable *d, struct pipe_frontend_screen *fscreen, unsi
 	d->visual.samples = 1;
 	d->width = width;
 	d->height = height;
+	d->linear = linear;
 	d->base.flush_front = drawable_flush_front;
 	d->base.validate = drawable_validate;
 	p_atomic_set(&d->base.stamp, 1);
@@ -223,6 +227,88 @@ probe_count(const uint8_t *pixels, const uint8_t rgba[4])
 	return n;
 }
 
+/* One render target: a clear, then a triangle over its lower-left half
+ * (compiler, vertex, tiler and fragment jobs), each read back and counted. */
+static int
+probe_target(struct pipe_frontend_screen *fscreen, struct st_context *st, bool linear)
+{
+	struct b2l_drawable drawable;
+	const char *layout = linear ? "linear" : "default";
+	drawable_init(&drawable, fscreen, PROBE_SIZE, PROBE_SIZE, linear);
+	if (!st_api_make_current(st, &drawable.base, &drawable.base)) {
+		b2l_drm_note("mesa: %s: make current failed", layout);
+		return 0;
+	}
+	struct _glapi_table *disp = GET_DISPATCH();
+	b2l_drm_note("mesa: %s | %s | GLSL %s", (const char *)CALL_GetString(disp, (GL_RENDERER)),
+	    (const char *)CALL_GetString(disp, (GL_VERSION)),
+	    (const char *)CALL_GetString(disp, (GL_SHADING_LANGUAGE_VERSION)));
+
+	static uint8_t pixels[PROBE_SIZE * PROBE_SIZE * 4];
+	static const uint8_t clear[4] = { 64, 128, 191, 255 }, red[4] = { 255, 0, 0, 255 };
+	int result = 1;
+
+	/* 1. A clear: one fragment job. */
+	uint64_t t0 = now_us();
+	CALL_Viewport(disp, (0, 0, PROBE_SIZE, PROBE_SIZE));
+	CALL_ClearColor(disp, (64 / 255.0f, 128 / 255.0f, 191 / 255.0f, 1.0f));
+	CALL_Clear(disp, (GL_COLOR_BUFFER_BIT));
+	memset(pixels, 0, sizeof(pixels));
+	CALL_ReadPixels(disp, (0, 0, PROBE_SIZE, PROBE_SIZE, GL_RGBA, GL_UNSIGNED_BYTE, pixels));
+	unsigned cleared = probe_count(pixels, clear);
+	b2l_drm_note("mesa: %s: clear %u/%u pixels right in %llu us, first %02x%02x%02x%02x, error 0x%x", layout, cleared,
+	    PROBE_SIZE * PROBE_SIZE, (unsigned long long)(now_us() - t0), pixels[0], pixels[1], pixels[2], pixels[3],
+	    CALL_GetError(disp, ()));
+	result &= cleared == PROBE_SIZE * PROBE_SIZE;
+
+	/* 2. A triangle over the lower-left half: compiler, vertex and tiler jobs. */
+	t0 = now_us();
+	GLuint vs = probe_shader(disp, GL_VERTEX_SHADER,
+	    "#version 300 es\nlayout(location = 0) in vec2 p;\nvoid main() { gl_Position = vec4(p, 0.0, 1.0); }\n");
+	GLuint fs = probe_shader(disp, GL_FRAGMENT_SHADER,
+	    "#version 300 es\nprecision mediump float;\nout vec4 c;\nvoid main() { c = vec4(1.0, 0.0, 0.0, 1.0); }\n");
+	GLuint program = 0;
+	GLint linked = 0;
+	if (vs && fs) {
+		program = CALL_CreateProgram(disp, ());
+		CALL_AttachShader(disp, (program, vs));
+		CALL_AttachShader(disp, (program, fs));
+		CALL_LinkProgram(disp, (program));
+		CALL_GetProgramiv(disp, (program, GL_LINK_STATUS, &linked));
+	}
+	uint64_t compile_us = now_us() - t0;
+	if (!linked) {
+		b2l_drm_note("mesa: %s: shaders not ready (vs %u fs %u program %u)", layout, vs, fs, program);
+		result = 0;
+	} else {
+		static const float vertices[6] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f };
+		GLuint buffer = 0;
+		t0 = now_us();
+		CALL_UseProgram(disp, (program));
+		CALL_GenBuffers(disp, (1, &buffer));
+		CALL_BindBuffer(disp, (GL_ARRAY_BUFFER, buffer));
+		CALL_BufferData(disp, (GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW));
+		CALL_VertexAttribPointer(disp, (0, 2, GL_FLOAT, GL_FALSE, 0, NULL));
+		CALL_EnableVertexAttribArray(disp, (0));
+		CALL_DrawArrays(disp, (GL_TRIANGLES, 0, 3));
+		memset(pixels, 0, sizeof(pixels));
+		CALL_ReadPixels(disp, (0, 0, PROBE_SIZE, PROBE_SIZE, GL_RGBA, GL_UNSIGNED_BYTE, pixels));
+		unsigned reds = probe_count(pixels, red), rest = probe_count(pixels, clear);
+		const uint8_t *corner = pixels + 4 * (PROBE_SIZE * PROBE_SIZE - 1);
+		b2l_drm_note("mesa: %s: triangle red %u clear %u of %u (half is %u) compile %llu us draw+read %llu us, "
+		    "corners %02x%02x%02x %02x%02x%02x, error 0x%x", layout, reds, rest, PROBE_SIZE * PROBE_SIZE,
+		    PROBE_SIZE * PROBE_SIZE / 2, (unsigned long long)compile_us, (unsigned long long)(now_us() - t0),
+		    pixels[0], pixels[1], pixels[2], corner[0], corner[1], corner[2], CALL_GetError(disp, ()));
+		result &= reds > PROBE_SIZE * PROBE_SIZE * 2 / 5 && rest > PROBE_SIZE * PROBE_SIZE * 2 / 5 &&
+		    reds + rest == PROBE_SIZE * PROBE_SIZE;
+	}
+
+	b2l_drm_note("mesa: %s: %s", layout, result ? "right" : "WRONG");
+	st_api_make_current(st, NULL, NULL);
+	drawable_release(&drawable);
+	return result;
+}
+
 /*
  * The first Mesa run on the phone. Returns 1 when the clear and the triangle
  * both read back right, 0 otherwise; every step is logged.
@@ -260,79 +346,12 @@ b2l_mesa_probe(void)
 		return 0;
 	}
 
-	struct b2l_drawable drawable;
-	drawable_init(&drawable, fscreen, PROBE_SIZE, PROBE_SIZE);
-	if (!st_api_make_current(st, &drawable.base, &drawable.base)) {
-		b2l_drm_note("mesa: make current failed");
-		st_destroy_context(st);
-		return 0;
-	}
-	struct _glapi_table *disp = GET_DISPATCH();
-	b2l_drm_note("mesa: %s | %s | GLSL %s", (const char *)CALL_GetString(disp, (GL_RENDERER)),
-	    (const char *)CALL_GetString(disp, (GL_VERSION)),
-	    (const char *)CALL_GetString(disp, (GL_SHADING_LANGUAGE_VERSION)));
-
-	static uint8_t pixels[PROBE_SIZE * PROBE_SIZE * 4];
-	static const uint8_t clear[4] = { 64, 128, 191, 255 }, red[4] = { 255, 0, 0, 255 };
-	int result = 1;
-
-	/* 1. A clear: one fragment job. */
-	uint64_t t0 = now_us();
-	CALL_Viewport(disp, (0, 0, PROBE_SIZE, PROBE_SIZE));
-	CALL_ClearColor(disp, (64 / 255.0f, 128 / 255.0f, 191 / 255.0f, 1.0f));
-	CALL_Clear(disp, (GL_COLOR_BUFFER_BIT));
-	memset(pixels, 0, sizeof(pixels));
-	CALL_ReadPixels(disp, (0, 0, PROBE_SIZE, PROBE_SIZE, GL_RGBA, GL_UNSIGNED_BYTE, pixels));
-	unsigned cleared = probe_count(pixels, clear);
-	b2l_drm_note("mesa: clear %u/%u pixels right in %llu us, first %02x%02x%02x%02x, error 0x%x", cleared,
-	    PROBE_SIZE * PROBE_SIZE, (unsigned long long)(now_us() - t0), pixels[0], pixels[1], pixels[2], pixels[3],
-	    CALL_GetError(disp, ()));
-	result &= cleared == PROBE_SIZE * PROBE_SIZE;
-
-	/* 2. A triangle over the lower-left half: compiler, vertex and tiler jobs. */
-	t0 = now_us();
-	GLuint vs = probe_shader(disp, GL_VERTEX_SHADER,
-	    "#version 300 es\nlayout(location = 0) in vec2 p;\nvoid main() { gl_Position = vec4(p, 0.0, 1.0); }\n");
-	GLuint fs = probe_shader(disp, GL_FRAGMENT_SHADER,
-	    "#version 300 es\nprecision mediump float;\nout vec4 c;\nvoid main() { c = vec4(1.0, 0.0, 0.0, 1.0); }\n");
-	GLuint program = 0;
-	GLint linked = 0;
-	if (vs && fs) {
-		program = CALL_CreateProgram(disp, ());
-		CALL_AttachShader(disp, (program, vs));
-		CALL_AttachShader(disp, (program, fs));
-		CALL_LinkProgram(disp, (program));
-		CALL_GetProgramiv(disp, (program, GL_LINK_STATUS, &linked));
-	}
-	uint64_t compile_us = now_us() - t0;
-	if (!linked) {
-		b2l_drm_note("mesa: shaders not ready (vs %u fs %u program %u)", vs, fs, program);
-		result = 0;
-	} else {
-		static const float vertices[6] = { -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f };
-		GLuint buffer = 0;
-		t0 = now_us();
-		CALL_UseProgram(disp, (program));
-		CALL_GenBuffers(disp, (1, &buffer));
-		CALL_BindBuffer(disp, (GL_ARRAY_BUFFER, buffer));
-		CALL_BufferData(disp, (GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW));
-		CALL_VertexAttribPointer(disp, (0, 2, GL_FLOAT, GL_FALSE, 0, NULL));
-		CALL_EnableVertexAttribArray(disp, (0));
-		CALL_DrawArrays(disp, (GL_TRIANGLES, 0, 3));
-		memset(pixels, 0, sizeof(pixels));
-		CALL_ReadPixels(disp, (0, 0, PROBE_SIZE, PROBE_SIZE, GL_RGBA, GL_UNSIGNED_BYTE, pixels));
-		unsigned reds = probe_count(pixels, red), rest = probe_count(pixels, clear);
-		const uint8_t *corner = pixels + 4 * (PROBE_SIZE * PROBE_SIZE - 1);
-		b2l_drm_note("mesa: triangle red %u clear %u of %u (half is %u) compile %llu us draw+read %llu us, "
-		    "corners %02x%02x%02x %02x%02x%02x, error 0x%x", reds, rest, PROBE_SIZE * PROBE_SIZE,
-		    PROBE_SIZE * PROBE_SIZE / 2, (unsigned long long)compile_us, (unsigned long long)(now_us() - t0),
-		    pixels[0], pixels[1], pixels[2], corner[0], corner[1], corner[2], CALL_GetError(disp, ()));
-		result &= reds > PROBE_SIZE * PROBE_SIZE * 2 / 5 && rest > PROBE_SIZE * PROBE_SIZE * 2 / 5 &&
-		    reds + rest == PROBE_SIZE * PROBE_SIZE;
-	}
-
+	/* Boot 37: on the default (AFBC) target the triangle drew right but the
+	 * clear read back as zeros. Linear first, as IOSurfaces will be; then the
+	 * default layout again, to see which one loses the clear. */
+	int result = probe_target(fscreen, st, true);
+	result &= probe_target(fscreen, st, false);
 	st_api_make_current(NULL, NULL, NULL);
-	drawable_release(&drawable);
 	st_destroy_context(st);
 	b2l_drm_note("mesa: probe %s in %llu ms", result ? "PASSED" : "FAILED",
 	    (unsigned long long)((now_us() - start) / 1000));
