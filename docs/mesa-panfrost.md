@@ -224,6 +224,21 @@ of a mapped page; not understood yet. Boot 52 tests 16-bit arithmetic
 1179 x 2556 screen could throw single vertices far off), and the EAGL layer
 logs Core Animation's first shaders, vertex array setups and indexed draws.
 
+Boot 52 (build 51): no change without fp16. The new log lines show what Core
+Animation draws: every draw is one quad, `GL_TRIANGLES` with the indices
+0,1,2, 2,3,0 from client memory, its vertices interleaved in client memory
+(48 bytes: position as 4 floats at +0, two texture coordinates as 2 floats
+at +16 and +24, colour as 4 half floats at +32), rewritten for the next quad
+right after the draw. The broken quads lose or stretch exactly the second
+triangle, the only one that uses vertex 3, the highest index: as if the last
+vertex of the shaded range were not shaded and its position came from an
+earlier draw (Mesa's own range arithmetic, `max - min + 1`, is right). Test
+and workaround for boot 53: the EAGL layer expands each indexed draw on the
+CPU into a non-indexed one, vertices in index order plus one padding vertex
+the primitives do not use (`B2L_EAGL_EXPAND=0` keeps indexed draws). The
+library also logs its load address, for crash backtraces (boot 52 died in
+`capture_backdrop` with two frames inside our libraries).
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer

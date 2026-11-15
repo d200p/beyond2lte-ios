@@ -2096,7 +2096,7 @@ static const uint32_t SW_NEW_WORDS[2] = { 0xd503201f, 0xa9be4ff4 };
 static const uint32_t GLES_NEW_WORDS[2] = { 0xb9400008, 0x71000d1f };   /* ldr w8, [x0]; cmp w8, #3 */
 #define GLES_MARKER "/private/var/tmp/b2l-gles.running"
 #ifndef B2L_GLES_PAN_DEBUG
-#define B2L_GLES_PAN_DEBUG "nofp16"           /* Panfrost debug flags for the GLES context, see gles_context */
+#define B2L_GLES_PAN_DEBUG ""                 /* Panfrost debug flags for the GLES context, see gles_context */
 #endif
 
 /*
@@ -2350,13 +2350,15 @@ gles_context(void *server)
 	 * with every job done and no fault; neither the tiler job barrier nor the
 	 * copy routines changed it. Intermediate surfaces left with pieces of
 	 * other draws would look like that. Boot 51 turned AFBC and transaction
-	 * elimination off (noafbc,nocrc): no change. Boot 52 tests 16-bit
-	 * arithmetic instead: Panfrost runs mediump in fp16, and position math
-	 * over a 1179 x 2556 screen in fp16 could throw single vertices far off
-	 * (Panfrost reads PAN_MESA_DEBUG when the screen is made, inside create).
+	 * elimination off (noafbc,nocrc): no change; boot 52 without fp16
+	 * (nofp16): no change either. Kept as a hook for further tests (Panfrost
+	 * reads PAN_MESA_DEBUG when the screen is made, inside create); the
+	 * suspect is now the last vertex of indexed draws (b2l_eagl.c).
 	 */
-	setenv("PAN_MESA_DEBUG", B2L_GLES_PAN_DEBUG, 0);
-	log_line("gles: PAN_MESA_DEBUG=%s", getenv("PAN_MESA_DEBUG"));
+	if (B2L_GLES_PAN_DEBUG[0] != '\0') {
+		setenv("PAN_MESA_DEBUG", B2L_GLES_PAN_DEBUG, 0);
+	}
+	log_line("gles: PAN_MESA_DEBUG=%s", getenv("PAN_MESA_DEBUG") ? getenv("PAN_MESA_DEBUG") : "(none)");
 	void *eagl = create();
 	if (eagl == NULL) {
 		log_line("gles: no EAGL context; software");

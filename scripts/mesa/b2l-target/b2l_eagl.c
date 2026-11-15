@@ -24,6 +24,7 @@
  * Mesa does not have, GL errors in the first calls, selectors the class lacks
  * and every surface import are logged ("B2L GPU UI: eagl: ...").
  */
+#include <dlfcn.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -106,6 +107,7 @@ static uint8_t gli_seen[B2L_GLI_COUNT];         /* 1 first use logged, 2 also "m
 static uint32_t gli_calls[B2L_GLI_COUNT];
 static uint64_t calls_total, errors_total, window_calls, window_start;
 static unsigned lines, attaches, teximages, import_failures, switches, swap_flushes, copies;
+static unsigned expanded_draws, expand_fallbacks;
 static uint64_t swap_flush_ms;
 static struct b2l_eagl *the_eagl;
 static struct b2l_image images[IMAGES];
@@ -157,10 +159,10 @@ summary(void)
 		}
 	}
 	b2l_drm_note("eagl: 5 s: %llu calls (%llu total), attach %u, teximage %u (copied %u), import failures %u,"
-	    " GL errors %llu, context switches %u, swaps flushed %u (%llu ms); busiest:%s",
+	    " GL errors %llu, context switches %u, swaps flushed %u (%llu ms), draws expanded %u (kept %u); busiest:%s",
 	    (unsigned long long)window_calls, (unsigned long long)calls_total, attaches, teximages, copies,
 	    import_failures, (unsigned long long)errors_total, switches, swap_flushes,
-	    (unsigned long long)swap_flush_ms, used);
+	    (unsigned long long)swap_flush_ms, expanded_draws, expand_fallbacks, used);
 	swap_flush_ms = 0;
 	memset(gli_calls, 0, sizeof(gli_calls));
 	window_calls = 0;
@@ -316,6 +318,110 @@ gli_attrib_pointer(void *c, uint32_t index, int32_t size, uint32_t type, uint8_t
 	b2l_gli_leave((unsigned)idx_attrib_pointer);
 }
 
+/*
+ * Boot 52: every Core Animation draw is a quad, four vertices drawn with the
+ * indices 0,1,2, 2,3,0, its client arrays rewritten for the next quad right
+ * after. The broken quads lose or stretch the second triangle, the only one
+ * using vertex 3, the highest index: as if the last vertex of the range were
+ * not shaded and its position came from whatever an earlier draw left. Test,
+ * and workaround if it holds: the draw is expanded on the CPU into a
+ * non-indexed one (the vertices in index order, from the client arrays) with
+ * one more vertex than the primitives use, so no needed vertex is last.
+ * B2L_EAGL_EXPAND=0 keeps the indexed draws.
+ */
+#define EXPAND_ATTRIBS  8
+static int expand_enabled = -1;
+
+static unsigned
+type_bytes(GLenum type)
+{
+	switch (type) {
+	case GL_BYTE:
+	case GL_UNSIGNED_BYTE:
+		return 1;
+	case GL_SHORT:
+	case GL_UNSIGNED_SHORT:
+	case GL_HALF_FLOAT:
+	case E_HALF_FLOAT_OES:
+		return 2;
+	case GL_INT:
+	case GL_UNSIGNED_INT:
+	case GL_FLOAT:
+	case GL_FIXED:
+		return 4;
+	default:
+		return 0;
+	}
+}
+
+static bool
+draw_expanded(struct _glapi_table *d, uint32_t mode, int32_t count, uint32_t type, const void *indices)
+{
+	static uint8_t *scratch[EXPAND_ATTRIBS];
+	static size_t scratch_size[EXPAND_ATTRIBS];
+	struct {
+		GLint enabled, size, type, normalized, stride, buffer;
+		void *pointer;
+		unsigned bytes;
+	} a[EXPAND_ATTRIBS];
+	GLint element_buffer = 0;
+	CALL_GetIntegerv(d, (GL_ELEMENT_ARRAY_BUFFER_BINDING, &element_buffer));
+	unsigned index_bytes = type == GL_UNSIGNED_SHORT ? 2 : type == GL_UNSIGNED_BYTE ? 1 : type == GL_UNSIGNED_INT ? 4 : 0;
+	if (element_buffer != 0 || indices == NULL || count <= 0 || index_bytes == 0) {
+		return false;
+	}
+	unsigned pad = (mode == GL_TRIANGLES && count % 3 == 0) || (mode == GL_LINES && count % 2 == 0) ? 1 : 0;
+	unsigned total = (unsigned)count + pad;
+	for (unsigned i = 0; i < EXPAND_ATTRIBS; i++) {
+		a[i].enabled = 0;
+		CALL_GetVertexAttribiv(d, (i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &a[i].enabled));
+		if (!a[i].enabled) {
+			continue;
+		}
+		CALL_GetVertexAttribiv(d, (i, GL_VERTEX_ATTRIB_ARRAY_SIZE, &a[i].size));
+		CALL_GetVertexAttribiv(d, (i, GL_VERTEX_ATTRIB_ARRAY_TYPE, &a[i].type));
+		CALL_GetVertexAttribiv(d, (i, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &a[i].normalized));
+		CALL_GetVertexAttribiv(d, (i, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &a[i].stride));
+		CALL_GetVertexAttribiv(d, (i, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &a[i].buffer));
+		CALL_GetVertexAttribPointerv(d, (i, GL_VERTEX_ATTRIB_ARRAY_POINTER, &a[i].pointer));
+		a[i].bytes = type_bytes((GLenum)a[i].type) * (unsigned)a[i].size;
+		if (a[i].buffer != 0 || a[i].pointer == NULL || a[i].bytes == 0 || a[i].size < 1 || a[i].size > 4) {
+			return false;
+		}
+		size_t need = (size_t)total * a[i].bytes;
+		if (scratch_size[i] < need) {
+			uint8_t *grown = realloc(scratch[i], need);
+			if (grown == NULL) {
+				return false;
+			}
+			scratch[i] = grown;
+			scratch_size[i] = need;
+		}
+	}
+	for (unsigned i = 0; i < EXPAND_ATTRIBS; i++) {
+		if (!a[i].enabled) {
+			continue;
+		}
+		size_t step = a[i].stride != 0 ? (size_t)a[i].stride : a[i].bytes;
+		const uint8_t *src = a[i].pointer;
+		for (unsigned k = 0; k < total; k++) {
+			unsigned at = k < (unsigned)count ? k : 0;   /* the padding vertex repeats the first */
+			uint32_t v = index_bytes == 2 ? ((const uint16_t *)indices)[at] :
+			    index_bytes == 1 ? ((const uint8_t *)indices)[at] : ((const uint32_t *)indices)[at];
+			memcpy(scratch[i] + (size_t)k * a[i].bytes, src + (size_t)v * step, a[i].bytes);
+		}
+		CALL_VertexAttribPointer(d, (i, a[i].size, (GLenum)a[i].type, (GLboolean)a[i].normalized, 0, scratch[i]));
+	}
+	CALL_DrawArrays(d, (mode, 0, (GLsizei)total));
+	for (unsigned i = 0; i < EXPAND_ATTRIBS; i++) {
+		if (a[i].enabled) {
+			CALL_VertexAttribPointer(d, (i, a[i].size, (GLenum)a[i].type, (GLboolean)a[i].normalized, a[i].stride,
+			    a[i].pointer));
+		}
+	}
+	return true;
+}
+
 static void
 gli_draw_elements(void *c, uint32_t mode, int32_t count, uint32_t type, const void *indices)
 {
@@ -324,6 +430,22 @@ gli_draw_elements(void *c, uint32_t mode, int32_t count, uint32_t type, const vo
 		return;
 	}
 	struct _glapi_table *d = GET_DISPATCH();
+	if (expand_enabled < 0) {
+		const char *env = getenv("B2L_EAGL_EXPAND");
+		expand_enabled = env == NULL || env[0] != '0';
+		note("indexed draws %s", expand_enabled ? "expanded on the CPU (B2L_EAGL_EXPAND=0 keeps them)" : "kept");
+	}
+	if (expand_enabled) {
+		if (draw_expanded(d, mode, count, type, indices)) {
+			expanded_draws++;
+			b2l_gli_leave((unsigned)idx_draw_elements);
+			return;
+		}
+		if (expand_fallbacks++ < 8) {
+			note("draw_elements mode 0x%x count %d type 0x%x not expanded (buffer objects or type)", mode, count,
+			    type);
+		}
+	}
 	if (logged < DRAWS_LOGGED) {
 		GLint element_buffer = 0, program = 0;
 		CALL_GetIntegerv(d, (GL_ELEMENT_ARRAY_BUFFER_BINDING, &element_buffer));
@@ -1075,10 +1197,13 @@ b2l_eagl_context_create(void)
 	const GLubyte *extensions = CALL_GetString(d, (GL_EXTENSIONS));
 	GLint max_texture = 0;
 	CALL_GetIntegerv(d, (GL_MAX_TEXTURE_SIZE, &max_texture));
-	note("context ready in %llu ms: %s, %s, max texture %d, extensions %zu bytes, object %p",
+	Dl_info where;
+	memset(&where, 0, sizeof(where));
+	dladdr((const void *)b2l_eagl_context_create, &where);
+	note("context ready in %llu ms: %s, %s, max texture %d, extensions %zu bytes, object %p, library at %p",
 	    (unsigned long long)(now_ms() - start), renderer ? (const char *)renderer : "?",
 	    version ? (const char *)version : "?", max_texture, extensions ? strlen((const char *)extensions) : 0,
-	    (void *)object);
+	    (void *)object, where.dli_fbase);
 	return object;
 }
 
