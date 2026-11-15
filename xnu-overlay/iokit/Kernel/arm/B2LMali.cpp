@@ -132,7 +132,10 @@ extern "C" pmap_t get_task_pmap(task_t task);
 #define B2L_RT_SLOTS           128
 #define B2L_RT_MAPPED_LIMIT    (256ull << 20)
 #define B2L_RT_JOB_TIMEOUT_US  1000000
-#define B2L_RT_IDLE_MS         50
+/* Boot 57: Core Animation's frames came 100-300 ms apart while in use, so with
+ * 50 ms the cores went off and on (power-up and whole TLB flush) nearly every
+ * frame; 500 ms keeps them on while the phone is in use. */
+#define B2L_RT_IDLE_MS         500
 #define B2L_MALI_VA_LOG2       48              /* the whole GPU address space, for a full TLB flush */
 #define B2L_MALI_LOCK_MIN_LOG2 15              /* the smallest region AS LOCK takes */
 #define B2L_RT_BO_VA           0xa0000000ull   /* buffer objects: after the draw client's buffers, */
@@ -278,7 +281,7 @@ private:
 	struct b2l_mali_bo *bos;
 	uint64_t *boPages;              /* one bit per 4 KiB page of the BO range */
 	uint64_t boBytes, boJobs, boFaults;
-	uint64_t boRunNS, boCleanBeforeNS, boCleanAfterNS, boCleanBytes, boCleanSkips;
+	uint64_t boRunNS, boCleanBeforeNS, boCleanAfterNS, boCleanBytes, boCleanSkips, powerUps, powerUpNS;
 	unsigned clients;
 	bool drawOpen;
 	void readProps();
@@ -1226,10 +1229,11 @@ B2LMali::coresUp()
 	if (coresOn) {
 		return true;
 	}
+	uint64_t powerStart = nowNS();
 	/*
 	 * S10: drop every GPU TLB entry after the address space is set again.
 	 * evictSlot only flushes while the cores are on, but the cores go off
-	 * after B2L_RT_IDLE_MS (50 ms) without a job, so most evictions happened
+	 * after B2L_RT_IDLE_MS (then 50 ms) without a job, so most evictions happened
 	 * with them off; AS UPDATE does not drop TLB entries, and a new client
 	 * brings new tables. A stale entry sends a render target or texture to
 	 * pages that are no longer it: thin wrong lines along live GPU draws, of
@@ -1252,6 +1256,8 @@ B2LMali::coresUp()
 		b2l_diag_record("B2L ACPM: change took %llu ns\n", nowNS() - before);
 		measureClock();
 	}
+	powerUps++;
+	powerUpNS += nowNS() - powerStart;
 	return true;
 }
 
@@ -1991,9 +1997,10 @@ B2LMali::jobSubmit(uint64_t jc, uint64_t requirements, uint64_t *out)
 	boJobs++;
 	if (boJobs % 500 == 0) {
 		b2l_diag_record("B2L GPU BO: %llu jobs: last 500 ran %llu ms, surface cleaning %llu ms before + %llu ms after"
-		    " (%llu MB, %llu skipped unchanged), %u surfaces imported\n", boJobs, boRunNS / 1000000,
-		    boCleanBeforeNS / 1000000, boCleanAfterNS / 1000000, boCleanBytes >> 20, boCleanSkips, boSurfaces);
-		boRunNS = boCleanBeforeNS = boCleanAfterNS = boCleanBytes = boCleanSkips = 0;
+		    " (%llu MB, %llu skipped unchanged), %u surfaces imported, %llu power-ups (%llu ms)\n", boJobs,
+		    boRunNS / 1000000, boCleanBeforeNS / 1000000, boCleanAfterNS / 1000000, boCleanBytes >> 20, boCleanSkips,
+		    boSurfaces, powerUps, powerUpNS / 1000000);
+		boRunNS = boCleanBeforeNS = boCleanAfterNS = boCleanBytes = boCleanSkips = powerUps = powerUpNS = 0;
 	}
 	if (status != B2L_MALI_STATUS_DONE) {
 		if (boFaults++ < 16) {

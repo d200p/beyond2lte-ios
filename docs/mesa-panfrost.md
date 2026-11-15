@@ -331,6 +331,17 @@ CPU and the GPU path does in shaders is vibrancy and the blend modes, with
 fetch on a texture and on an imported IOSurface, in the same batch and in
 the next one (tile buffer preloaded from memory).
 
+Where boot 57's time went: over the whole boot `draw_elements` spent 228 s
+inside Mesa, `clear` 27 s, `generate_mipmap` 7 s, `tex_image2D` 8 s and
+shader compiles 1.5 s; in use, 1.5-3.8 s of every 5 s. That is not the
+draws themselves (0.08 ms each with the screen still) but the submissions
+they trigger (a draw that samples what another batch rendered flushes it),
+which wait for the GPU in the kernel: per job about 0.2 ms of GPU work and,
+until ed49f1a, 2.6 ms of cache cleaning, plus a power-up of the cores and a
+whole TLB flush whenever 50 ms had passed without a job, which at 3-10
+frames a second was nearly every frame. The cores now stay on for 500 ms
+without a job, and the 500-job log line counts the power-ups and their time.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
