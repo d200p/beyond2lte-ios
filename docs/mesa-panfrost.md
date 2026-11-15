@@ -364,6 +364,20 @@ resource through its CPU mapping, and nothing drops those lines since
 ed49f1a): the test now also reads the surface under `IOSurfaceLock`, after
 the red draw and after the fetch.
 
+The clock and calendar icons (missing in software mode too) belong to
+chronod, whose IOSurface calls failed twice. Selector 54 is
+`kIOSurfaceMethodSetCoreVideoBridgedKeys` (IOSurface.framework, once a
+process: a 12-byte header and serialized key names; it only logs a
+failure): now accepted. And every surface with planes was refused on
+purpose (`kIOReturnUnsupported`), so chronod's 'xf20' surfaces (YUV 4:2:0,
+10 bits, two planes, 128 x 96) never existed. iOS 26's
+`IOSurfaceGet*OfPlane` read the plane count at client + 0xc8 (lock result
++ 0x58) and 0x98-byte plane records from client + 0xf8 (+ 0x88): width,
+height, offset, bytes per row and size as u64 at +0, +8, +0x18, +0x20,
++0x28, bytes per element (u16) at +0x30, element width and height at +0x32
+and +0x33; the rest is compression and tiling. The driver now creates them
+and fills those records.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
