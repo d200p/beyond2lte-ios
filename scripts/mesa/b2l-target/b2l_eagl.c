@@ -1749,6 +1749,155 @@ sft_check(const uint8_t *pixels, bool texcoords, unsigned bad[2], char *first, s
 	}
 }
 
+/*
+ * Boot 57: the lock screen time, Control Center's controls and Settings'
+ * icons (all drawn in software mode) stay blank with the GPU, with every
+ * shader compiled and no GL error. Core Animation draws vibrancy and blend
+ * modes with GL_EXT_shader_framebuffer_fetch (gl_LastFragData, shaders 4
+ * and 6 of boot 52); software mode computes them on the CPU. Checked here:
+ * a fetching draw after a clear in the same batch, and after a draw and a
+ * finish (a new batch: the tile buffer is preloaded from memory), on a
+ * texture and on an IOSurface imported as Core Animation's are.
+ */
+static const char sft_fetch_vs[] =
+    "attribute highp vec4 vertex_position;\n"
+    "void main() {\n"
+    "  gl_Position = vertex_position;\n"
+    "}\n";
+static const char sft_red_fs[] =
+    "precision mediump float;\n"
+    "void main(void) {\n"
+    "  gl_FragData[0] = vec4(1.0, 0.25, 0.0, 1.0);\n"
+    "}\n";
+static const char sft_fetch_fs[] =
+    "#extension GL_EXT_shader_framebuffer_fetch : require\n"
+    "precision mediump float;\n"
+    "void main(void) {\n"
+    "  lowp vec4 d0 = gl_LastFragData[0];\n"
+    "  gl_FragData[0] = vec4(d0.b, d0.g, d0.r, d0.a);\n"
+    "}\n";
+
+/* Two triangles over x0..x1 (clip space), the whole height. */
+static void
+sft_rect(struct _glapi_table *d, float x0, float x1)
+{
+	const GLfloat v[24] = { x0, -1, 0, 1, x1, -1, 0, 1, x1, 1, 0, 1, x1, 1, 0, 1, x0, 1, 0, 1, x0, -1, 0, 1 };
+	CALL_VertexAttribPointer(d, (0, 4, GL_FLOAT, GL_FALSE, 0, v));
+	CALL_DrawArrays(d, (GL_TRIANGLES, 0, 6));
+}
+
+static bool
+sft_near(const uint8_t *got, const uint8_t want[4])
+{
+	for (unsigned c = 0; c < 4; c++) {
+		int diff = (int)got[c] - (int)want[c];
+		if (diff > 4 || diff < -4) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* One target: the same-batch case, then the next-batch (preloaded) case. */
+static void
+sft_fetch_target(struct _glapi_table *d, const char *label, GLuint red, GLuint fetch, uint8_t *pixels)
+{
+	static const uint8_t clear_swapped[4] = { 191, 128, 64, 255 }; /* clear (64, 128, 191) fetched, red and blue swapped */
+	static const uint8_t red_swapped[4] = { 0, 64, 255, 255 };     /* (255, 64, 0) fetched, swapped */
+	const unsigned left = SFT_SIZE / 4, right = SFT_SIZE * 3 / 4, mid = SFT_SIZE / 2;
+	CALL_Viewport(d, (0, 0, SFT_SIZE, SFT_SIZE));
+	CALL_ClearColor(d, (64.0f / 255.0f, 128.0f / 255.0f, 191.0f / 255.0f, 1.0f));
+	/* Same batch: clear, fetch. */
+	CALL_Clear(d, (GL_COLOR_BUFFER_BIT));
+	CALL_UseProgram(d, (fetch));
+	sft_rect(d, -1.0f, 1.0f);
+	CALL_Finish(d, ());
+	CALL_ReadPixels(d, (0, 0, SFT_SIZE, SFT_SIZE, GL_RGBA, GL_UNSIGNED_BYTE, pixels));
+	const uint8_t *a = pixels + ((size_t)mid * SFT_SIZE + mid) * 4;
+	note("selftest fetch %s, same batch: %s (%02x%02x%02x%02x, want %02x%02x%02x%02x) (GL 0x%x)", label,
+	    sft_near(a, clear_swapped) ? "right" : "WRONG", a[0], a[1], a[2], a[3], clear_swapped[0], clear_swapped[1],
+	    clear_swapped[2], clear_swapped[3], CALL_GetError(d, ()));
+	/* Next batch: clear, red on the left half, finish; then fetch over everything. */
+	CALL_Clear(d, (GL_COLOR_BUFFER_BIT));
+	CALL_UseProgram(d, (red));
+	sft_rect(d, -1.0f, 0.0f);
+	CALL_Finish(d, ());
+	CALL_UseProgram(d, (fetch));
+	sft_rect(d, -1.0f, 1.0f);
+	CALL_Finish(d, ());
+	CALL_ReadPixels(d, (0, 0, SFT_SIZE, SFT_SIZE, GL_RGBA, GL_UNSIGNED_BYTE, pixels));
+	const uint8_t *l = pixels + ((size_t)mid * SFT_SIZE + left) * 4, *r = pixels + ((size_t)mid * SFT_SIZE + right) * 4;
+	note("selftest fetch %s, next batch: drawn half %s (%02x%02x%02x%02x, want %02x%02x%02x%02x), cleared half %s"
+	    " (%02x%02x%02x%02x) (GL 0x%x)", label, sft_near(l, red_swapped) ? "right" : "WRONG", l[0], l[1], l[2], l[3],
+	    red_swapped[0], red_swapped[1], red_swapped[2], red_swapped[3], sft_near(r, clear_swapped) ? "right" : "WRONG",
+	    r[0], r[1], r[2], r[3], CALL_GetError(d, ()));
+}
+
+/* An IOSurface like Core Animation's display buffers: BGRA, rows a multiple of 64 bytes. */
+static IOSurfaceRef
+sft_iosurface(void)
+{
+	int width = SFT_SIZE, height = SFT_SIZE, bpe = 4, bpr = SFT_SIZE * 4, format = 0x42475241;
+	const void *keys[5] = { kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfaceBytesPerRow,
+		kIOSurfacePixelFormat };
+	const void *values[5] = {
+		CFNumberCreate(NULL, kCFNumberIntType, &width), CFNumberCreate(NULL, kCFNumberIntType, &height),
+		CFNumberCreate(NULL, kCFNumberIntType, &bpe), CFNumberCreate(NULL, kCFNumberIntType, &bpr),
+		CFNumberCreate(NULL, kCFNumberIntType, &format) };
+	CFDictionaryRef properties = CFDictionaryCreate(NULL, keys, values, 5, &kCFTypeDictionaryKeyCallBacks,
+	    &kCFTypeDictionaryValueCallBacks);
+	for (unsigned i = 0; i < 5; i++) {
+		CFRelease(values[i]);
+	}
+	IOSurfaceRef surface = properties != NULL ? IOSurfaceCreate(properties) : NULL;
+	if (properties != NULL) {
+		CFRelease(properties);
+	}
+	return surface;
+}
+
+static void
+sft_fetch(struct _glapi_table *d, GLuint framebuffer, uint8_t *pixels)
+{
+	GLuint vertex = sft_shader(d, GL_VERTEX_SHADER, sft_fetch_vs);
+	GLuint red = sft_program(d, vertex, sft_red_fs), fetch = sft_program(d, vertex, sft_fetch_fs);
+	CALL_DisableVertexAttribArray(d, (1));
+	CALL_DisableVertexAttribArray(d, (2));
+	CALL_DisableVertexAttribArray(d, (3));
+	CALL_EnableVertexAttribArray(d, (0));
+	CALL_BindFramebuffer(d, (GL_FRAMEBUFFER, framebuffer));
+	sft_fetch_target(d, "texture", red, fetch, pixels);
+	IOSurfaceRef surface = sft_iosurface();
+	GLuint texture = 0, target = 0;
+	char why[160] = "";
+	GLenum error = 0;
+	struct b2l_image *img = surface != NULL ? image_get(surface, 0, PIPE_FORMAT_B8G8R8A8_UNORM, SFT_SIZE, SFT_SIZE,
+	    why, sizeof(why)) : NULL;
+	CALL_GenTextures(d, (1, &texture));
+	CALL_BindTexture(d, (GL_TEXTURE_2D, texture));
+	bool bound = img != NULL && bind_image(GL_TEXTURE_2D, img, &error);
+	CALL_GenFramebuffers(d, (1, &target));
+	CALL_BindFramebuffer(d, (GL_FRAMEBUFFER, target));
+	CALL_FramebufferTexture2D(d, (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0));
+	GLenum status = CALL_CheckFramebufferStatus(d, (GL_FRAMEBUFFER));
+	if (bound && status == GL_FRAMEBUFFER_COMPLETE) {
+		sft_fetch_target(d, "IOSurface", red, fetch, pixels);
+	} else {
+		note("selftest fetch IOSurface: not run (surface %p, import %s %s, GL 0x%x, framebuffer 0x%x)",
+		    (void *)surface, bound ? "ok" : "FAILED", why, error, status);
+	}
+	CALL_BindFramebuffer(d, (GL_FRAMEBUFFER, framebuffer));
+	CALL_DeleteFramebuffers(d, (1, &target));
+	CALL_DeleteTextures(d, (1, &texture));
+	if (surface != NULL) {
+		CFRelease(surface);
+	}
+	CALL_UseProgram(d, (0));
+	CALL_DeleteProgram(d, (red));
+	CALL_DeleteProgram(d, (fetch));
+	CALL_DeleteShader(d, (vertex));
+}
+
 static void
 selftest(struct _glapi_table *d)
 {
@@ -1816,6 +1965,7 @@ selftest(struct _glapi_table *d)
 		}
 		note("selftest done in %llu ms: %u runs, wrong first triangles %u, second %u",
 		    (unsigned long long)(now_ms() - start), runs, total[0], total[1]);
+		sft_fetch(d, framebuffer, pixels);
 	}
 	/* Back to a new context's state for Core Animation. */
 	CALL_UseProgram(d, (0));
@@ -1832,6 +1982,7 @@ selftest(struct _glapi_table *d)
 	CALL_DeleteTextures(d, (1, &texture));
 	CALL_Viewport(d, (viewport[0], viewport[1], viewport[2], viewport[3]));
 	CALL_Scissor(d, (scissor[0], scissor[1], scissor[2], scissor[3]));
+	CALL_ClearColor(d, (0.0f, 0.0f, 0.0f, 0.0f));
 	while (CALL_GetError(d, ()) != GL_NO_ERROR) {
 	}
 	free(quads);

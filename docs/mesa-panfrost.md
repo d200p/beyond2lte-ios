@@ -321,6 +321,16 @@ after a job (`b2l_surface_gpu_wrote`), and a CPU reader drops the stale
 lines when it reads: a client's `IOSurfaceLock` (`trapLock`) and the
 framebuffer's CPU copies (`b2l_surface_cpu_access`).
 
+In software mode (the user, after boot 57) the lock screen time, Control
+Center and Settings' icons were drawn; the clock and calendar icons were
+missing there too, so those two are not a GPU matter (chronod's 'xf20'
+surfaces, refused by our IOSurface driver, are the first suspect). Core
+Animation draws no copies or readbacks; what software mode computes on the
+CPU and the GPU path does in shaders is vibrancy and the blend modes, with
+`GL_EXT_shader_framebuffer_fetch`. The self-test now checks framebuffer
+fetch on a texture and on an imported IOSurface, in the same batch and in
+the next one (tile buffer preloaded from memory).
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
