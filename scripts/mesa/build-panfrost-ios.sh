@@ -25,7 +25,11 @@ cross="$build/ios-arm64e.txt"
 # store at a 4-byte boundary in panfrost_update_shader_state (two 32-bit
 # descriptor words merged by the compiler); the flag keeps every access the
 # compiler emits naturally aligned. memcpy/memset come from b2l_memset.c.
-flags="'-target', 'arm64e-apple-ios26.0', '-isysroot', '$sdk', '-fno-ptrauth-returns', '-fno-ptrauth-calls', '-fno-ptrauth-intrinsics', '-mstrict-align', '-I$repo/scripts/mesa/include'"
+# Boot 55: st_draw_quad's `stp s11, s9` (two aligned 32-bit stores merged
+# into one pair) wrote across a page boundary of an upload buffer and took
+# an alignment fault; the load/store pair pass is off, so every access to
+# such memory stays one aligned access that cannot cross a page.
+flags="'-target', 'arm64e-apple-ios26.0', '-isysroot', '$sdk', '-fno-ptrauth-returns', '-fno-ptrauth-calls', '-fno-ptrauth-intrinsics', '-mstrict-align', '-mllvm', '-aarch64-enable-ldst-opt=false', '-I$repo/scripts/mesa/include'"
 cat > "$cross" <<EOF
 [binaries]
 c = '$cc'

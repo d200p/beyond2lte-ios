@@ -110,6 +110,9 @@ static uint64_t calls_total, errors_total, window_calls, window_start;
 static unsigned lines, attaches, teximages, import_failures, switches, swap_flushes, copies;
 static unsigned expanded_draws, expand_fallbacks;
 static uint64_t swap_flush_ms;
+/* Boot 55 ran at 3-4 frames a second with the GPU busy a fifth of the time:
+ * CPU time inside Mesa per GLI entry, and in the IOSurface paths. */
+static uint64_t enter_ticks, mesa_ticks, surface_ticks, gli_ticks[B2L_GLI_COUNT];
 static struct b2l_eagl *the_eagl;
 static struct b2l_image images[IMAGES];
 static uint64_t image_clock;
@@ -164,6 +167,33 @@ summary(void)
 	    (unsigned long long)window_calls, (unsigned long long)calls_total, attaches, teximages, copies,
 	    import_failures, (unsigned long long)errors_total, switches, swap_flushes,
 	    (unsigned long long)swap_flush_ms, expanded_draws, expand_fallbacks, used);
+	static mach_timebase_info_data_t tb;
+	if (tb.denom == 0) {
+		mach_timebase_info(&tb);
+	}
+	char slowest[200] = "";
+	size_t at2 = 0;
+	for (unsigned pick = 0; pick < 5; pick++) {
+		unsigned best = B2L_GLI_COUNT;
+		for (unsigned i = 0; i < B2L_GLI_COUNT; i++) {
+			if (gli_ticks[i] > 0 && (best == B2L_GLI_COUNT || gli_ticks[i] > gli_ticks[best])) {
+				best = i;
+			}
+		}
+		if (best == B2L_GLI_COUNT || at2 + 40 >= sizeof(slowest)) {
+			break;
+		}
+		at2 += (size_t)snprintf(slowest + at2, sizeof(slowest) - at2, " %s=%llu", b2l_gli_name[best],
+		    (unsigned long long)(gli_ticks[best] * tb.numer / tb.denom / 1000000));
+		gli_ticks[best] = 0;
+	}
+	b2l_drm_note("eagl: 5 s CPU: %llu ms inside Mesa, %llu ms in IOSurface attach/copy, of %llu ms; slowest (ms):%s",
+	    (unsigned long long)(mesa_ticks * tb.numer / tb.denom / 1000000),
+	    (unsigned long long)(surface_ticks * tb.numer / tb.denom / 1000000), (unsigned long long)(now - window_start),
+	    slowest);
+	mesa_ticks = 0;
+	surface_ticks = 0;
+	memset(gli_ticks, 0, sizeof(gli_ticks));
 	swap_flush_ms = 0;
 	memset(gli_calls, 0, sizeof(gli_calls));
 	window_calls = 0;
@@ -201,6 +231,7 @@ begin(void *c, unsigned index, uint64_t a0)
 	if ((calls_total & 63) == 0) {
 		summary();
 	}
+	enter_ticks = mach_absolute_time();
 	return 1;
 }
 
@@ -225,6 +256,11 @@ b2l_gli_enter(void *c, unsigned index, uint64_t a0)
 static void
 b2l_gli_leave(unsigned index)
 {
+	uint64_t spent = mach_absolute_time() - enter_ticks;
+	mesa_ticks += spent;
+	if (index < B2L_GLI_COUNT) {
+		gli_ticks[index] += spent;
+	}
 	if (calls_total > ERROR_WINDOW && gli_calls[index] > 2) {
 		return;
 	}
@@ -242,7 +278,7 @@ static int idx_get_string, idx_tex_image2D, idx_tex_sub_image2D, idx_finish_obje
     idx_create_shader_object, idx_create_program_object, idx_attach_object, idx_detach_object,
     idx_get_object_parameteriv, idx_get_object_parameterfv, idx_get_info_log, idx_get_attached_objects,
     idx_get_handle, idx_insert_marker, idx_push_marker, idx_pop_marker, idx_shader_source, idx_attrib_pointer,
-    idx_draw_elements;
+    idx_draw_elements, idx_link_program;
 
 #define HANDLE(h) ((GLuint)(uintptr_t)(h))
 #define TO_HANDLE(n) ((void *)(uintptr_t)(n))
@@ -271,6 +307,55 @@ note_text(const char *what, unsigned id, const char *text, size_t length)
 		}
 		chunk[n] = '\0';
 		note("%s %u.%u: %s", what, id, lines_done, chunk);
+	}
+}
+
+/*
+ * Boot 55: use_program_object failed with GL_INVALID_OPERATION a dozen
+ * times, as for a program that did not link, and nothing said why. After
+ * each link the status is checked; for the first programs that fail, the
+ * link log, each attached shader's compile log and (twice) its source.
+ */
+#define UNLINKED_LOGGED 8
+static unsigned unlinked;
+
+static void
+gli_link_program(void *c, void *program)
+{
+	if (!begin(c, (unsigned)idx_link_program, HANDLE(program))) {
+		return;
+	}
+	struct _glapi_table *d = GET_DISPATCH();
+	GLuint p = HANDLE(program);
+	CALL_LinkProgram(d, (p));
+	b2l_gli_leave((unsigned)idx_link_program);
+	GLint ok = 1;
+	CALL_GetProgramiv(d, (p, GL_LINK_STATUS, &ok));
+	if (ok || unlinked++ >= UNLINKED_LOGGED) {
+		return;
+	}
+	char log[400] = "";
+	CALL_GetProgramInfoLog(d, (p, (GLsizei)sizeof(log), NULL, log));
+	note_text("link log", p, log, strlen(log));
+	GLuint shaders[4] = { 0, 0, 0, 0 };
+	GLsizei count = 0;
+	CALL_GetAttachedShaders(d, (p, 4, &count, shaders));
+	for (GLsizei i = 0; i < count; i++) {
+		GLint compiled = 1, kind = 0;
+		CALL_GetShaderiv(d, (shaders[i], GL_COMPILE_STATUS, &compiled));
+		CALL_GetShaderiv(d, (shaders[i], GL_SHADER_TYPE, &kind));
+		note("program %u not linked (%u): %s shader %u %s", p, unlinked,
+		    kind == GL_VERTEX_SHADER ? "vertex" : "fragment", shaders[i], compiled ? "compiled" : "NOT compiled");
+		if (!compiled) {
+			CALL_GetShaderInfoLog(d, (shaders[i], (GLsizei)sizeof(log), NULL, log));
+			note_text("compile log", shaders[i], log, strlen(log));
+		}
+		if (unlinked <= 2) {
+			static char source[8192];
+			GLsizei length = 0;
+			CALL_GetShaderSource(d, (shaders[i], (GLsizei)sizeof(source), &length, source));
+			note_text("unlinked src", shaders[i], source, (size_t)length);
+		}
 	}
 }
 
@@ -757,7 +842,8 @@ gli_fill(struct b2l_eagl *e)
 	gli_own(e, "shader_source_ARB", (void *)gli_shader_source, &idx_shader_source);
 	gli_own(e, "vertex_attrib_pointer_ARB", (void *)gli_attrib_pointer, &idx_attrib_pointer);
 	gli_own(e, "draw_elements", (void *)gli_draw_elements, &idx_draw_elements);
-	note("GLI table: %u entries, %u with a Mesa function, 20 our own", (unsigned)B2L_GLI_COUNT, mapped);
+	gli_own(e, "link_program_ARB", (void *)gli_link_program, &idx_link_program);
+	note("GLI table: %u entries, %u with a Mesa function, 21 our own", (unsigned)B2L_GLI_COUNT, mapped);
 }
 
 /* ---- IOSurfaces as EGL images ---- */
@@ -945,6 +1031,99 @@ bind_image(uint32_t target, struct b2l_image *img, GLenum *error)
 	return *error == GL_NO_ERROR;
 }
 
+/*
+ * Boot 55: Core Animation renders into many small IOSurfaces of its own
+ * (icons, masked or filtered layers, the lock screen clock) whose rows are
+ * not multiples of 64 bytes (96, 160, 224, 288, 352...). The Mali cannot
+ * draw into those in place, so the attach failed, the texture had no
+ * storage and nothing was drawn into it or from it: the clock and calendar
+ * icons, Settings' icons and the lock screen time were missing. Such a
+ * texture now gets storage of its own (a shadow: RGBA8, or RGBA16F for half
+ * floats, laid out as the Mali wants), filled once from the surface; Core
+ * Animation draws into it and samples it through the same texture. The
+ * surface is not written back: a texImageIOSurface of a shadowed surface
+ * (the one reader that would need it) is logged.
+ */
+#define SHADOWS 64
+static uint32_t shadow_ids[SHADOWS];
+static unsigned shadow_next, shadows;
+
+static bool
+shadowed(uint32_t sid)
+{
+	for (unsigned i = 0; i < SHADOWS; i++) {
+		if (shadow_ids[i] == sid && sid != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+shadow_attach(IOSurfaceRef surface, uint32_t target, enum pipe_format format, GLenum *error)
+{
+	size_t width = IOSurfaceGetWidth(surface), height = IOSurfaceGetHeight(surface);
+	size_t stride = IOSurfaceGetBytesPerRow(surface);
+	bool half = format == PIPE_FORMAT_R16G16B16A16_FLOAT;
+	bool swap = format == PIPE_FORMAT_B8G8R8A8_UNORM;
+	size_t bpp = half ? 8 : 4;
+	if ((!half && !swap && format != PIPE_FORMAT_R8G8B8A8_UNORM) || width == 0 || height == 0 ||
+	    stride < width * bpp || IOSurfaceGetPlaneCount(surface) > 1) {
+		return false;
+	}
+	uint8_t *pixels = malloc(width * height * bpp);
+	if (pixels == NULL) {
+		return false;
+	}
+	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) == 0) {
+		const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+		for (size_t y = 0; y < height; y++) {
+			memcpy(pixels + y * width * bpp, base + y * stride, width * bpp);
+		}
+		IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+	} else {
+		memset(pixels, 0, width * height * bpp);
+	}
+	if (swap) {             /* B,G,R,A in the surface; R,G,B,A for GL_RGBA */
+		for (size_t i = 0; i < width * height; i++) {
+			uint8_t blue = pixels[i * 4];
+			pixels[i * 4] = pixels[i * 4 + 2];
+			pixels[i * 4 + 2] = blue;
+		}
+	}
+	struct _glapi_table *d = GET_DISPATCH();
+	while (CALL_GetError(d, ()) != GL_NO_ERROR) {
+	}
+	GLint row = 0, align = 4, unpack = 0;
+	CALL_GetIntegerv(d, (GL_UNPACK_ROW_LENGTH, &row));
+	CALL_GetIntegerv(d, (GL_UNPACK_ALIGNMENT, &align));
+	CALL_GetIntegerv(d, (GL_PIXEL_UNPACK_BUFFER_BINDING, &unpack));
+	if (unpack != 0) {
+		CALL_BindBuffer(d, (GL_PIXEL_UNPACK_BUFFER, 0));
+	}
+	CALL_PixelStorei(d, (GL_UNPACK_ROW_LENGTH, 0));
+	CALL_PixelStorei(d, (GL_UNPACK_ALIGNMENT, 1));
+	CALL_TexImage2D(d, (target, 0, half ? GL_RGBA16F : GL_RGBA8, (GLsizei)width, (GLsizei)height, 0, GL_RGBA,
+	    half ? GL_HALF_FLOAT : GL_UNSIGNED_BYTE, pixels));
+	*error = CALL_GetError(d, ());
+	CALL_PixelStorei(d, (GL_UNPACK_ROW_LENGTH, row));
+	CALL_PixelStorei(d, (GL_UNPACK_ALIGNMENT, align));
+	if (unpack != 0) {
+		CALL_BindBuffer(d, (GL_PIXEL_UNPACK_BUFFER, (GLuint)unpack));
+	}
+	free(pixels);
+	if (*error != GL_NO_ERROR) {
+		return false;
+	}
+	uint32_t sid = IOSurfaceGetID(surface);
+	if (!shadowed(sid)) {
+		shadow_ids[shadow_next] = sid;
+		shadow_next = (shadow_next + 1) % SHADOWS;
+	}
+	shadows++;
+	return true;
+}
+
 /* ---- the Objective-C class ---- */
 
 static struct b2l_eagl *
@@ -985,7 +1164,8 @@ eagl_attach(id self, SEL cmd, uint32_t target, IOSurfaceRef surface, BOOL invert
 	struct b2l_eagl *e = eagl_of(self);
 	char why[160] = "";
 	GLenum error = 0;
-	bool ok = false;
+	bool ok = false, shadow = false;
+	uint64_t start = mach_absolute_time();
 	attaches++;
 	if (surface == NULL || !begin(e, B2L_GLI_COUNT, 0)) {
 		snprintf(why, sizeof(why), "no surface or context");
@@ -999,11 +1179,20 @@ eagl_attach(id self, SEL cmd, uint32_t target, IOSurfaceRef surface, BOOL invert
 			    (unsigned)IOSurfaceGetHeight(surface), why, sizeof(why));
 		}
 		ok = img != NULL && bind_image(target, img, &error);
+		if (img == NULL && format != PIPE_FORMAT_NONE) {
+			ok = shadow = shadow_attach(surface, target, format, &error);
+			size_t used = strlen(why);
+			snprintf(why + used, sizeof(why) - used, "; shadow texture: %s", ok ? "ok" : "FAILED");
+		}
 	}
+	surface_ticks += mach_absolute_time() - start;
 	if (!ok) {
 		import_failures++;
 	}
-	if (!ok || attaches <= 12) {
+	if (shadow && shadows > 6) {
+		return ok;      /* shadows logged the first few times only */
+	}
+	if (!ok || attaches <= 12 || shadow) {
 		note("attachImage target 0x%x surface %u %zux%zu fmt 0x%x rows %zu inverted %d -> %s %s (GL 0x%x)",
 		    target, surface ? IOSurfaceGetID(surface) : 0, surface ? IOSurfaceGetWidth(surface) : 0,
 		    surface ? IOSurfaceGetHeight(surface) : 0, surface ? IOSurfaceGetPixelFormat(surface) : 0,
@@ -1067,7 +1256,15 @@ eagl_teximage(id self, SEL cmd, IOSurfaceRef surface, uint32_t target, uint32_t 
 	char why[160] = "";
 	GLenum error = 0;
 	bool ok = false;
+	uint64_t start = mach_absolute_time();
 	teximages++;
+	if (surface != NULL && shadowed(IOSurfaceGetID(surface))) {
+		static unsigned logged;
+		if (logged++ < 8) {
+			note("texImageIOSurface of shadowed surface %u: reads the surface, not what was drawn into its shadow",
+			    IOSurfaceGetID(surface));
+		}
+	}
 	if (surface == NULL || width <= 0 || height <= 0 || !begin(e, B2L_GLI_COUNT, 0)) {
 		snprintf(why, sizeof(why), "no surface, size or context");
 	} else {
@@ -1083,6 +1280,7 @@ eagl_teximage(id self, SEL cmd, IOSurfaceRef surface, uint32_t target, uint32_t 
 			ok = upload_copy(surface, plane, target, internal, width, height, format, type, &error);
 			copies++;
 			if (ok && copies > 4) {
+				surface_ticks += mach_absolute_time() - start;
 				return ok;      /* logged the first few times only */
 			}
 			size_t used = strlen(why);
@@ -1097,6 +1295,7 @@ eagl_teximage(id self, SEL cmd, IOSurfaceRef surface, uint32_t target, uint32_t 
 		    " -> %s %s (GL 0x%x)", surface ? IOSurfaceGetID(surface) : 0, target, internal, width, height, format,
 		    type, plane, (int)invert, ok ? "ok" : "FAILED", why, error);
 	}
+	surface_ticks += mach_absolute_time() - start;
 	return ok;
 }
 

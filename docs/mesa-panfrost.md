@@ -278,6 +278,21 @@ data from the shader cores was not coherent with the tiler's reads within a
 job chain. Build 54 maps pages inner shareable (`B2L_MALI_PT_PAGE`); the
 self-test checks it.
 
+Boot 55 (build 54): the triangles are fixed (self-test: 0 wrong in all 24
+runs, the user saw no more glitches). Left: (1) opening Control Center,
+backboardd took an alignment fault in `st_draw_quad` (a partial clear
+drawn as a quad): `stp s11, s9` wrote two aligned 32-bit words across a
+page boundary of an upload buffer, which device memory does not allow; the
+build now turns off LLVM's load/store pair pass (`-mllvm
+-aarch64-enable-ldst-opt=false`). (2) The clock and calendar icons,
+Settings' icons and the lock screen time were missing: Core Animation's
+own render targets with rows that are not multiples of 64 bytes failed to
+attach and had no storage; they now get a shadow texture (see
+`shadow_attach`). (3) `use_program` failed a dozen times: link failures are
+now logged with their compile logs. (4) 3-4 frames a second with the GPU
+busy a fifth of the time: the 5-second summary now gives the CPU time spent
+inside Mesa (and the slowest entries) and in the IOSurface paths.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
