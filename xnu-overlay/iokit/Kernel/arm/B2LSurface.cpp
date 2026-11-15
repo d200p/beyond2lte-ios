@@ -206,6 +206,31 @@ b2l_surface_current_seed(B2LSurface *s)
 	return *b2l_surface_seed(s);
 }
 
+extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
+
+/*
+ * Boot 57: the GPU driver cleaned every imported surface whole after every
+ * job: 1.3 s of every 500 jobs against 70-130 ms of GPU work (24 MB a job,
+ * the two display buffers). Now it only marks them, and a CPU reader drops
+ * the stale lines before it reads (clean + invalidate, once per GPU write).
+ */
+void
+b2l_surface_gpu_wrote(B2LSurface *s)
+{
+	s->gpuWritten = 1;
+}
+
+void
+b2l_surface_cpu_access(B2LSurface *s)
+{
+	if (s != NULL && OSCompareAndSwap(1, 0, &s->gpuWritten)) {
+		uintptr_t address = s->kernelAddress();
+		if (address != 0) {
+			flush_dcache64((addr64_t)address + s->offset, s->bytesPerRow * s->height, FALSE);
+		}
+	}
+}
+
 /* The table lock; the framebuffer may publish a surface before the root starts. */
 static void
 b2l_surface_init_lock(void)
@@ -1124,6 +1149,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
 	if (s == NULL) {
 		return kIOReturnNotFound;
 	}
+	b2l_surface_cpu_access(s);      /* the client reads what the GPU wrote */
 	IOReturn ret = b2l_surface_seed_out(s, seedOut, false);
 	s->release();
 	return ret;

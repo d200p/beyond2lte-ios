@@ -1908,12 +1908,15 @@ B2LMali::boImport(void *owner, uint32_t id, uint64_t *out)
  * Imported surfaces: CPU lines written back and dropped (clean + invalidate).
  * Boot 56: every submission cleaned every imported surface whole, before and
  * after the job (the two display buffers alone are 12 MB each), and the
- * GPU's share of even a trivial frame stayed 25-70 ms. After a job every
- * imported surface is still cleaned, so CPU readers see what the GPU wrote,
- * which leaves no line of them in the cache; before a job only those the CPU
- * may have written since (their seed moved: CPU writes go through IOSurface
- * locks, which move it) can hold dirty lines, so only those are cleaned.
- * Both passes are timed and logged every 500 jobs.
+ * GPU's share of even a trivial frame stayed 25-70 ms. Before a job only
+ * surfaces the CPU may have written since their last clean (their seed
+ * moved: CPU writes go through IOSurface locks, which move it) can hold
+ * dirty lines, so only those are cleaned. Boot 57: the pass after the job
+ * (every surface whole, so CPU readers would see the GPU's writes) still
+ * took 1.3 s of every 500 jobs against 70-130 ms of GPU work; now it only
+ * marks the surfaces (b2l_surface_gpu_wrote) and a CPU reader drops the
+ * stale lines when it locks the surface (b2l_surface_cpu_access). Both
+ * passes are timed and logged every 500 jobs.
  */
 void
 B2LMali::boSurfacesClean(bool before)
@@ -1925,8 +1928,12 @@ B2LMali::boSurfacesClean(bool before)
 			continue;
 		}
 		seen++;
+		if (!before) {
+			b2l_surface_gpu_wrote(surface);
+			continue;
+		}
 		uint32_t seed = b2l_surface_current_seed(surface);
-		if (before && bos[i].cleaned && bos[i].cleanedSeed == seed) {
+		if (bos[i].cleaned && bos[i].cleanedSeed == seed) {
 			boCleanSkips++;
 			continue;
 		}
@@ -1977,7 +1984,7 @@ B2LMali::jobSubmit(uint64_t jc, uint64_t requirements, uint64_t *out)
 	uint64_t begin = nowNS();
 	uint32_t status = b2l_mali_run_job(&io, slot, jc, B2L_RT_JOB_TIMEOUT_US);
 	uint64_t ran = nowNS() - begin;
-	boSurfacesClean(false);         /* and no stale line hides the GPU's */
+	boSurfacesClean(false);         /* CPU readers will drop stale lines first */
 	out[0] = status;
 	out[1] = ran;
 	boRunNS += ran;

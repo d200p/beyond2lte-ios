@@ -311,6 +311,16 @@ whole before and after each job (two 12 MB display buffers among them):
 before a job only surfaces whose seed moved are cleaned now, and the kernel
 logs run and cleaning times every 500 jobs.
 
+Boot 57 (build 56): the patched shaders compile (seven fixed, no link
+failure, no GL error), but the icons, the lock screen time and Control
+Center's controls are still blank, so the cause is elsewhere. The kernel
+times: every 500 jobs the GPU ran 70-130 ms while the after-job cleaning
+took about 1.3 s (12 GB, 24 MB a job: the display buffers); the before-job
+pass is down to 0 ms. Now the GPU driver only marks the imported surfaces
+after a job (`b2l_surface_gpu_wrote`), and a CPU reader drops the stale
+lines when it reads: a client's `IOSurfaceLock` (`trapLock`) and the
+framebuffer's CPU copies (`b2l_surface_cpu_access`).
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
