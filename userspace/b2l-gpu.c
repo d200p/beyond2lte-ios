@@ -23,6 +23,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <dlfcn.h>
@@ -2094,6 +2095,9 @@ static const uint32_t SWR_RESUME_WORDS[2] = { 0xf9006274, 0xf9475ea8 };
 static const uint32_t SW_NEW_WORDS[2] = { 0xd503201f, 0xa9be4ff4 };
 static const uint32_t GLES_NEW_WORDS[2] = { 0xb9400008, 0x71000d1f };   /* ldr w8, [x0]; cmp w8, #3 */
 #define GLES_MARKER "/private/var/tmp/b2l-gles.running"
+#ifndef B2L_GLES_PAN_DEBUG
+#define B2L_GLES_PAN_DEBUG "noafbc,nocrc"     /* Panfrost debug flags for the GLES context, see gles_context */
+#endif
 
 /*
  * Boot 46: the GLESContext was made, the display's IOSurface attached and its
@@ -2179,17 +2183,28 @@ b2l_gles_track(void *ctx, void *surface)
 		return;
 	}
 	uint32_t flags = *(const uint32_t *)((const char *)surface + 0x5c);
-	void *const *head = (void *const *)((const char *)ctx + ((flags & 0x400) ? 0x60 : 0x58));
-	for (void *s = *head; s != NULL; s = *(void *const *)((const char *)s + 0x10)) {
-		if (s == surface) {
-			return;
+	/* Either list counts as listed (the flag can change after tracking). */
+	for (unsigned list = 0x58; list <= 0x60; list += 8) {
+		void *const *head = (void *const *)((const char *)ctx + list);
+		for (void *s = *head; s != NULL; s = *(void *const *)((const char *)s + 0x10)) {
+			if (s == surface) {
+				return;
+			}
 		}
 	}
-	void *next = *(void *const *)((const char *)surface + 0x10);
-	if (next != NULL) {
-		/* Linked elsewhere: track_surface would assert; leave it to push_surface. */
-		log_line("gles: surface %p (flags 0x%x) not on the list but linked to %p", surface, flags, next);
-		return;
+	/*
+	 * Boot 50: a display surface Core Animation had taken off the list came
+	 * back to push_surface with its link (surface+0x10) still set, and
+	 * track_surface asserts on a set link. Off both lists, the link is stale:
+	 * clear it, then list the surface.
+	 */
+	void **link = (void **)((char *)surface + 0x10);
+	if (*link != NULL) {
+		if (gles_tracked < 16) {
+			log_line("gles: surface %p (flags 0x%x) off the list with a stale link %p: cleared", surface, flags,
+			    *link);
+		}
+		*link = NULL;
 	}
 	track_surface_function(ctx, surface);
 	if (gles_tracked++ < 16) {
@@ -2329,6 +2344,18 @@ gles_context(void *server)
 		return NULL;
 	}
 	eagl_flush_function = (int (*)(void))dlsym(mesa, "b2l_eagl_flush");
+	/*
+	 * Boots 49-50: Core Animation's frames on the Mali had quads losing or
+	 * stretching a triangle, different in every frame although nothing moved,
+	 * with every job done and no fault; neither the tiler job barrier nor the
+	 * copy routines changed it. Intermediate surfaces left with pieces of
+	 * other draws would look like that. Panfrost renders them with AFBC and
+	 * transaction elimination (CRC tile skipping) by default, and AFBC
+	 * clears misbehaved in the probe boots 38-43: this test turns both off
+	 * (Panfrost reads PAN_MESA_DEBUG when the screen is made, inside create).
+	 */
+	setenv("PAN_MESA_DEBUG", B2L_GLES_PAN_DEBUG, 0);
+	log_line("gles: PAN_MESA_DEBUG=%s", getenv("PAN_MESA_DEBUG"));
 	void *eagl = create();
 	if (eagl == NULL) {
 		log_line("gles: no EAGL context; software");

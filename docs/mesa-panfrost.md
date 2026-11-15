@@ -204,6 +204,17 @@ sets it on every tiler job (`B2L_NO_TILER_BARRIER=1` undoes it). Surfaces the
 Mali cannot sample in place are now copied into the texture with
 glTexImage2D.
 
+Boot 50 (build 49): the copies worked (6 x 90, 6 x 6, 256 x 1), the barrier did
+not change the triangles (and the battery icon was now wrong too). Core
+Animation redraws about 10 times a second even with nothing moving, and every
+frame comes out different: more like intermediate surfaces left with pieces
+of other draws than like wrong vertices. backboardd then aborted in
+`push_surface` again: a display surface Core Animation had taken off the list
+came back with its link still set, which the hook left alone; it now clears a
+stale link before `track_surface`. Test for boot 51: `b2l-gpu.c` sets
+`PAN_MESA_DEBUG=noafbc,nocrc` (no AFBC, no transaction elimination) before
+the Mesa screen is made (`B2L_GLES_PAN_DEBUG` at build time).
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
