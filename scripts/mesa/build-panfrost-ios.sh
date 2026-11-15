@@ -82,6 +82,8 @@ python3 "$repo/scripts/mesa/b2l-drm/patch_os_mman.py" "$src/src/util/os_mman.h"
 python3 "$repo/scripts/mesa/b2l-drm/patch_pan_shader_idvs.py" "$src/src/gallium/drivers/panfrost/pan_shader.c"
 # Tiler jobs wait for every earlier job (B2L_NO_TILER_BARRIER=1 undoes it): see the script.
 python3 "$repo/scripts/mesa/b2l-drm/patch_pan_jm_barrier.py" "$src/src/gallium/drivers/panfrost/pan_jm.c"
+# A refused IOSurface import returns NULL instead of crashing (boot 58): see the script.
+python3 "$repo/scripts/mesa/b2l-drm/patch_pan_bo_import.py" "$src/src/gallium/drivers/panfrost/pan_bo.c"
 # Our target, built by Mesa's own meson like the OSMesa one.
 target="$src/src/gallium/targets/b2l"
 mkdir -p "$target"

@@ -1777,7 +1777,9 @@ B2LMali::boDrop(struct b2l_mali_bo *bo)
 {
 	unmapRange(bo->va, bo->resident);
 	boRelease((bo->va - B2L_RT_BO_VA) >> 12, bo->bytes >> 12);
-	boBytes -= bo->resident;
+	if (bo->surface == NULL) {
+		boBytes -= bo->resident;        /* imports never counted (boImport) */
+	}
 	bo->memory->complete();
 	OSSafeReleaseNULL(bo->memory);
 	if (bo->surface != NULL) {
@@ -1853,8 +1855,14 @@ B2LMali::boImport(void *owner, uint32_t id, uint64_t *out)
 	}
 	IOMemoryDescriptor *memory = surface->memory;
 	uint64_t bytes = round_page_64(surface->allocSize);
-	if (memory == NULL || bytes == 0 || bytes > memory->getLength() + PAGE_MASK ||
-	    boBytes + bytes > B2L_RT_BO_LIMIT) {
+	/*
+	 * Boot 58: with 50 surfaces imported (several whole-screen app snapshots,
+	 * 12 MB each) the next import was refused with kIOReturnNoMemory, as the
+	 * imports counted against B2L_RT_BO_LIMIT, the limit on the memory Mesa's
+	 * own buffer objects allocate. An import allocates nothing (it maps the
+	 * surface's pages), so only the GPU address range bounds it now.
+	 */
+	if (memory == NULL || bytes == 0 || bytes > memory->getLength() + PAGE_MASK) {
 		surface->release();
 		return memory == NULL || bytes == 0 ? kIOReturnBadArgument : kIOReturnNoMemory;
 	}
@@ -1891,7 +1899,6 @@ B2LMali::boImport(void *owner, uint32_t id, uint64_t *out)
 	bo->resident = bytes;
 	bo->flags = B2L_MALI_BO_NOEXEC;
 	bo->surface = surface;          /* keeps b2l_surface_copy's reference */
-	boBytes += bytes;
 	boSurfaces++;
 	out[0] = index + 1;
 	out[1] = base;

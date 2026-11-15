@@ -116,6 +116,7 @@ static uint64_t enter_ticks, mesa_ticks, surface_ticks, gli_ticks[B2L_GLI_COUNT]
 static struct b2l_eagl *the_eagl;
 static struct b2l_image images[IMAGES];
 static uint64_t image_clock;
+static unsigned images_dropped;
 static pthread_mutex_t image_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static uint64_t
@@ -187,10 +188,14 @@ summary(void)
 		    (unsigned long long)(gli_ticks[best] * tb.numer / tb.denom / 1000000));
 		gli_ticks[best] = 0;
 	}
-	b2l_drm_note("eagl: 5 s CPU: %llu ms inside Mesa, %llu ms in IOSurface attach/copy, of %llu ms; slowest (ms):%s",
-	    (unsigned long long)(mesa_ticks * tb.numer / tb.denom / 1000000),
+	unsigned held = 0;
+	for (unsigned i = 0; i < IMAGES; i++) {
+		held += images[i].magic == IMAGE_MAGIC;
+	}
+	b2l_drm_note("eagl: 5 s CPU: %llu ms inside Mesa, %llu ms in IOSurface attach/copy, of %llu ms; images held %u,"
+	    " dropped %u; slowest (ms):%s", (unsigned long long)(mesa_ticks * tb.numer / tb.denom / 1000000),
 	    (unsigned long long)(surface_ticks * tb.numer / tb.denom / 1000000), (unsigned long long)(now - window_start),
-	    slowest);
+	    held, images_dropped, slowest);
 	mesa_ticks = 0;
 	surface_ticks = 0;
 	memset(gli_ticks, 0, sizeof(gli_ticks));
@@ -1052,6 +1057,20 @@ image_get(IOSurfaceRef surface, unsigned plane, enum pipe_format format, unsigne
 	uint32_t sid = IOSurfaceGetID(surface);
 	struct b2l_image *img = NULL, *victim = &images[0];
 	pthread_mutex_lock(&image_lock);
+	/*
+	 * Boot 58: entries kept their surface, and its GPU mapping, alive after
+	 * everyone else had let it go (50 imported, whole-screen app snapshots of
+	 * 12 MB among them, until an import was refused). Entries whose surface
+	 * nobody else in the process holds go now; a texture still using one
+	 * keeps its own reference to the resource.
+	 */
+	for (unsigned i = 0; i < IMAGES; i++) {
+		struct b2l_image *it = &images[i];
+		if (it->magic == IMAGE_MAGIC && it->surface != surface && CFGetRetainCount(it->surface) <= 1) {
+			image_release(it);
+			images_dropped++;
+		}
+	}
 	for (unsigned i = 0; i < IMAGES; i++) {
 		struct b2l_image *it = &images[i];
 		if (it->magic == IMAGE_MAGIC && it->surface == surface && it->surface_id == sid && it->plane == plane &&
@@ -1798,9 +1817,34 @@ sft_near(const uint8_t *got, const uint8_t want[4])
 	return true;
 }
 
+/*
+ * A pixel of an IOSurface read with the CPU under IOSurfaceLock (which drops
+ * the lines the GPU made stale, b2l_surface_cpu_access), as RGBA. Boot 58:
+ * glReadPixels of the imported surface after the next-batch case returned
+ * what the surface held before the red draw: Mesa may read a linear
+ * imported resource through its CPU mapping, whose cache lines nothing drops
+ * since the after-job cleaning went (ed49f1a); the lock gives the truth.
+ */
+static bool
+sft_surface_pixel(IOSurfaceRef surface, unsigned x, unsigned y, uint8_t rgba[4])
+{
+	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
+		return false;
+	}
+	const uint8_t *p = (const uint8_t *)IOSurfaceGetBaseAddress(surface) + (size_t)y * IOSurfaceGetBytesPerRow(surface) +
+	    (size_t)x * 4;
+	rgba[0] = p[2];
+	rgba[1] = p[1];
+	rgba[2] = p[0];
+	rgba[3] = p[3];
+	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+	return true;
+}
+
 /* One target: the same-batch case, then the next-batch (preloaded) case. */
 static void
-sft_fetch_target(struct _glapi_table *d, const char *label, GLuint red, GLuint fetch, uint8_t *pixels)
+sft_fetch_target(struct _glapi_table *d, const char *label, GLuint red, GLuint fetch, uint8_t *pixels,
+    IOSurfaceRef surface)
 {
 	static const uint8_t clear_swapped[4] = { 191, 128, 64, 255 }; /* clear (64, 128, 191) fetched, red and blue swapped */
 	static const uint8_t red_swapped[4] = { 0, 64, 255, 255 };     /* (255, 64, 0) fetched, swapped */
@@ -1818,10 +1862,16 @@ sft_fetch_target(struct _glapi_table *d, const char *label, GLuint red, GLuint f
 	    sft_near(a, clear_swapped) ? "right" : "WRONG", a[0], a[1], a[2], a[3], clear_swapped[0], clear_swapped[1],
 	    clear_swapped[2], clear_swapped[3], CALL_GetError(d, ()));
 	/* Next batch: clear, red on the left half, finish; then fetch over everything. */
+	static const uint8_t red_plain[4] = { 255, 64, 0, 255 };
 	CALL_Clear(d, (GL_COLOR_BUFFER_BIT));
 	CALL_UseProgram(d, (red));
 	sft_rect(d, -1.0f, 0.0f);
 	CALL_Finish(d, ());
+	uint8_t locked[4];
+	if (surface != NULL && sft_surface_pixel(surface, left, mid, locked)) {
+		note("selftest fetch %s, after the red draw: surface (locked) holds %02x%02x%02x%02x on the left: %s", label,
+		    locked[0], locked[1], locked[2], locked[3], sft_near(locked, red_plain) ? "right" : "WRONG");
+	}
 	CALL_UseProgram(d, (fetch));
 	sft_rect(d, -1.0f, 1.0f);
 	CALL_Finish(d, ());
@@ -1831,6 +1881,10 @@ sft_fetch_target(struct _glapi_table *d, const char *label, GLuint red, GLuint f
 	    " (%02x%02x%02x%02x) (GL 0x%x)", label, sft_near(l, red_swapped) ? "right" : "WRONG", l[0], l[1], l[2], l[3],
 	    red_swapped[0], red_swapped[1], red_swapped[2], red_swapped[3], sft_near(r, clear_swapped) ? "right" : "WRONG",
 	    r[0], r[1], r[2], r[3], CALL_GetError(d, ()));
+	if (surface != NULL && sft_surface_pixel(surface, left, mid, locked)) {
+		note("selftest fetch %s, next batch read locked: drawn half %s (%02x%02x%02x%02x)", label,
+		    sft_near(locked, red_swapped) ? "right" : "WRONG", locked[0], locked[1], locked[2], locked[3]);
+	}
 }
 
 /* An IOSurface like Core Animation's display buffers: BGRA, rows a multiple of 64 bytes. */
@@ -1866,7 +1920,7 @@ sft_fetch(struct _glapi_table *d, GLuint framebuffer, uint8_t *pixels)
 	CALL_DisableVertexAttribArray(d, (3));
 	CALL_EnableVertexAttribArray(d, (0));
 	CALL_BindFramebuffer(d, (GL_FRAMEBUFFER, framebuffer));
-	sft_fetch_target(d, "texture", red, fetch, pixels);
+	sft_fetch_target(d, "texture", red, fetch, pixels, NULL);
 	IOSurfaceRef surface = sft_iosurface();
 	GLuint texture = 0, target = 0;
 	char why[160] = "";
@@ -1881,7 +1935,7 @@ sft_fetch(struct _glapi_table *d, GLuint framebuffer, uint8_t *pixels)
 	CALL_FramebufferTexture2D(d, (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0));
 	GLenum status = CALL_CheckFramebufferStatus(d, (GL_FRAMEBUFFER));
 	if (bound && status == GL_FRAMEBUFFER_COMPLETE) {
-		sft_fetch_target(d, "IOSurface", red, fetch, pixels);
+		sft_fetch_target(d, "IOSurface", red, fetch, pixels, surface);
 	} else {
 		note("selftest fetch IOSurface: not run (surface %p, import %s %s, GL 0x%x, framebuffer 0x%x)",
 		    (void *)surface, bound ? "ok" : "FAILED", why, error, status);

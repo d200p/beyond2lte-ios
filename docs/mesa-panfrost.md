@@ -342,6 +342,28 @@ whole TLB flush whenever 50 ms had passed without a job, which at 3-10
 frames a second was nearly every frame. The cores now stay on for 500 ms
 without a job, and the 500-job log line counts the power-ups and their time.
 
+Boot 58 (build 57): much faster (the user). Per 500 jobs: GPU 70-90 ms,
+cleaning 1-10 ms before and 0-1 ms after (was about 1300), 0-1 power-ups.
+Opening apps, backboardd died at NULL + 8 in `panfrost_bo_import`: with 50
+surfaces imported (whole-screen app snapshots of 12 MB among them) the
+kernel refused the next import (`kIOReturnNoMemory`), because imports
+counted against `B2L_RT_BO_LIMIT`, the limit on memory Mesa's own buffer
+objects allocate, and Mesa does not check the import's result in release
+builds. Now an import maps without counting (only the GPU range bounds
+it), `patch_pan_bo_import.py` makes a refused import return NULL (its
+callers handle that), and the EAGL image cache lets go of surfaces nobody
+else in the process holds (it had kept them, and their memory, alive).
+The Files app stopped on a Swift trap in libswiftCore, nothing pointing to
+the GPU. iOS's own lines add, for the clock and calendar icons, that
+chronod also calls IOSurface root selector 54, which our driver lacks.
+The framebuffer-fetch self-test: right on a texture in both cases and on
+an imported IOSurface in the same batch; for the next batch on the
+IOSurface, glReadPixels returned what the surface held before the red
+draw, possibly stale CPU cache lines (Mesa may read a linear imported
+resource through its CPU mapping, and nothing drops those lines since
+ed49f1a): the test now also reads the surface under `IOSurfaceLock`, after
+the red draw and after the fetch.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
