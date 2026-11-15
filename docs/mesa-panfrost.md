@@ -405,10 +405,16 @@ The tab bars (icons too, in software as well): Liquid Glass is
 `GlassBackgroundFilter` (shader kinds 0x44/0x45) and `GlassForegroundFilter`
 (0x48/0x49), kinds only `MetalContext::function_supported` takes
 (`GLContext`'s takes none above 0x39 but 0x78, `SWContext`'s none but 0x4a
-and 0x4c), so the glass and what sits on it were dropped. Both filters'
-`identity()` (slot 0 of the OGL filter subclass, which
-`Render::Filter::evaluate_identity` calls) now answers 1, in both modes:
-Core Animation skips the glass and draws the content plainly.
+and 0x4c), so the glass and what sits on it are dropped. Boot 60 (build 59)
+made both filters' `identity()` answer 1, and it went badly: on the GPU
+only 320 GL calls and 6 frames, then backboardd aborted on unlock
+("memory corruption of free block" in `CA::Shape` code, the display thread
+inside `prepare_layers_roi`); the software backboardd that followed stopped
+presenting frames after a few seconds while using about 1.3 cores, until
+the phone was rebooted. `Render::Filter::evaluate_identity` runs once, when
+the filter is made, and the layers' region-of-interest code still treats
+them as glass. That patch is undone; the lock screen time had no fair test
+in boot 60 (the GPU drew almost nothing).
 
 ## Why
 

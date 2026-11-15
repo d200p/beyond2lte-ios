@@ -2222,48 +2222,6 @@ install_gles_no_paths(uint64_t slide)
 	    (void *)entry);
 }
 
-/*
- * Boot 59: every app's tab bar showed only its shadow, icons and titles
- * missing, on the GPU and in software alike. iOS 26 draws them through
- * Liquid Glass: GlassBackgroundFilter (the platter, shader kinds 0x44/0x45)
- * and GlassForegroundFilter (what sits on it, 0x48/0x49). Only the Metal
- * context supports those kinds (GLContext::function_supported takes none
- * above 0x39 but 0x78, SWContext's none but 0x4a and 0x4c), so the glass and
- * its content were dropped. Both filters' identity() (FilterSubclass slot 0,
- * which Render::Filter::evaluate_identity calls, as for a blur of radius 0)
- * now answers 1: Core Animation skips the glass and draws the content as it
- * is, without the effect. Software and GPU alike.
- */
-#define GLASS_FG_IDENTITY 0x1840fd948ull /* GlassForegroundFilter::identity: mov w0, #0; ret */
-#define GLASS_BG_IDENTITY 0x183fc9d24ull /* GlassBackgroundFilter::identity: mov w0, #0; ret */
-static const uint32_t GLASS_IDENTITY_WORDS[2] = { 0x52800000, 0xd65f03c0 };
-static char glass_note[96] = "not patched";
-
-static void
-install_glass_identity(uint64_t slide)
-{
-	uint32_t *fg = (uint32_t *)(GLASS_FG_IDENTITY + slide), *bg = (uint32_t *)(GLASS_BG_IDENTITY + slide);
-	if (memcmp(fg, GLASS_IDENTITY_WORDS, sizeof(GLASS_IDENTITY_WORDS)) ||
-	    memcmp(bg, GLASS_IDENTITY_WORDS, sizeof(GLASS_IDENTITY_WORDS))) {
-		snprintf(glass_note, sizeof(glass_note), "words differ: %08x %08x", fg[0], bg[0]);
-		return;
-	}
-	uint32_t *at[2] = { fg, bg };
-	for (int i = 0; i < 2; i++) {
-		vm_address_t page = (vm_address_t)at[i] & ~(vm_address_t)(vm_page_size - 1);
-		kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE,
-		    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-		if (kr) {
-			snprintf(glass_note, sizeof(glass_note), "%s not writable (%d)", i ? "background" : "foreground", kr);
-			return;
-		}
-		at[i][0] = 0x52800020;  /* mov w0, #1 */
-		sys_icache_invalidate(at[i], 4);
-		vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
-	}
-	snprintf(glass_note, sizeof(glass_note), "glass filters are identity (%p, %p)", (void *)fg, (void *)bg);
-}
-
 static void *gles_ctx;                  /* the window server's GLESContext */
 static void (*track_surface_function)(void *, void *);
 static unsigned gles_tracked, gles_untracked;
@@ -2396,7 +2354,6 @@ install_gles_hook(void)
 		    (unsigned long long)slide);
 		return;
 	}
-	install_glass_identity(slide);  /* software renderer too: neither draws the glass */
 	uint32_t *at = (uint32_t *)(SWR_PATCH + slide);
 	const uint32_t *resume = (const uint32_t *)(SWR_RESUME + slide);
 	const uint32_t *sw = (const uint32_t *)(SW_NEW_CONTEXT + slide);
@@ -2540,7 +2497,6 @@ start_thread(void *unused)
 	log_line("library running in pid %d uid %d", getpid(), (int)getuid());
 	log_line("gles: %s", gles_install_note);
 	log_line("gles: GPU paths: %s", gles_paths_note);
-	log_line("gles: Liquid Glass: %s", glass_note);
 	keyboard_dictation_languages();
 	keyboard_dictation_off();
 	if (!B2L_GPU_HOOKS) {
