@@ -105,7 +105,13 @@ if [[ -f "$lib" ]]; then
   codesign --force --sign - "$build/b2l-mesa/libb2l-mesa.dylib"
   { ls -l "$lib" "$build/b2l-mesa/libb2l-mesa.dylib"; xcrun --sdk iphoneos nm -gU "$build/b2l-mesa/libb2l-mesa.dylib" | grep -c ' T ' ;
     xcrun --sdk iphoneos nm -gU "$build/b2l-mesa/libb2l-mesa.dylib" | grep ' _b2l_'; xcrun --sdk iphoneos otool -L "$build/b2l-mesa/libb2l-mesa.dylib";
-    gzip -9 -c "$build/b2l-mesa/libb2l-mesa.dylib" | wc -c; } 2>&1 | tee "$build/b2l-mesa.log"
+    gzip -9 -c "$build/b2l-mesa/libb2l-mesa.dylib" | wc -c; shasum -a 256 "$build/b2l-mesa/libb2l-mesa.dylib"; } 2>&1 | tee "$build/b2l-mesa.log"
+  # For reading crash backtraces from the phone: the same library before
+  # strip, and its full symbol map (with local symbols), sorted by address.
+  mkdir -p "$build/b2l-mesa-symbols"
+  cp "$lib" "$build/b2l-mesa-symbols/libb2l-mesa-unstripped.dylib"
+  xcrun --sdk iphoneos nm -n "$lib" > "$build/b2l-mesa-symbols/libb2l-mesa.nm.txt" || true
+  shasum -a 256 "$lib" "$build/b2l-mesa/libb2l-mesa.dylib" > "$build/b2l-mesa-symbols/SHA256SUMS"
 else
   echo "b2l-mesa: not built" | tee "$build/b2l-mesa.log"
 fi

@@ -73,3 +73,10 @@ jobs:
           name: b2l-mesa
           path: out/mesa/ios/b2l-mesa/libb2l-mesa.dylib
           if-no-files-found: warn
+      # The same library unstripped, with its symbol map, for crash backtraces.
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: b2l-mesa-symbols
+          path: out/mesa/ios/b2l-mesa-symbols/
+          if-no-files-found: warn
