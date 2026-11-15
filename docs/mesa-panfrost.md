@@ -161,6 +161,22 @@ in the software context is closed by `scripts/patch-ca-software-surface.py`.
 surface that is not on the context's list is put there with `track_surface`
 first.
 
+Boot 47 (build 46): past `push_surface`, Core Animation drew on the Mali for
+about 80 s: shaders compiled and linked, `draw_elements`, `clear`,
+`tex_image2D`, both display buffers attached, no GL error, no missing entry
+or selector. The panel stayed black (no Apple logo), and no `flush`, `finish`
+or fence was ever called. Then backboardd died with EXC_ARM_DA_ALIGN in
+libSystem's memset, reached from `gli_tex_image2D` -> `_mesa_TexImage2D` ->
+`st_TexImage` -> `st_texture_create` -> Panfrost's
+`panfrost_resource_init_afbc_headers`, which zeroes a new texture's AFBC
+headers through the write-combined mapping; libSystem clears large ranges with
+DC ZVA, which faults there (frames read with the unstripped library from the
+Mesa workflow's `b2l-mesa-symbols` artifact; the published library was
+rebuilt bit for bit). Fixes: `b2l-target/b2l_memset.c` gives everything in
+libb2l-mesa a memset/bzero with plain stores only, and `b2l-gpu.c` hooks
+`IOMFBDisplay::fb_swap_set_layer` so that Mesa finishes the frame
+(`b2l_eagl_flush`, glFinish) before a display buffer goes to the framebuffer.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer

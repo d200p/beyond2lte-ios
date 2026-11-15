@@ -2128,9 +2128,49 @@ __asm__(".text\n.p2align 2\n.globl _b2l_push_surface_hook\n_b2l_push_surface_hoo
     " nop\n sub sp, sp, #0x80\n stp x26, x25, [sp, #0x30]\n stp x24, x23, [sp, #0x40]\n"
     " adrp x16, _b2l_push_surface_resume@PAGE\n ldr x16, [x16, _b2l_push_surface_resume@PAGEOFF]\n br x16\n");
 
+/*
+ * Boot 47: the GLESContext drew for 80 s (shaders, draws, both display
+ * buffers attached, no GL error) while the panel stayed black: GLESContext
+ * never calls flush, finish or a fence itself, so Panfrost kept each frame's
+ * batch pending when the buffer went to the display. The buffer reaches the
+ * framebuffer through IOMFBDisplay::fb_swap_set_layer (only caller:
+ * swap_set_layer); its entry first calls b2l_gles_before_swap, which has
+ * Mesa finish the context's work (b2l_eagl_flush).
+ */
+#define FB_SWAP_SET_LAYER 0x183f5874cull /* IOMFBDisplay::fb_swap_set_layer(IOMobileFramebuffer &, unsigned, IOSurface *, ...) */
+static const uint32_t FB_SWAP_SET_LAYER_WORDS[4] = { 0xd503201f, 0xa9ba6ffc, 0xa90167fa, 0xa9025ff8 };
+
+void b2l_gles_before_swap(void *surface);
+void b2l_swap_layer_hook(void);
+uint64_t b2l_swap_layer_resume;
+__asm__(".text\n.p2align 2\n.globl _b2l_swap_layer_hook\n_b2l_swap_layer_hook:\n"
+    " stp x29, x30, [sp, #-0x60]!\n mov x29, sp\n"
+    " stp x0, x1, [sp, #0x10]\n stp x2, x3, [sp, #0x20]\n stp x4, x5, [sp, #0x30]\n stp x6, x7, [sp, #0x40]\n"
+    " str x8, [sp, #0x50]\n"
+    " mov x0, x3\n bl _b2l_gles_before_swap\n"
+    " ldp x0, x1, [sp, #0x10]\n ldp x2, x3, [sp, #0x20]\n ldp x4, x5, [sp, #0x30]\n ldp x6, x7, [sp, #0x40]\n"
+    " ldr x8, [sp, #0x50]\n ldp x29, x30, [sp], #0x60\n"
+    /* fb_swap_set_layer's displaced entry words, then the rest of it */
+    " nop\n stp x28, x27, [sp, #-0x60]!\n stp x26, x25, [sp, #0x10]\n stp x24, x23, [sp, #0x20]\n"
+    " adrp x16, _b2l_swap_layer_resume@PAGE\n ldr x16, [x16, _b2l_swap_layer_resume@PAGEOFF]\n br x16\n");
+
 static void *gles_ctx;                  /* the window server's GLESContext */
 static void (*track_surface_function)(void *, void *);
 static unsigned gles_tracked;
+static int (*eagl_flush_function)(void);
+static unsigned gles_swaps;
+
+void
+b2l_gles_before_swap(void *surface)
+{
+	if (gles_ctx == NULL) {
+		return;
+	}
+	int r = eagl_flush_function != NULL ? eagl_flush_function() : -9;
+	if (gles_swaps++ < 4) {
+		log_line("gles: display buffer %p to the framebuffer: Mesa finish -> %d (swap %u)", surface, r, gles_swaps);
+	}
+}
 
 void
 b2l_gles_track(void *ctx, void *surface)
@@ -2212,14 +2252,16 @@ install_gles_hook(void)
 	const uint32_t *gles = (const uint32_t *)(GLES_NEW_CONTEXT + slide);
 	uint32_t *push = (uint32_t *)(PUSH_SURFACE + slide);
 	const uint32_t *track = (const uint32_t *)(TRACK_SURFACE + slide);
+	uint32_t *swap = (uint32_t *)(FB_SWAP_SET_LAYER + slide);
 	if (memcmp(at, SWR_PATCH_WORDS, sizeof(SWR_PATCH_WORDS)) || memcmp(resume, SWR_RESUME_WORDS,
 	    sizeof(SWR_RESUME_WORDS)) || memcmp(sw, SW_NEW_WORDS, sizeof(SW_NEW_WORDS)) ||
 	    memcmp(gles, GLES_NEW_WORDS, sizeof(GLES_NEW_WORDS)) ||
 	    memcmp(push, PUSH_SURFACE_WORDS, sizeof(PUSH_SURFACE_WORDS)) ||
-	    memcmp(track, TRACK_SURFACE_WORDS, sizeof(TRACK_SURFACE_WORDS))) {
+	    memcmp(track, TRACK_SURFACE_WORDS, sizeof(TRACK_SURFACE_WORDS)) ||
+	    memcmp(swap, FB_SWAP_SET_LAYER_WORDS, sizeof(FB_SWAP_SET_LAYER_WORDS))) {
 		snprintf(gles_install_note, sizeof(gles_install_note),
-		    "words differ: patch %08x resume %08x sw %08x gles %08x push %08x track %08x", at[0], resume[0], sw[1],
-		    gles[0], push[1], track[1]);
+		    "words differ: patch %08x resume %08x sw %08x gles %08x push %08x track %08x swap %08x", at[0], resume[0],
+		    sw[1], gles[0], push[1], track[1], swap[1]);
 		return;
 	}
 	sw_new_context_function = (void *(*)(void *, void *, unsigned))(uintptr_t)sw;
@@ -2229,10 +2271,17 @@ install_gles_hook(void)
 	b2l_swr_x21 = SWR_X21_PAGE + slide;
 	b2l_swr_x22 = SWR_X22_PAGE + slide;
 	b2l_push_surface_resume = (uint64_t)(uintptr_t)(push + 4);
-	/* push_surface first: its hook does nothing until a GLES context exists. */
+	b2l_swap_layer_resume = (uint64_t)(uintptr_t)(swap + 4);
+	/* push_surface and fb_swap_set_layer first: their hooks do nothing until
+	 * a GLES context exists. */
 	kern_return_t kr = patch_jump(push, b2l_push_surface_hook);
 	if (kr) {
 		snprintf(gles_install_note, sizeof(gles_install_note), "push_surface not writable (%d)", kr);
+		return;
+	}
+	kr = patch_jump(swap, b2l_swap_layer_hook);
+	if (kr) {
+		snprintf(gles_install_note, sizeof(gles_install_note), "fb_swap_set_layer not writable (%d)", kr);
 		return;
 	}
 	kr = patch_jump(at, b2l_sw_renderer_stub);
@@ -2241,8 +2290,9 @@ install_gles_hook(void)
 		return;
 	}
 	gles_hooked = 1;
-	snprintf(gles_install_note, sizeof(gles_install_note), "sw_renderer patched at %p, push_surface at %p",
-	    (void *)at, (void *)push);
+	snprintf(gles_install_note, sizeof(gles_install_note),
+	    "sw_renderer patched at %p, push_surface at %p, fb_swap_set_layer at %p", (void *)at, (void *)push,
+	    (void *)swap);
 }
 
 static void *
@@ -2278,6 +2328,7 @@ gles_context(void *server)
 		unlink(GLES_MARKER);
 		return NULL;
 	}
+	eagl_flush_function = (int (*)(void))dlsym(mesa, "b2l_eagl_flush");
 	void *eagl = create();
 	if (eagl == NULL) {
 		log_line("gles: no EAGL context; software");

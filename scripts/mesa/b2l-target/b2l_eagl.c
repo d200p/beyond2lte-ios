@@ -51,6 +51,7 @@
 #define B2L_EXPORT __attribute__((visibility("default")))
 
 B2L_EXPORT void *b2l_eagl_context_create(void);
+B2L_EXPORT int b2l_eagl_flush(void);
 struct pipe_frontend_screen *b2l_fscreen(void);
 
 /* Enums from Apple's and the ES extension headers. */
@@ -104,7 +105,8 @@ static int gli_slot[B2L_GLI_COUNT];             /* Mesa dispatch offset; -1 none
 static uint8_t gli_seen[B2L_GLI_COUNT];         /* 1 first use logged, 2 also "missing" */
 static uint32_t gli_calls[B2L_GLI_COUNT];
 static uint64_t calls_total, errors_total, window_calls, window_start;
-static unsigned lines, attaches, teximages, import_failures, switches;
+static unsigned lines, attaches, teximages, import_failures, switches, swap_flushes;
+static uint64_t swap_flush_ms;
 static struct b2l_eagl *the_eagl;
 static struct b2l_image images[IMAGES];
 static uint64_t image_clock;
@@ -155,8 +157,10 @@ summary(void)
 		}
 	}
 	b2l_drm_note("eagl: 5 s: %llu calls (%llu total), attach %u, teximage %u, import failures %u, GL errors %llu,"
-	    " context switches %u; busiest:%s", (unsigned long long)window_calls, (unsigned long long)calls_total,
-	    attaches, teximages, import_failures, (unsigned long long)errors_total, switches, used);
+	    " context switches %u, swaps flushed %u (%llu ms); busiest:%s", (unsigned long long)window_calls,
+	    (unsigned long long)calls_total, attaches, teximages, import_failures, (unsigned long long)errors_total,
+	    switches, swap_flushes, (unsigned long long)swap_flush_ms, used);
+	swap_flush_ms = 0;
 	memset(gli_calls, 0, sizeof(gli_calls));
 	window_calls = 0;
 	window_start = now;
@@ -190,7 +194,7 @@ begin(void *c, unsigned index, uint64_t a0)
 			    (unsigned long long)calls_total);
 		}
 	}
-	if ((calls_total & 1023) == 0) {
+	if ((calls_total & 63) == 0) {
 		summary();
 	}
 	return 1;
@@ -914,4 +918,33 @@ b2l_eagl_context_create(void)
 	    version ? (const char *)version : "?", max_texture, extensions ? strlen((const char *)extensions) : 0,
 	    (void *)object);
 	return object;
+}
+
+/*
+ * Before the window server hands a display buffer to the framebuffer
+ * (userspace/b2l-gpu.c hooks IOMFBDisplay::fb_swap_set_layer): GLESContext
+ * never calls flush, finish or a fence itself (boot 47: none in 80 s), so
+ * Panfrost kept each frame's batch pending while the panel showed the
+ * buffer as it was. glFinish submits every batch; B2LMali's submission
+ * waits for the GPU, so the IOSurface holds the frame on return.
+ */
+int
+b2l_eagl_flush(void)
+{
+	struct b2l_eagl *e = the_eagl;
+	if (e == NULL) {
+		return -1;
+	}
+	if (_mesa_glapi_get_context() != (void *)e->st->ctx && !st_api_make_current(e->st, NULL, NULL)) {
+		return -2;
+	}
+	uint64_t start = now_ms();
+	CALL_Finish(GET_DISPATCH(), ());
+	uint64_t took = now_ms() - start;
+	swap_flushes++;
+	swap_flush_ms += took;
+	if (swap_flushes <= 6) {
+		note("swap %u: frame finished on the GPU in %llu ms", swap_flushes, (unsigned long long)took);
+	}
+	return 0;
 }
