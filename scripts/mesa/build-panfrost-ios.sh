@@ -76,6 +76,8 @@ echo '--- libdrm calls'; cat "$build/libdrm-calls.txt"; echo '--- DRM ioctls'; c
 python3 "$repo/scripts/mesa/b2l-drm/patch_os_mman.py" "$src/src/util/os_mman.h"
 # No IDVS on this GPU (B2L_IDVS=1 brings it back): see the script.
 python3 "$repo/scripts/mesa/b2l-drm/patch_pan_shader_idvs.py" "$src/src/gallium/drivers/panfrost/pan_shader.c"
+# Tiler jobs wait for every earlier job (B2L_NO_TILER_BARRIER=1 undoes it): see the script.
+python3 "$repo/scripts/mesa/b2l-drm/patch_pan_jm_barrier.py" "$src/src/gallium/drivers/panfrost/pan_jm.c"
 # Our target, built by Mesa's own meson like the OSMesa one.
 target="$src/src/gallium/targets/b2l"
 mkdir -p "$target"

@@ -105,7 +105,7 @@ static int gli_slot[B2L_GLI_COUNT];             /* Mesa dispatch offset; -1 none
 static uint8_t gli_seen[B2L_GLI_COUNT];         /* 1 first use logged, 2 also "missing" */
 static uint32_t gli_calls[B2L_GLI_COUNT];
 static uint64_t calls_total, errors_total, window_calls, window_start;
-static unsigned lines, attaches, teximages, import_failures, switches, swap_flushes;
+static unsigned lines, attaches, teximages, import_failures, switches, swap_flushes, copies;
 static uint64_t swap_flush_ms;
 static struct b2l_eagl *the_eagl;
 static struct b2l_image images[IMAGES];
@@ -156,10 +156,11 @@ summary(void)
 			at += (size_t)snprintf(used + at, sizeof(used) - at, " %s=%u", b2l_gli_name[i], gli_calls[i]);
 		}
 	}
-	b2l_drm_note("eagl: 5 s: %llu calls (%llu total), attach %u, teximage %u, import failures %u, GL errors %llu,"
-	    " context switches %u, swaps flushed %u (%llu ms); busiest:%s", (unsigned long long)window_calls,
-	    (unsigned long long)calls_total, attaches, teximages, import_failures, (unsigned long long)errors_total,
-	    switches, swap_flushes, (unsigned long long)swap_flush_ms, used);
+	b2l_drm_note("eagl: 5 s: %llu calls (%llu total), attach %u, teximage %u (copied %u), import failures %u,"
+	    " GL errors %llu, context switches %u, swaps flushed %u (%llu ms); busiest:%s",
+	    (unsigned long long)window_calls, (unsigned long long)calls_total, attaches, teximages, copies,
+	    import_failures, (unsigned long long)errors_total, switches, swap_flushes,
+	    (unsigned long long)swap_flush_ms, used);
 	swap_flush_ms = 0;
 	memset(gli_calls, 0, sizeof(gli_calls));
 	window_calls = 0;
@@ -781,6 +782,52 @@ eagl_attach(id self, SEL cmd, uint32_t target, IOSurfaceRef surface, BOOL invert
 	return ok;
 }
 
+/*
+ * Boot 49: two small layer surfaces (6 x 90, 6 x 6) had rows of 32 bytes,
+ * which the Mali cannot sample in place (64-byte multiples), so their layers
+ * were missing. Such surfaces are copied instead: locked for reading and
+ * uploaded into the bound texture with glTexImage2D (row length from the
+ * surface). Core Animation calls texImageIOSurface again when they change.
+ */
+static bool
+upload_copy(IOSurfaceRef surface, unsigned plane, uint32_t target, uint32_t internal, int32_t width,
+    int32_t height, uint32_t format, uint32_t type, GLenum *error)
+{
+	size_t planes = IOSurfaceGetPlaneCount(surface);
+	size_t stride = planes ? IOSurfaceGetBytesPerRowOfPlane(surface, plane) : IOSurfaceGetBytesPerRow(surface);
+	size_t bpe = planes ? IOSurfaceGetBytesPerElementOfPlane(surface, plane) : IOSurfaceGetBytesPerElement(surface);
+	if (bpe == 0 || stride % bpe != 0 || (planes == 0 && plane != 0) || (planes != 0 && plane >= planes)) {
+		return false;
+	}
+	if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != 0) {
+		return false;
+	}
+	const void *base = planes ? IOSurfaceGetBaseAddressOfPlane(surface, plane) : IOSurfaceGetBaseAddress(surface);
+	struct _glapi_table *d = GET_DISPATCH();
+	while (CALL_GetError(d, ()) != GL_NO_ERROR) {
+	}
+	GLint row = 0, align = 4;
+	CALL_GetIntegerv(d, (GL_UNPACK_ROW_LENGTH, &row));
+	CALL_GetIntegerv(d, (GL_UNPACK_ALIGNMENT, &align));
+	CALL_PixelStorei(d, (GL_UNPACK_ROW_LENGTH, (GLint)(stride / bpe)));
+	CALL_PixelStorei(d, (GL_UNPACK_ALIGNMENT, 1));
+	if (format == E_BGRA && (internal == E_RGBA || internal == E_RGBA8)) {
+		internal = E_BGRA;
+	}
+	if (format == E_BGRA && type == E_UINT_8888_REV) {
+		type = E_UNSIGNED_BYTE;
+	}
+	if (type == E_HALF_FLOAT_OES) {
+		type = E_HALF_FLOAT;
+	}
+	CALL_TexImage2D(d, (target, 0, (GLint)internal, width, height, 0, format, type, base));
+	*error = CALL_GetError(d, ());
+	CALL_PixelStorei(d, (GL_UNPACK_ROW_LENGTH, row));
+	CALL_PixelStorei(d, (GL_UNPACK_ALIGNMENT, align));
+	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+	return *error == GL_NO_ERROR;
+}
+
 static BOOL
 eagl_teximage(id self, SEL cmd, IOSurfaceRef surface, uint32_t target, uint32_t internal, int32_t width,
     int32_t height, uint32_t format, uint32_t type, uint32_t plane, BOOL invert)
@@ -802,6 +849,15 @@ eagl_teximage(id self, SEL cmd, IOSurfaceRef surface, uint32_t target, uint32_t 
 			img = image_get(surface, plane, pf, (unsigned)width, (unsigned)height, why, sizeof(why));
 		}
 		ok = img != NULL && bind_image(target, img, &error);
+		if (img == NULL && pf != PIPE_FORMAT_NONE) {
+			ok = upload_copy(surface, plane, target, internal, width, height, format, type, &error);
+			copies++;
+			if (ok && copies > 4) {
+				return ok;      /* logged the first few times only */
+			}
+			size_t used = strlen(why);
+			snprintf(why + used, sizeof(why) - used, "; copied instead: %s", ok ? "ok" : "FAILED");
+		}
 	}
 	if (!ok) {
 		import_failures++;

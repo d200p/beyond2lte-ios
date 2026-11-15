@@ -189,6 +189,21 @@ its size. Mesa is now built with `-mstrict-align`, and `b2l_memset.c` also
 gives libb2l-mesa memcpy/memmove that only make aligned accesses on both
 sides.
 
+Boot 49 (build 48): the first boot whose whole UI was composed on the Mali.
+backboardd stayed up for minutes (over 140,000 GL calls, about 10 swaps a
+second, glFinish 10 to 20 ms a frame, no GL error but one, every logged job
+done, no MMU fault). Defects (photos in the boot's log folder): some quads
+lost a triangle or had one stretched to a wrong point, flickering from frame
+to frame; two small layer surfaces with 32-byte rows were refused (the Mali
+samples in place only rows of 64-byte multiples); later backboardd died in
+`CA::OGL::Context::end_rendering` (not yet understood). The triangles look
+like boots 41-43's IDVS failure, intermittent now: the tiler using positions
+not yet visible from the vertex job it depends on. Panfrost sets the job
+barrier only on jobs with memory side effects; `patch_pan_jm_barrier.py` now
+sets it on every tiler job (`B2L_NO_TILER_BARRIER=1` undoes it). Surfaces the
+Mali cannot sample in place are now copied into the texture with
+glTexImage2D.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
