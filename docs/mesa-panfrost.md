@@ -215,6 +215,15 @@ stale link before `track_surface`. Test for boot 51: `b2l-gpu.c` sets
 `PAN_MESA_DEBUG=noafbc,nocrc` (no AFBC, no transaction elimination) before
 the Mesa screen is made (`B2L_GLES_PAN_DEBUG` at build time).
 
+Boot 51 (build 50): no change with AFBC and CRC off, so neither is behind the
+triangles. backboardd later died after a display off/on: a store into pool
+memory from `pan_preload_fb_part` (reached from a batch flushed inside a draw)
+hit an unmapped page, the allocation having started 160 bytes before the end
+of a mapped page; not understood yet. Boot 52 tests 16-bit arithmetic
+(`PAN_MESA_DEBUG=nofp16`: Panfrost runs mediump in fp16, which over a
+1179 x 2556 screen could throw single vertices far off), and the EAGL layer
+logs Core Animation's first shaders, vertex array setups and indexed draws.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer

@@ -73,7 +73,7 @@ struct pipe_frontend_screen *b2l_fscreen(void);
 #define E_CURRENT_PROGRAM       0x8B8D
 #define E_PROGRAM_OBJECT_ARB    0x8B40
 
-#define LOG_LINES       1500    /* "eagl:" lines per process, summaries aside */
+#define LOG_LINES       2500    /* "eagl:" lines per process, summaries aside */
 #define ERROR_WINDOW    4000    /* GL errors checked after each of the first calls */
 #define IMAGES          48      /* imported IOSurfaces kept */
 #define IMAGE_MAGIC     0xb2e61a6eu
@@ -238,10 +238,113 @@ b2l_gli_leave(unsigned index)
 static int idx_get_string, idx_tex_image2D, idx_tex_sub_image2D, idx_finish_object, idx_delete_object,
     idx_create_shader_object, idx_create_program_object, idx_attach_object, idx_detach_object,
     idx_get_object_parameteriv, idx_get_object_parameterfv, idx_get_info_log, idx_get_attached_objects,
-    idx_get_handle, idx_insert_marker, idx_push_marker, idx_pop_marker;
+    idx_get_handle, idx_insert_marker, idx_push_marker, idx_pop_marker, idx_shader_source, idx_attrib_pointer,
+    idx_draw_elements;
 
 #define HANDLE(h) ((GLuint)(uintptr_t)(h))
 #define TO_HANDLE(n) ((void *)(uintptr_t)(n))
+
+/*
+ * Boots 49-51, quads losing or stretching a triangle in different frames: the
+ * first shaders Core Animation compiles (precision of its position math), the
+ * first vertex array setups and the first indexed draws (with the index range
+ * read on the CPU) go to the log, so the next step rests on what it draws.
+ */
+#define SHADERS_LOGGED  10
+#define SHADER_LINES    40
+#define ATTRIBS_LOGGED  48
+#define DRAWS_LOGGED    32
+
+static void
+note_text(const char *what, unsigned id, const char *text, size_t length)
+{
+	char chunk[184];
+	unsigned lines_done = 0;
+	for (size_t at = 0; at < length && lines_done < SHADER_LINES; lines_done++) {
+		size_t n = 0;
+		while (n < sizeof(chunk) - 1 && at < length) {
+			char ch = text[at++];
+			chunk[n++] = ch == '\n' ? '|' : (ch == '\t' ? ' ' : ch);
+		}
+		chunk[n] = '\0';
+		note("%s %u.%u: %s", what, id, lines_done, chunk);
+	}
+}
+
+static void
+gli_shader_source(void *c, void *shader, int32_t count, const void *strings, const void *lengths)
+{
+	static unsigned logged;
+	if (!begin(c, (unsigned)idx_shader_source, HANDLE(shader))) {
+		return;
+	}
+	struct _glapi_table *d = GET_DISPATCH();
+	CALL_ShaderSource(d, (HANDLE(shader), count, (const GLchar *const *)strings, (const GLint *)lengths));
+	b2l_gli_leave((unsigned)idx_shader_source);
+	if (logged < SHADERS_LOGGED && strings != NULL && count > 0) {
+		GLint kind = 0;
+		CALL_GetShaderiv(d, (HANDLE(shader), GL_SHADER_TYPE, &kind));
+		unsigned id = logged++;
+		note("shader %u: %s, name %u, %d strings", id, kind == GL_VERTEX_SHADER ? "vertex" : "fragment",
+		    HANDLE(shader), count);
+		for (int32_t i = 0; i < count; i++) {
+			const char *s = ((const char *const *)strings)[i];
+			GLint len = lengths != NULL ? ((const GLint *)lengths)[i] : -1;
+			if (s != NULL) {
+				note_text("src", id, s, len >= 0 ? (size_t)len : strlen(s));
+			}
+		}
+	}
+}
+
+static void
+gli_attrib_pointer(void *c, uint32_t index, int32_t size, uint32_t type, uint8_t normalized, int32_t stride,
+    const void *pointer)
+{
+	static unsigned logged;
+	if (!begin(c, (unsigned)idx_attrib_pointer, index)) {
+		return;
+	}
+	struct _glapi_table *d = GET_DISPATCH();
+	if (logged < ATTRIBS_LOGGED) {
+		GLint array_buffer = 0;
+		CALL_GetIntegerv(d, (GL_ARRAY_BUFFER_BINDING, &array_buffer));
+		note("attrib %u: index %u size %d type 0x%x normalized %u stride %d pointer %p (array buffer %d)",
+		    logged++, index, size, type, (unsigned)normalized, stride, pointer, array_buffer);
+	}
+	CALL_VertexAttribPointer(d, (index, size, type, normalized, stride, pointer));
+	b2l_gli_leave((unsigned)idx_attrib_pointer);
+}
+
+static void
+gli_draw_elements(void *c, uint32_t mode, int32_t count, uint32_t type, const void *indices)
+{
+	static unsigned logged;
+	if (!begin(c, (unsigned)idx_draw_elements, mode)) {
+		return;
+	}
+	struct _glapi_table *d = GET_DISPATCH();
+	if (logged < DRAWS_LOGGED) {
+		GLint element_buffer = 0, program = 0;
+		CALL_GetIntegerv(d, (GL_ELEMENT_ARRAY_BUFFER_BINDING, &element_buffer));
+		CALL_GetIntegerv(d, (GL_CURRENT_PROGRAM, &program));
+		unsigned lo = ~0u, hi = 0;
+		char first[64] = "";
+		if (element_buffer == 0 && indices != NULL && count > 0 && type == GL_UNSIGNED_SHORT) {
+			const uint16_t *ix = indices;
+			for (int32_t i = 0; i < count; i++) {
+				lo = ix[i] < lo ? ix[i] : lo;
+				hi = ix[i] > hi ? ix[i] : hi;
+			}
+			snprintf(first, sizeof(first), "%u,%u,%u,%u,%u,%u", ix[0], count > 1 ? ix[1] : 0,
+			    count > 2 ? ix[2] : 0, count > 3 ? ix[3] : 0, count > 4 ? ix[4] : 0, count > 5 ? ix[5] : 0);
+		}
+		note("draw %u: mode 0x%x count %d type 0x%x indices %p (element buffer %d) program %d range %u..%u first %s",
+		    logged++, mode, count, type, indices, element_buffer, program, lo, hi, first);
+	}
+	CALL_DrawElements(d, (mode, count, type, indices));
+	b2l_gli_leave((unsigned)idx_draw_elements);
+}
 
 static const void *
 gli_get_string(void *c, uint32_t name)
@@ -527,7 +630,10 @@ gli_fill(struct b2l_eagl *e)
 	gli_own(e, "insert_event_marker_EXT", (void *)gli_marker, &idx_insert_marker);
 	gli_own(e, "push_group_marker_EXT", (void *)gli_push_marker, &idx_push_marker);
 	gli_own(e, "pop_group_marker_EXT", (void *)gli_pop_marker, &idx_pop_marker);
-	note("GLI table: %u entries, %u with a Mesa function, 17 our own", (unsigned)B2L_GLI_COUNT, mapped);
+	gli_own(e, "shader_source_ARB", (void *)gli_shader_source, &idx_shader_source);
+	gli_own(e, "vertex_attrib_pointer_ARB", (void *)gli_attrib_pointer, &idx_attrib_pointer);
+	gli_own(e, "draw_elements", (void *)gli_draw_elements, &idx_draw_elements);
+	note("GLI table: %u entries, %u with a Mesa function, 20 our own", (unsigned)B2L_GLI_COUNT, mapped);
 }
 
 /* ---- IOSurfaces as EGL images ---- */
