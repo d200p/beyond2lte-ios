@@ -177,6 +177,18 @@ libb2l-mesa a memset/bzero with plain stores only, and `b2l-gpu.c` hooks
 `IOMFBDisplay::fb_swap_set_layer` so that Mesa finishes the frame
 (`b2l_eagl_flush`, glFinish) before a display buffer goes to the framebuffer.
 
+Boot 48 (build 47): the Apple logo appeared, drawn by the Mali (four swaps,
+glFinish 0 to 10 ms each), then backboardd died again, this time inside
+Panfrost: `render_solid_background` -> `fill_rect` -> `GLContext::draw_elements`
+-> `_mesa_DrawElementsBaseVertex` -> `panfrost_draw_vbo` ->
+`panfrost_update_shader_state`, on `stur xzr, [x0, #0x14]`, a 64-bit store at a
+4-byte boundary into a descriptor in a buffer object (two 32-bit words the
+compiler merged). With the DC ZVA fault before, this says the CPU mappings of
+buffer objects act as device memory, where every access must be aligned to
+its size. Mesa is now built with `-mstrict-align`, and `b2l_memset.c` also
+gives libb2l-mesa memcpy/memmove that only make aligned accesses on both
+sides.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer

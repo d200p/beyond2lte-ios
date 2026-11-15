@@ -20,7 +20,12 @@ ar=$(xcrun --sdk iphoneos -f ar)
 strip=$(xcrun --sdk iphoneos -f strip)
 mkdir -p "$build"
 cross="$build/ios-arm64e.txt"
-flags="'-target', 'arm64e-apple-ios26.0', '-isysroot', '$sdk', '-fno-ptrauth-returns', '-fno-ptrauth-calls', '-fno-ptrauth-intrinsics', '-I$repo/scripts/mesa/include'"
+# -mstrict-align: B2LMali maps buffer objects as device memory on the CPU side,
+# where every access must be aligned to its size. Boot 48 died on a 64-bit
+# store at a 4-byte boundary in panfrost_update_shader_state (two 32-bit
+# descriptor words merged by the compiler); the flag keeps every access the
+# compiler emits naturally aligned. memcpy/memset come from b2l_memset.c.
+flags="'-target', 'arm64e-apple-ios26.0', '-isysroot', '$sdk', '-fno-ptrauth-returns', '-fno-ptrauth-calls', '-fno-ptrauth-intrinsics', '-mstrict-align', '-I$repo/scripts/mesa/include'"
 cat > "$cross" <<EOF
 [binaries]
 c = '$cc'
