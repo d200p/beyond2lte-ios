@@ -348,6 +348,10 @@ OSDefineMetaClassAndStructors(B2LHIDButtons, IOHIDEventService);
  * absolute digitizers.
  */
 #define B2L_TOUCH_FINGERS 10
+/* A touch beginning this close to an edge comes "from the edge" (0..4095:
+ * about 2.7 %, 69 pixels of the height, 32 of the width). Boot 58's swipes
+ * up from the bottom began 17-93 units from it. */
+#define B2L_TOUCH_EDGE    110
 class B2LHIDTouch : public IOHIDEventService {
 	OSDeclareDefaultStructors(B2LHIDTouch);
 public:
@@ -360,6 +364,7 @@ protected:
 private:
 	IOLock *fLock;
 	bool fDown[B2L_TOUCH_FINGERS];
+	bool fEdge[B2L_TOUCH_FINGERS];          /* the touch began at a screen edge */
 	IOFixed fX[B2L_TOUCH_FINGERS];
 	IOFixed fY[B2L_TOUCH_FINGERS];
 };
@@ -449,6 +454,23 @@ B2LHIDTouch::touch(int finger, bool down, int x, int y)
 		IOLockUnlock(fLock);
 		return;
 	}
+	/*
+	 * The home and app switcher gestures (swipe up from the bottom, and pause)
+	 * never worked, while Control Center's pull did. UIKit gives each touch
+	 * an edge type from its HID event mask (_UIEventHIDTouchEdgeTypeForHIDEvent:
+	 * FromEdgeTip 1, FromCorner 2, SwipePending 3, SwipeLocked 4, else 0), and
+	 * the screen-edge gesture features fail a touch whose first sample has
+	 * type 0 and recognize one with type 1 (_UISEEdgeTypeFail/Recognize
+	 * GestureFeature). An iPhone's touch firmware marks a touch that comes in
+	 * from an edge; ours did not, so every bottom swipe failed. A touch that
+	 * begins within B2L_TOUCH_EDGE of an edge (0..4095 display coordinates)
+	 * now carries FromEdgeTip in all its events; UIKit still applies its own
+	 * edge regions by position.
+	 */
+	if (down && !was) {
+		fEdge[finger] = x < B2L_TOUCH_EDGE || x > 4095 - B2L_TOUCH_EDGE || y < B2L_TOUCH_EDGE ||
+		    y > 4095 - B2L_TOUCH_EDGE;
+	}
 
 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
 	if (!collection) {
@@ -482,6 +504,9 @@ B2LHIDTouch::touch(int finger, bool down, int x, int y)
 				mask |= kIOHIDDigitizerEventIdentity;
 			}
 		}
+		if (fEdge[i]) {
+			mask |= kIOHIDDigitizerEventFromEdgeTip;
+		}
 		child->setIntegerValue(kIOHIDEventFieldDigitizerIndex, i);
 		child->setIntegerValue(kIOHIDEventFieldDigitizerIdentity, i + 2);
 		child->setIntegerValue(kIOHIDEventFieldDigitizerTouch, d);
@@ -491,10 +516,13 @@ B2LHIDTouch::touch(int finger, bool down, int x, int y)
 		cmask |= mask;
 		any |= d;
 	}
+	bool edge = fEdge[finger];
 	fDown[finger] = down;
 	if (down) {
 		fX[finger] = nx;
 		fY[finger] = ny;
+	} else {
+		fEdge[finger] = false;
 	}
 	collection->setFixedValue(kIOHIDEventFieldDigitizerX, nx);
 	collection->setFixedValue(kIOHIDEventFieldDigitizerY, ny);
@@ -506,7 +534,8 @@ B2LHIDTouch::touch(int finger, bool down, int x, int y)
 
 	if (was != down) {
 		uint64_t ns=0;absolutetime_to_nanoseconds(now,&ns);
-		IOLog("B2L HID: touch %d %s at %d,%d t_us=%llu\n", finger, down ? "down" : "up", x, y, ns/1000);
+		IOLog("B2L HID: touch %d %s at %d,%d%s t_us=%llu\n", finger, down ? "down" : "up", x, y,
+		    edge ? " from edge" : "", ns/1000);
 	}
 	dispatchEvent(collection);
 	uint64_t dispatchNS=0;
