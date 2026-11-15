@@ -172,11 +172,25 @@ b2l_mali_clear_job(void *page, uint64_t page_va, uint64_t rt_va, uint32_t width,
 	}
 }
 
-/* GPU page table: `capacity` contiguous 4 KiB tables, the first is the root. */
+/*
+ * GPU page table: `capacity` contiguous 4 KiB tables, the first is the root.
+ *
+ * Pages are inner shareable (SH = 3, bits 9:8), as Linux maps every Panfrost
+ * buffer (io-pgtable sets SH_IS; with memory attribute 0x88, whose
+ * shareability field is SH_MIDGARD_INNER, that is the Mali's internal
+ * shareable domain, kept coherent through the L2). They were non-shareable
+ * until boot 54, whose EAGL self-test drew the same quads three times in a
+ * row: the first run of each new way of drawing came out empty and the next
+ * two right, with the jobs at the same addresses. The tiler had read what the
+ * previous run left at the vertex shader's output addresses, not what the
+ * shader had just written, as boot 43 saw within IDVS jobs: non-shareable
+ * write-back data written by the shader cores was not coherent with the
+ * tiler's reads within one job chain (the chain's end flush wrote it back).
+ */
 #define B2L_MALI_PT_ENTRIES        512u
 #define B2L_MALI_PT_TABLE          3ull
 #define B2L_MALI_PT_PAGE \
-	(3ull | (1ull << 6) | (1ull << 10) | (1ull << 54)) /* RW, AF, no execute */
+	(3ull | (1ull << 6) | (3ull << 8) | (1ull << 10) | (1ull << 54)) /* RW, inner shareable, AF, no execute */
 #define B2L_MALI_PT_EXECUTE        (1ull << 54)       /* clear this for shaders */
 #define B2L_MALI_PT_ADDRESS        0x0000fffffffff000ull
 

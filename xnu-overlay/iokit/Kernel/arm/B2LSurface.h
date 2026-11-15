@@ -44,6 +44,7 @@ public:
 	OSDictionary             *properties;   /* protected by the surface lock */
 	OSSerialize              *serializedProperties; /* immutable readback snapshot */
 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
+	volatile UInt32           gpuWritten;   /* the GPU may have written it since a CPU reader last looked */
 
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;
@@ -57,6 +58,14 @@ B2LSurface *b2l_surface_copy(uint32_t id);
 
 /* Modification seed: changes each time a client unlocks after writing. */
 uint32_t b2l_surface_current_seed(B2LSurface *s);
+
+/*
+ * The GPU driver marks a surface it may have written (after a job); whoever
+ * then reads it with the CPU (a client's lock, the framebuffer's CPU copies)
+ * calls b2l_surface_cpu_access first, which drops its stale CPU lines once.
+ */
+void b2l_surface_gpu_wrote(B2LSurface *s);
+void b2l_surface_cpu_access(B2LSurface *s);
 
 /*
  * Publish physical memory (the panel framebuffer) as a surface. Returns a

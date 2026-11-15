@@ -26,8 +26,10 @@
  * Selectors 5, 9, 10 and 27 implement matrix, nonbulk property and bulk
  * attachment updates/readback. Selector 20 (SetPurgeable) records the
  * requested state and reports the previous one; wired surfaces are never
- * reclaimed (b2l_surface_purgeable.h). Unsupported notification, accelerator and
- * shared-event selectors return kIOReturnUnsupported (logged once).
+ * reclaimed (b2l_surface_purgeable.h). Selector 54 (SetCoreVideoBridgedKeys)
+ * is accepted. Multi-plane surfaces are created, with their planes in the
+ * lock result. Unsupported notification, accelerator and shared-event
+ * selectors return kIOReturnUnsupported (logged once).
  */
 #include "B2LSurface.h"
 #include "b2l_surface_purgeable.h"
@@ -61,6 +63,7 @@ enum {
 	kB2LSurfaceLimits             = 13,
 	kB2LSurfaceLookupFromPort     = 34,
 	kB2LSurfaceCreatePort         = 35,
+	kB2LSurfaceSetCVBridgedKeys   = 54,     /* kIOSurfaceMethodSetCoreVideoBridgedKeys */
 };
 
 enum {
@@ -204,6 +207,31 @@ uint32_t
 b2l_surface_current_seed(B2LSurface *s)
 {
 	return *b2l_surface_seed(s);
+}
+
+extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
+
+/*
+ * Boot 57: the GPU driver cleaned every imported surface whole after every
+ * job: 1.3 s of every 500 jobs against 70-130 ms of GPU work (24 MB a job,
+ * the two display buffers). Now it only marks them, and a CPU reader drops
+ * the stale lines before it reads (clean + invalidate, once per GPU write).
+ */
+void
+b2l_surface_gpu_wrote(B2LSurface *s)
+{
+	s->gpuWritten = 1;
+}
+
+void
+b2l_surface_cpu_access(B2LSurface *s)
+{
+	if (s != NULL && OSCompareAndSwap(1, 0, &s->gpuWritten)) {
+		uintptr_t address = s->kernelAddress();
+		if (address != 0) {
+			flush_dcache64((addr64_t)address + s->offset, s->bytesPerRow * s->height, FALSE);
+		}
+	}
 }
 
 /* The table lock; the framebuffer may publish a surface before the root starts. */
@@ -588,7 +616,18 @@ put64(uint8_t *p, uint32_t off, uint64_t v)
 	memcpy(p + off, &v, 8);
 }
 
-/* IOSurface.framework's lock result (copied to IOSurfaceClient + 0x70). */
+/*
+ * IOSurface.framework's lock result (copied to IOSurfaceClient + 0x70).
+ *
+ * Planes (boot 58: chronod's 'xf20' surfaces, YUV 4:2:0 10-bit in two
+ * planes, were refused, and the clock and calendar icons never drew, in
+ * software mode too): the plane count at +0x58, then one 0x98-byte record a
+ * plane from +0x88, as iOS 26's IOSurfaceGet*OfPlane read them (client +
+ * 0xc8 and client + 0xf8 + plane * 0x98): +0x00 width, +0x08 height, +0x18
+ * offset of the plane in the pixels, +0x20 bytes per row, +0x28 size (u64);
+ * +0x30 bytes per element (u16), +0x32 element width, +0x33 element height.
+ * The other fields describe compression and tiling and stay 0 (linear).
+ */
 static void
 b2l_surface_fill_result(B2LSurface *s, B2LSurfaceRef *ref, uint8_t *out)
 {
@@ -600,10 +639,21 @@ b2l_surface_fill_result(B2LSurface *s, B2LSurfaceRef *ref, uint8_t *out)
     put64(out,0x20,s->allocSize);put64(out,0x28,s->width);
     put64(out,0x30,s->height);put64(out,0x38,s->bytesPerRow);
     put64(out,0x40,s->offset);put32(out,0x48,s->pixelFormat);
-    put64(out,0x50,s->allocSize);put32(out,0x58,0); /* single-plane only */
+    put64(out,0x50,s->allocSize);put32(out,0x58,s->planeCount);
     memcpy(out+0x60,&s->bytesPerElement,2);out[0x62]=s->elementWidth;out[0x63]=s->elementHeight;
     put32(out,0x64,s->cacheMode);put32(out,0x70,s->parentID);
-
+    for (uint32_t i = 0; i < s->planeCount && i < B2L_SURFACE_MAX_PLANES; i++) {
+        const struct b2l_surface_plane *p = &s->planes[i];
+        uint32_t at = 0x88 + i * 0x98;
+        put64(out, at + 0x00, p->width);
+        put64(out, at + 0x08, p->height);
+        put64(out, at + 0x18, p->offset);
+        put64(out, at + 0x20, p->bytesPerRow);
+        put64(out, at + 0x28, p->size);
+        memcpy(out + at + 0x30, &p->bytesPerElement, 2);
+        out[at + 0x32] = p->elementWidth;
+        out[at + 0x33] = p->elementHeight;
+    }
 }
 
 static IOReturn
@@ -693,8 +743,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		return kIOReturnNoMemory;
 	}
 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
-	ret = b2l_surface_layout(s, props);
-    if(ret==kIOReturnSuccess && s->planeCount) ret=kIOReturnUnsupported;
+	ret = b2l_surface_layout(s, props);  /* planes too: their records are in the lock result */
 	if (ret == kIOReturnSuccess) {
 		IOBufferMemoryDescriptor *mem = NULL;
 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&b2l_surface_wired) +
@@ -792,6 +841,23 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		return metadata(selector, args);
 	case kB2LSurfaceCreate:
 		return create(args);
+	case kB2LSurfaceSetCVBridgedKeys:
+		/*
+		 * Boot 58: chronod called selector 54 and got kIOReturnUnsupported.
+		 * IOSurface.framework sends it once a process: a 12-byte header and
+		 * serialized data naming the CoreVideo attachment keys the kernel
+		 * should carry as surface values ("kIOSurfaceMethodSetCoreVideoBridgedKeys
+		 * failed" is all it does on error). Attachments here are kept as
+		 * values already (selectors 9, 10, 27), so the list is accepted.
+		 */
+		if (args->scalarInputCount != 0 ||
+		    (args->structureInputDescriptor == NULL && args->structureInputSize == 0) ||
+		    (args->structureInputDescriptor != NULL ? args->structureInputDescriptor->getLength() :
+		    args->structureInputSize) > B2L_SURFACE_MAX_PROPS) {
+			return kIOReturnBadArgument;
+		}
+		b2l_surf_log_once("sel", selector);
+		return kIOReturnSuccess;
 	case kB2LSurfaceLookup: {
 		B2LSurface *s = b2l_surface_copy((uint32_t)arg0);
 		IOReturn ret = kIOReturnNotFound;
@@ -1124,6 +1190,7 @@ IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOu
 	if (s == NULL) {
 		return kIOReturnNotFound;
 	}
+	b2l_surface_cpu_access(s);      /* the client reads what the GPU wrote */
 	IOReturn ret = b2l_surface_seed_out(s, seedOut, false);
 	s->release();
 	return ret;

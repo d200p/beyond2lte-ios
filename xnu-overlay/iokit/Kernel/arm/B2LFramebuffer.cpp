@@ -1249,6 +1249,7 @@ AppleCLCD::stripeScan(const char *when, bool locked)
 	uint32_t sw = 0, sh = 0, sbpr = 0;
 	if (current && b2l_surface_current_seed(src) == seed && src->kernelAddress() != 0 &&
 	    src->width == fWidth && src->height == fHeight && src->bytesPerElement == 4 && src->bytesPerRow >= fWidth * 4) {
+		b2l_surface_cpu_access(src);    /* read with the CPU below: drop lines the GPU made stale */
 		sp = (const uint8_t *)src->kernelAddress() + src->offset;
 		sw = src->width;
 		sh = src->height;
@@ -1480,6 +1481,7 @@ AppleCLCD::copyScaled(B2LSurface *s, const Layer *l, bool shadowValid, uint64_t 
 	    s->pixelFormat != B2L_FB_FORMAT_BGRA || fShadow == NULL) {
 		return 0;
 	}
+	b2l_surface_cpu_access(s);      /* copied with the CPU: drop lines the GPU made stale */
 	int32_t w = l->w, h = l->h;
 	if (w <= 0 || h <= 0) { w = (int32_t)s->width; h = (int32_t)s->height; }
 	const uint64_t shadowBytes = (uint64_t)fShadowStride * fHeight;
@@ -1643,6 +1645,7 @@ AppleCLCD::runCopy(void)
 			uintptr_t src = s->kernelAddress();
 			if (fShadow != NULL && src && s->memory && s->bytesPerElement == 4 && s->elementWidth == 1 &&
 			    s->elementHeight == 1 && s->pixelFormat == B2L_FB_FORMAT_BGRA) {
+				b2l_surface_cpu_access(s);      /* copied with the CPU */
 				int32_t w = l->w, h = l->h;
 				if (w <= 0 || h <= 0) { w = (int32_t)s->width; h = (int32_t)s->height; }
 				struct b2l_blit_rect r;
@@ -1774,6 +1777,7 @@ AppleCLCD::runCopy(void)
 		uintptr_t src = s->kernelAddress();
 		if (src && s->memory && s->bytesPerElement == 4 && s->elementWidth == 1 && s->elementHeight == 1 &&
 		    s->pixelFormat == B2L_FB_FORMAT_BGRA) {
+			b2l_surface_cpu_access(s);      /* copied with the CPU */
 			int32_t w = l->w, h = l->h;
 			if (w <= 0 || h <= 0) { w = (int32_t)s->width; h = (int32_t)s->height; }
 			struct b2l_blit_rect r;

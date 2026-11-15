@@ -132,7 +132,10 @@ extern "C" pmap_t get_task_pmap(task_t task);
 #define B2L_RT_SLOTS           128
 #define B2L_RT_MAPPED_LIMIT    (256ull << 20)
 #define B2L_RT_JOB_TIMEOUT_US  1000000
-#define B2L_RT_IDLE_MS         50
+/* Boot 57: Core Animation's frames came 100-300 ms apart while in use, so with
+ * 50 ms the cores went off and on (power-up and whole TLB flush) nearly every
+ * frame; 500 ms keeps them on while the phone is in use. */
+#define B2L_RT_IDLE_MS         500
 #define B2L_MALI_VA_LOG2       48              /* the whole GPU address space, for a full TLB flush */
 #define B2L_MALI_LOCK_MIN_LOG2 15              /* the smallest region AS LOCK takes */
 #define B2L_RT_BO_VA           0xa0000000ull   /* buffer objects: after the draw client's buffers, */
@@ -179,10 +182,13 @@ struct b2l_mali_slot {
 
 /* S10 port: a Mesa buffer object (type 1 clients); handle = index + 1. */
 struct b2l_mali_bo {
-	IOBufferMemoryDescriptor *memory;       /* NULL while the handle is free */
+	IOMemoryDescriptor *memory;             /* NULL while the handle is free */
 	void *owner;                            /* the B2LMaliUserClient */
 	uint64_t va, bytes, resident;           /* VA range; memory behind its start */
 	uint32_t flags;
+	B2LSurface *surface;                    /* an imported IOSurface (kB2LMaliBoImport) */
+	uint32_t cleanedSeed;                   /* the surface's seed at its last clean */
+	bool cleaned;                           /* cleaned since the import */
 };
 
 class B2LMali : public IOService {
@@ -275,6 +281,7 @@ private:
 	struct b2l_mali_bo *bos;
 	uint64_t *boPages;              /* one bit per 4 KiB page of the BO range */
 	uint64_t boBytes, boJobs, boFaults;
+	uint64_t boRunNS, boCleanBeforeNS, boCleanAfterNS, boCleanBytes, boCleanSkips, powerUps, powerUpNS;
 	unsigned clients;
 	bool drawOpen;
 	void readProps();
@@ -287,7 +294,10 @@ private:
 	IOReturn boCreate(void *owner, uint64_t bytes, uint64_t flags, uint64_t *handle, uint64_t *va);
 	IOReturn boFree(void *owner, uint64_t handle);
 	void boFreeAll(void *owner);
-	IOBufferMemoryDescriptor *boMemory(void *owner, uint32_t handle);
+	IOMemoryDescriptor *boMemory(void *owner, uint32_t handle);
+	IOReturn boImport(void *owner, uint32_t id, uint64_t *out);
+	void boSurfacesClean(bool before);
+	unsigned boSurfaces;            /* imported surfaces alive */
 	IOReturn jobSubmit(uint64_t jc, uint64_t requirements, uint64_t *out);
 	IOReturn clientBegin(bool draw);
 	void clientEnd(bool draw, void *owner);
@@ -1219,10 +1229,11 @@ B2LMali::coresUp()
 	if (coresOn) {
 		return true;
 	}
+	uint64_t powerStart = nowNS();
 	/*
 	 * S10: drop every GPU TLB entry after the address space is set again.
 	 * evictSlot only flushes while the cores are on, but the cores go off
-	 * after B2L_RT_IDLE_MS (50 ms) without a job, so most evictions happened
+	 * after B2L_RT_IDLE_MS (then 50 ms) without a job, so most evictions happened
 	 * with them off; AS UPDATE does not drop TLB entries, and a new client
 	 * brings new tables. A stale entry sends a render target or texture to
 	 * pages that are no longer it: thin wrong lines along live GPU draws, of
@@ -1245,6 +1256,8 @@ B2LMali::coresUp()
 		b2l_diag_record("B2L ACPM: change took %llu ns\n", nowNS() - before);
 		measureClock();
 	}
+	powerUps++;
+	powerUpNS += nowNS() - powerStart;
 	return true;
 }
 
@@ -1286,9 +1299,11 @@ B2LMali::runtimeEnd()
 			bos[i].memory->complete();
 			OSSafeReleaseNULL(bos[i].memory);
 		}
+		OSSafeReleaseNULL(bos[i].surface);
 		bzero(&bos[i], sizeof(bos[i]));
 	}
 	boBytes = 0;
+	boSurfaces = 0;
 	if (coresOn) {
 		gpuClock(false);
 		b2l_mali_power_off(&io);
@@ -1762,9 +1777,15 @@ B2LMali::boDrop(struct b2l_mali_bo *bo)
 {
 	unmapRange(bo->va, bo->resident);
 	boRelease((bo->va - B2L_RT_BO_VA) >> 12, bo->bytes >> 12);
-	boBytes -= bo->resident;
+	if (bo->surface == NULL) {
+		boBytes -= bo->resident;        /* imports never counted (boImport) */
+	}
 	bo->memory->complete();
 	OSSafeReleaseNULL(bo->memory);
+	if (bo->surface != NULL) {
+		OSSafeReleaseNULL(bo->surface);
+		boSurfaces--;
+	}
 	bzero(bo, sizeof(*bo));
 }
 
@@ -1799,7 +1820,7 @@ B2LMali::boFreeAll(void *owner)
 	}
 }
 
-IOBufferMemoryDescriptor *
+IOMemoryDescriptor *
 B2LMali::boMemory(void *owner, uint32_t handle)
 {
 	if (bos == NULL || handle == 0 || handle > B2L_MALI_MAX_BOS) {
@@ -1811,6 +1832,138 @@ B2LMali::boMemory(void *owner, uint32_t handle)
 	}
 	bo->memory->retain();
 	return bo->memory;
+}
+
+/*
+ * S10 port: an IOSurface as a buffer object (Mesa's resource_from_handle,
+ * through libdrm's drmPrimeFDToHandle). Its pages are wired and mapped at a
+ * fresh GPU address like a buffer object's; the surface stays retained until
+ * the handle is freed. IOSurface memory is cacheable for the CPU, so every
+ * imported surface is cleaned before and invalidated after each job
+ * (boSurfacesClean). out: handle, GPU VA, bytes, bytes per row, width,
+ * height, pixel format, offset of the pixels.
+ */
+IOReturn
+B2LMali::boImport(void *owner, uint32_t id, uint64_t *out)
+{
+	if (bos == NULL) {
+		return kIOReturnNotReady;
+	}
+	B2LSurface *surface = b2l_surface_copy(id);
+	if (surface == NULL) {
+		return kIOReturnNotFound;
+	}
+	IOMemoryDescriptor *memory = surface->memory;
+	uint64_t bytes = round_page_64(surface->allocSize);
+	/*
+	 * Boot 58: with 50 surfaces imported (several whole-screen app snapshots,
+	 * 12 MB each) the next import was refused with kIOReturnNoMemory, as the
+	 * imports counted against B2L_RT_BO_LIMIT, the limit on the memory Mesa's
+	 * own buffer objects allocate. An import allocates nothing (it maps the
+	 * surface's pages), so only the GPU address range bounds it now.
+	 */
+	if (memory == NULL || bytes == 0 || bytes > memory->getLength() + PAGE_MASK) {
+		surface->release();
+		return memory == NULL || bytes == 0 ? kIOReturnBadArgument : kIOReturnNoMemory;
+	}
+	unsigned index = 0;
+	while (index < B2L_MALI_MAX_BOS && bos[index].memory != NULL) {
+		index++;
+	}
+	uint64_t first = 0;
+	if (index == B2L_MALI_MAX_BOS || !boReserve(bytes >> 12, false, &first)) {
+		surface->release();
+		return kIOReturnNoSpace;
+	}
+	uint64_t base = B2L_RT_BO_VA + (first << 12);
+	if (memory->prepare() != kIOReturnSuccess) {
+		boRelease(first, bytes >> 12);
+		surface->release();
+		return kIOReturnNoMemory;
+	}
+	if (!mapMemory(memory, base, (IOByteCount)bytes, false)) {
+		unmapRange(base, bytes);
+		boRelease(first, bytes >> 12);
+		memory->complete();
+		surface->release();
+		return kIOReturnNoSpace;
+	}
+	flushTables();
+	flushRange(base, bytes);
+	memory->retain();
+	struct b2l_mali_bo *bo = &bos[index];
+	bo->memory = memory;
+	bo->owner = owner;
+	bo->va = base;
+	bo->bytes = bytes;
+	bo->resident = bytes;
+	bo->flags = B2L_MALI_BO_NOEXEC;
+	bo->surface = surface;          /* keeps b2l_surface_copy's reference */
+	boSurfaces++;
+	out[0] = index + 1;
+	out[1] = base;
+	out[2] = bytes;
+	out[3] = surface->bytesPerRow;
+	out[4] = surface->width;
+	out[5] = surface->height;
+	out[6] = surface->pixelFormat;
+	out[7] = surface->offset;
+	static unsigned notes;
+	if (notes++ < 8) {
+		b2l_diag_record("B2L GPU BO: surface %u %ux%u bpr %u fmt 0x%x imported as handle %u at 0x%llx (%llu KiB)\n",
+		    id, surface->width, surface->height, surface->bytesPerRow, surface->pixelFormat, index + 1, base,
+		    bytes >> 10);
+	}
+	return kIOReturnSuccess;
+}
+
+/*
+ * Imported surfaces: CPU lines written back and dropped (clean + invalidate).
+ * Boot 56: every submission cleaned every imported surface whole, before and
+ * after the job (the two display buffers alone are 12 MB each), and the
+ * GPU's share of even a trivial frame stayed 25-70 ms. Before a job only
+ * surfaces the CPU may have written since their last clean (their seed
+ * moved: CPU writes go through IOSurface locks, which move it) can hold
+ * dirty lines, so only those are cleaned. Boot 57: the pass after the job
+ * (every surface whole, so CPU readers would see the GPU's writes) still
+ * took 1.3 s of every 500 jobs against 70-130 ms of GPU work; now it only
+ * marks the surfaces (b2l_surface_gpu_wrote) and a CPU reader drops the
+ * stale lines when it locks the surface (b2l_surface_cpu_access). Both
+ * passes are timed and logged every 500 jobs.
+ */
+void
+B2LMali::boSurfacesClean(bool before)
+{
+	uint64_t start = nowNS();
+	for (unsigned i = 0, seen = 0; boSurfaces != 0 && i < B2L_MALI_MAX_BOS && seen < boSurfaces; i++) {
+		B2LSurface *surface = bos[i].surface;
+		if (surface == NULL) {
+			continue;
+		}
+		seen++;
+		if (!before) {
+			b2l_surface_gpu_wrote(surface);
+			continue;
+		}
+		uint32_t seed = b2l_surface_current_seed(surface);
+		if (bos[i].cleaned && bos[i].cleanedSeed == seed) {
+			boCleanSkips++;
+			continue;
+		}
+		uintptr_t address = surface->kernelAddress();
+		if (address != 0) {
+			unsigned bytes = surface->bytesPerRow * surface->height;
+			flush_dcache64((addr64_t)address + surface->offset, bytes, FALSE);
+			boCleanBytes += bytes;
+		}
+		bos[i].cleaned = true;
+		bos[i].cleanedSeed = seed;
+	}
+	if (before) {
+		boCleanBeforeNS += nowNS() - start;
+	} else {
+		boCleanAfterNS += nowNS() - start;
+	}
 }
 
 /* One job chain, as DRM_IOCTL_PANFROST_SUBMIT, awaited here. */
@@ -1840,11 +1993,22 @@ B2LMali::jobSubmit(uint64_t jc, uint64_t requirements, uint64_t *out)
 	}
 	checkTemperature();
 	unsigned slot = (requirements & B2L_MALI_REQ_FS) ? B2L_MALI_SLOT_FRAGMENT : B2L_MALI_SLOT_TILER;
+	boSurfacesClean(true);          /* the CPU's writes reach memory */
 	uint64_t begin = nowNS();
 	uint32_t status = b2l_mali_run_job(&io, slot, jc, B2L_RT_JOB_TIMEOUT_US);
+	uint64_t ran = nowNS() - begin;
+	boSurfacesClean(false);         /* CPU readers will drop stale lines first */
 	out[0] = status;
-	out[1] = nowNS() - begin;
+	out[1] = ran;
+	boRunNS += ran;
 	boJobs++;
+	if (boJobs % 500 == 0) {
+		b2l_diag_record("B2L GPU BO: %llu jobs: last 500 ran %llu ms, surface cleaning %llu ms before + %llu ms after"
+		    " (%llu MB, %llu skipped unchanged), %u surfaces imported, %llu power-ups (%llu ms)\n", boJobs,
+		    boRunNS / 1000000, boCleanBeforeNS / 1000000, boCleanAfterNS / 1000000, boCleanBytes >> 20, boCleanSkips,
+		    boSurfaces, powerUps, powerUpNS / 1000000);
+		boRunNS = boCleanBeforeNS = boCleanAfterNS = boCleanBytes = boCleanSkips = powerUps = powerUpNS = 0;
+	}
 	if (status != B2L_MALI_STATUS_DONE) {
 		if (boFaults++ < 16) {
 			b2l_diag_record("B2L GPU BO: job 0x%llx slot %u status 0x%x js_status=0x%x\n", jc, slot, status,
@@ -2083,7 +2247,7 @@ B2LMaliUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMem
 		return kIOReturnBadArgument;
 	}
 	IOLockLock(owner->runtimeLock);
-	IOBufferMemoryDescriptor *buffer = bo ? owner->boMemory(this, type & 0xffffu) : owner->buffers[type];
+	IOMemoryDescriptor *buffer = bo ? owner->boMemory(this, type & 0xffffu) : owner->buffers[type];
 	if (buffer != NULL && !bo) {
 		buffer->retain();
 	}
@@ -2127,7 +2291,8 @@ B2LMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
 	/* Drawing selectors for the drawing client, buffer objects for the others. */
 	bool drawing = selector == kB2LMaliCreateBuffer || selector == kB2LMaliMapSurface ||
 	    selector == kB2LMaliMapRange || selector == kB2LMaliSubmit;
-	bool objects = selector == kB2LMaliBoCreate || selector == kB2LMaliBoFree || selector == kB2LMaliJobSubmit;
+	bool objects = selector == kB2LMaliBoCreate || selector == kB2LMaliBoFree || selector == kB2LMaliJobSubmit ||
+	    selector == kB2LMaliBoImport;
 	if ((drawing && !draw) || (objects && draw)) {
 		IOLockUnlock(owner->runtimeLock);
 		return kIOReturnUnsupported;
@@ -2184,6 +2349,13 @@ B2LMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
 		break;
 	case kB2LMaliBoFree:
 		ret = args->scalarInputCount == 1 ? owner->boFree(this, args->scalarInput[0]) : kIOReturnBadArgument;
+		break;
+	case kB2LMaliBoImport:
+		if (args->scalarInputCount == 1 && args->scalarOutputCount == 8) {
+			ret = owner->boImport(this, (uint32_t)args->scalarInput[0], args->scalarOutput);
+		} else {
+			ret = kIOReturnBadArgument;
+		}
 		break;
 	case kB2LMaliJobSubmit:
 		if (args->scalarInputCount == 2 && args->scalarOutputCount == 2) {
