@@ -96,6 +96,54 @@ probe draws a clear and the triangle into a 64 x 64 BGRA IOSurface through
 `resource_from_handle` and checks it through `IOSurfaceLock`. Next: the EAGL
 layer.
 
+Status 2026-11-15, the window server on GLES (piece 4, written, not yet run).
+The 23G90 window server has no OpenGL ES branch: `IOMFBDisplay::get_ctx`
+calls `new_metal_context` directly and, when that fails,
+`Server::render_update`/`render_surface` take `Server::sw_renderer()`, which
+makes a `CA::OGL::SWContext` (server+0xc0, the same allocation as
+`sw_new_context`) and a `CA::OGL::Renderer` around it (server+0xc8).
+`GLESContext`'s constructor is reached only from `gles_new_context` (config
+`{u32 type = 3; id eagl at +8}`, in the callbacks table at 0x1ee989640 with
+the software, null and Metal ones, which QuartzCore's own code never reads)
+and from `-[CARenderer _initWithEAGLContext:options:]`. So injecting Mesa
+and an EAGL layer is not enough on iOS 26, unlike ios-sailfish on iOS 16:
+`userspace/b2l-gpu.c` now replaces the four instructions that begin the
+SWContext allocation in `sw_renderer` with a jump to its own stub, which
+returns `gles_new_context({3, our EAGL object})` or, on any failure, the
+software context as before (`B2L_GLES=0` leaves `sw_renderer` alone). Only the
+first backboardd of a boot tries (`/private/var/tmp/b2l-gles.running`): one
+that dies leaves the next on the CPU.
+
+What `GLESContext` asks of the EAGL object (selectors sent from its methods):
+`API` (above 2 its ES 3 paths), `getMacroContextPrivate`,
+`attachImage:toCoreSurface:invertedRender:` (`make_buffer_current`: a 2D
+texture, nearest filtering, clamp, the display's IOSurface attached, then a
+framebuffer with it as `COLOR_ATTACHMENT0`) and
+`texImageIOSurface:target:internalFormat:width:height:format:type:plane:invert:`.
+It never sends `setCurrentContext:` (only `-[CARenderer render]` does): it
+passes the GLIContext as the first argument of every dispatch entry, so the
+EAGL layer makes its context current inside each entry. The constructor asks
+`get_string` for `GL_EXTENSIONS` and 0x8a1e and `get_integerv` for
+`MAX_TEXTURE_IMAGE_UNITS`, `MAX_TEXTURE_SIZE` and `MAX_VIEWPORT_DIMS`.
+
+`scripts/mesa/b2l-target/b2l_eagl.c`: `B2LEAGLContext`, an `NSObject`
+subclass made with the Objective-C runtime (missing selectors are logged by
+`+resolveInstanceMethod:`); an OpenGL ES 3.0 context with no window-system
+buffers; the GLI table of 975 entries, generated at build time by
+`gen-gli-dispatch.py` from the runner's macOS SDK `gliDispatch.h` (the
+layout QuartzCore uses; the header is never copied into the repository), each
+entry a thunk to the Mesa function of the same name (core name first, so
+`bind_framebuffer_EXT` is `glBindFramebuffer`). Entries of its own: the ARB
+shader-object calls (`create_shader_object_ARB` and the rest, which ES names
+differently; handles are pointers), `get_string`, `tex_image2D` (Apple's
+`GL_RGBA` internal format with `GL_BGRA` data becomes ES's `GL_BGRA`),
+`finish_object_APPLE` (glFinish), the debug markers. IOSurfaces are imported
+as in the probe (rows must be multiples of 64 bytes for the Mali), kept in a
+48-entry cache, and given to the bound texture with
+`glEGLImageTargetTexture2DOES` through the screen's `get_egl_image`. Every
+first use of an entry, the GL errors of the first 4000 calls, entries Mesa
+lacks, imports and a 5 s summary go to the kernel log as `eagl:` lines.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer

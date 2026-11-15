@@ -5,8 +5,8 @@
 # the same pointer-authentication choices as userspace/b2l-gpu.c, so that the
 # errors of each step show what the port needs. The product is
 # libb2l-mesa.dylib (scripts/mesa/b2l-target): Panfrost, the GL state tracker
-# and our frontend over the B2LMali libdrm (scripts/mesa/b2l-drm); no EAGL
-# layer yet.
+# and our frontend over the B2LMali libdrm (scripts/mesa/b2l-drm), with the
+# EAGL layer Core Animation's GLESContext uses (b2l-target/b2l_eagl.c).
 #
 # Usage: build-panfrost-ios.sh MESA_SOURCE_DIR BUILD_DIR
 set -euo pipefail
@@ -75,8 +75,23 @@ python3 "$repo/scripts/mesa/b2l-drm/patch_pan_shader_idvs.py" "$src/src/gallium/
 target="$src/src/gallium/targets/b2l"
 mkdir -p "$target"
 cp "$repo/scripts/mesa/b2l-target/meson.build" "$repo/scripts/mesa/b2l-target/b2l_mesa.c" \
+  "$repo/scripts/mesa/b2l-target/b2l_eagl.c" \
   "$repo/scripts/mesa/b2l-drm/b2l_drm.c" "$repo/scripts/mesa/b2l-drm/b2l_drm.h" \
   "$repo/xnu-overlay/iokit/Kernel/arm/b2l_mali_uapi.h" "$target/"
+# The EAGL layer's GLI dispatch table, from the build machine's macOS SDK
+# (Apple's header is read here, never copied into the repository or the
+# artifacts); the script stops if the layout is not the one 23G90 uses.
+gli_rel=System/Library/Frameworks/OpenGL.framework/Headers/gliDispatch.h
+gli_header="$(xcrun --sdk macosx --show-sdk-path)/$gli_rel"
+if [[ ! -f "$gli_header" ]]; then
+  for sdk_dir in /Applications/Xcode*.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX*.sdk \
+      /Library/Developer/CommandLineTools/SDKs/MacOSX*.sdk; do
+    if [[ -f "$sdk_dir/$gli_rel" ]]; then gli_header="$sdk_dir/$gli_rel"; break; fi
+  done
+fi
+echo "gli: $gli_header" | tee "$build/gli.log"
+python3 "$repo/scripts/mesa/b2l-target/gen-gli-dispatch.py" "$gli_header" "$target/b2l_gli_table.h" \
+  2>&1 | tee -a "$build/gli.log"
 grep -q "targets/b2l" "$src/src/gallium/meson.build" || printf "\nsubdir('targets/b2l')\n" >> "$src/src/gallium/meson.build"
 meson setup "$build/out" "$src" --cross-file "$cross" --buildtype=release \
   --default-library=static "${args[@]}" 2>&1 | tee "$build/configure.log"

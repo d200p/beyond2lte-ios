@@ -2037,26 +2037,203 @@ mesa_probe(void)
 }
 #endif
 
+/*
+ * The drawing client, opened by whichever thread needs it first: the start
+ * thread, or Core Animation's render thread making its GLES context.
+ */
+static pthread_mutex_t connection_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int
+try_open_connection(void)
+{
+	pthread_mutex_lock(&connection_lock);
+	if (connection == MACH_PORT_NULL) {
+		io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("B2LMali"));
+		if (service != MACH_PORT_NULL) {
+			io_connect_t c = MACH_PORT_NULL;
+			if (IOServiceOpen(service, mach_task_self(), 0, &c) == KERN_SUCCESS) {
+				connection = c;
+			}
+			IOObjectRelease(service);
+		}
+	}
+	int open = connection != MACH_PORT_NULL;
+	pthread_mutex_unlock(&connection_lock);
+	return open;
+}
+
+/*
+ * S10: Core Animation composed by the Mali through Mesa (scripts/mesa,
+ * b2l-target/b2l_eagl.c). iOS 26's window server has no OpenGL ES branch of
+ * its own: IOMFBDisplay::get_ctx tries Metal, and on failure
+ * CA::WindowServer::Server::sw_renderer() makes a CA::OGL::SWContext (stored
+ * at server+0xc0) and wraps it in a CA::OGL::Renderer (server+0xc8) that
+ * render_update and render_surface draw with. The four instructions that
+ * start the SWContext allocation are replaced by a jump to
+ * b2l_sw_renderer_stub, which gets the context from b2l_ca_context() and goes
+ * back to the store at SWR_RESUME, with x21/x22 as the skipped adrp left them:
+ *  - an OpenGL ES context: QuartzCore's gles_new_context() with config type 3
+ *    and our EAGL object, i.e. a CA::OGL::GLESContext, which still ships;
+ *  - otherwise, the software context exactly as before (sw_new_context(), the
+ *    same allocation and constructor sw_renderer inlines).
+ * Once per boot: a backboardd that dies while composing on the GPU leaves
+ * GLES_MARKER, and the next backboardd of the same boot stays on the CPU.
+ * B2L_GLES=0 builds without the patch.
+ */
+#ifndef B2L_GLES
+#define B2L_GLES 1
+#endif
+#define SWR_PATCH        0x1841bfab8ull /* sw_renderer: adrp x21; ldr x8, [x21, #0xeb8]; cmn; b.ne */
+#define SWR_RESUME       0x1841bfb1cull /* str x20, [x19, #0xc0] */
+#define SWR_X21_PAGE     0x1ecd9c000ull /* the skipped adrp x21 */
+#define SWR_X22_PAGE     0x1ecd9e000ull /* the skipped adrp x22 at 0x1841bfac8 */
+#define SW_NEW_CONTEXT   0x184109ac4ull /* sw_new_context(void *, void *, unsigned) */
+#define GLES_NEW_CONTEXT 0x184109d38ull /* gles_new_context(config, void *, unsigned) */
+static const uint32_t SWR_PATCH_WORDS[4] = { 0xb0345ef5, 0xf9475ea8, 0xb100051f, 0x54000b61 };
+static const uint32_t SWR_RESUME_WORDS[2] = { 0xf9006274, 0xf9475ea8 };
+static const uint32_t SW_NEW_WORDS[2] = { 0xd503201f, 0xa9be4ff4 };
+static const uint32_t GLES_NEW_WORDS[2] = { 0xb9400008, 0x71000d1f };   /* ldr w8, [x0]; cmp w8, #3 */
+#define GLES_MARKER "/private/var/tmp/b2l-gles.running"
+
+void *b2l_ca_context(void *server);
+void b2l_sw_renderer_stub(void);
+uint64_t b2l_swr_resume, b2l_swr_x21, b2l_swr_x22;
+__asm__(".text\n.p2align 2\n.globl _b2l_sw_renderer_stub\n_b2l_sw_renderer_stub:\n"
+    " mov x0, x19\n bl _b2l_ca_context\n mov x20, x0\n"
+    " adrp x16, _b2l_swr_x21@PAGE\n ldr x21, [x16, _b2l_swr_x21@PAGEOFF]\n"
+    " adrp x16, _b2l_swr_x22@PAGE\n ldr x22, [x16, _b2l_swr_x22@PAGEOFF]\n"
+    " adrp x16, _b2l_swr_resume@PAGE\n ldr x16, [x16, _b2l_swr_resume@PAGEOFF]\n br x16\n");
+
+static void *(*sw_new_context_function)(void *, void *, unsigned);
+static void *(*gles_new_context_function)(void *, void *, unsigned);
+static int gles_hooked;                 /* the patch is in */
+static char gles_install_note[160] = "not installed";
+static int gles_asked;
+static int gles_active;
+
+/* From the constructor, before Core Animation makes any renderer; logged later. */
+static void
+install_gles_hook(void)
+{
+	uuid_t uuid;
+	uint64_t slide = quartzcore_slide();
+	if (!B2L_GLES) {
+		snprintf(gles_install_note, sizeof(gles_install_note), "off in this build");
+		return;
+	}
+	if (!slide || !_dyld_get_shared_cache_uuid(uuid) || memcmp(uuid, CACHE_UUID, 16)) {
+		snprintf(gles_install_note, sizeof(gles_install_note), "not cache 23G90 (slide 0x%llx)",
+		    (unsigned long long)slide);
+		return;
+	}
+	uint32_t *at = (uint32_t *)(SWR_PATCH + slide);
+	const uint32_t *resume = (const uint32_t *)(SWR_RESUME + slide);
+	const uint32_t *sw = (const uint32_t *)(SW_NEW_CONTEXT + slide);
+	const uint32_t *gles = (const uint32_t *)(GLES_NEW_CONTEXT + slide);
+	if (memcmp(at, SWR_PATCH_WORDS, sizeof(SWR_PATCH_WORDS)) || memcmp(resume, SWR_RESUME_WORDS,
+	    sizeof(SWR_RESUME_WORDS)) || memcmp(sw, SW_NEW_WORDS, sizeof(SW_NEW_WORDS)) ||
+	    memcmp(gles, GLES_NEW_WORDS, sizeof(GLES_NEW_WORDS))) {
+		snprintf(gles_install_note, sizeof(gles_install_note),
+		    "words differ: patch %08x resume %08x sw %08x gles %08x", at[0], resume[0], sw[1], gles[0]);
+		return;
+	}
+	sw_new_context_function = (void *(*)(void *, void *, unsigned))(uintptr_t)sw;
+	gles_new_context_function = (void *(*)(void *, void *, unsigned))(uintptr_t)gles;
+	b2l_swr_resume = (uint64_t)(uintptr_t)resume;
+	b2l_swr_x21 = SWR_X21_PAGE + slide;
+	b2l_swr_x22 = SWR_X22_PAGE + slide;
+	vm_address_t page = (vm_address_t)at & ~(vm_address_t)(vm_page_size - 1);
+	kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE,
+	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+	if (kr) {
+		snprintf(gles_install_note, sizeof(gles_install_note), "vm_protect write failed %d", kr);
+		return;
+	}
+	struct { uint32_t ldr, br; uint64_t address; } patch = { 0x58000050, 0xd61f0200,
+		(uint64_t)(uintptr_t)b2l_sw_renderer_stub };
+	memcpy(at, &patch, sizeof(patch));
+	sys_icache_invalidate(at, sizeof(patch));
+	kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+	gles_hooked = 1;
+	snprintf(gles_install_note, sizeof(gles_install_note), "sw_renderer patched at %p (protect back %d)",
+	    (void *)at, kr);
+}
+
+static void *
+gles_context(void *server)
+{
+	if (gles_asked++) {
+		log_line("gles: window server %p asks for a renderer too; software for it", server);
+		return NULL;
+	}
+	unsigned waited = 0;
+	while (!try_open_connection() && waited < 150) {
+		usleep(100000);
+		waited++;
+	}
+	if (connection == MACH_PORT_NULL) {
+		return NULL;            /* no B2LMali in 15 s: nothing to log with */
+	}
+	log_line("gles: window server %p makes its renderer (B2LMali after %u ms)", server, waited * 100);
+#ifdef B2L_MESA_LIBRARY
+	if (!once_per_boot(GLES_MARKER)) {
+		log_line("gles: a backboardd of this boot composed on the GPU and is gone (%s): software", GLES_MARKER);
+		return NULL;
+	}
+	mach_timebase_info_data_t tb;
+	mach_timebase_info(&tb);
+	uint64_t start = mach_absolute_time();
+	void *mesa = dlopen(B2L_MESA_LIBRARY, RTLD_NOW | RTLD_LOCAL);
+	void *(*create)(void) = mesa != NULL ? (void *(*)(void))dlsym(mesa, "b2l_eagl_context_create") : NULL;
+	if (create == NULL) {
+		const char *error = dlerror();
+		log_line("gles: %s: %s; software", B2L_MESA_LIBRARY, mesa == NULL ? (error ? error : "not loaded") :
+		    "no b2l_eagl_context_create");
+		unlink(GLES_MARKER);
+		return NULL;
+	}
+	void *eagl = create();
+	if (eagl == NULL) {
+		log_line("gles: no EAGL context; software");
+		unlink(GLES_MARKER);
+		return NULL;
+	}
+	struct { uint32_t type, pad; void *eagl; } config = { 3, 0, eagl };
+	void *ctx = gles_new_context_function(&config, NULL, 0);
+	log_line("gles: CA::OGL::GLESContext %p on EAGL object %p in %llu ms%s", ctx, eagl,
+	    (unsigned long long)((mach_absolute_time() - start) * tb.numer / tb.denom / 1000000),
+	    ctx != NULL ? ": Core Animation composes on the Mali" : "; software");
+	if (ctx == NULL) {
+		unlink(GLES_MARKER);
+	}
+	gles_active = ctx != NULL;
+	return ctx;
+#else
+	log_line("gles: no Mesa library in this build; software");
+	return NULL;
+#endif
+}
+
+/* From b2l_sw_renderer_stub, on the thread making the window server's renderer. */
+void *
+b2l_ca_context(void *server)
+{
+	void *ctx = gles_context(server);
+	return ctx != NULL ? ctx : sw_new_context_function(NULL, NULL, 0);
+}
+
 static void *
 start_thread(void *unused)
 {
 	(void)unused;
-	for (int attempt = 0; attempt < 120 && connection == MACH_PORT_NULL; attempt++) {
-		io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("B2LMali"));
-		if (service != MACH_PORT_NULL) {
-			if (IOServiceOpen(service, mach_task_self(), 0, &connection) != KERN_SUCCESS) {
-				connection = MACH_PORT_NULL;
-			}
-			IOObjectRelease(service);
-		}
-		if (connection == MACH_PORT_NULL) {
-			sleep(1);
-		}
+	for (int attempt = 0; attempt < 120 && !try_open_connection(); attempt++) {
+		sleep(1);
 	}
 	if (connection == MACH_PORT_NULL) {
 		return NULL;
 	}
 	log_line("library running in pid %d uid %d", getpid(), (int)getuid());
+	log_line("gles: %s", gles_install_note);
 	keyboard_dictation_languages();
 	keyboard_dictation_off();
 	if (!B2L_GPU_HOOKS) {
@@ -2065,7 +2242,14 @@ start_thread(void *unused)
 		uint64_t info[3] = { 0, 0, 0 };
 		uint32_t count = 3;
 		kern_return_t kr = IOConnectCallMethod(connection, kB2LMaliInfo, NULL, 0, NULL, 0, info, &count, NULL, NULL);
-		log_line("GPU client open for the kernel's screen copy (kr=0x%x); Core Animation not hooked", kr);
+		log_line("GPU client open for the kernel's screen copy (kr=0x%x); Core Animation %s", kr,
+		    gles_hooked ? "renderer patched for GLES" : "not hooked");
+		if (gles_hooked) {
+			/* Mesa runs in this process for Core Animation: no second screen
+			 * for the probe, no BO test beside it. */
+			log_line("gles: BO test and Mesa probe skipped (GLES asked %d, active %d)", gles_asked, gles_active);
+			return NULL;
+		}
 		bo_selftest();          /* beside the open drawing client, as Mesa will be */
 		mesa_probe();
 		return NULL;
@@ -2086,6 +2270,7 @@ b2l_gpu_start(void)
 	pthread_t thread;
 	pthread_attr_t attributes;
 
+	install_gles_hook();
 	pthread_attr_init(&attributes);
 	pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
 	pthread_create(&thread, &attributes, start_thread, NULL);

@@ -96,8 +96,11 @@ fscreen_get_param(struct pipe_frontend_screen *fscreen, enum st_manager_param pa
 	return 0;
 }
 
-/* The screen, once per process (for the EAGL layer; the probe makes its own). */
-__attribute__((unused)) static struct pipe_frontend_screen *
+/* The screen, once per process (for the EAGL layer, b2l_eagl.c; the probe
+ * makes its own). */
+struct pipe_frontend_screen *b2l_fscreen(void);
+
+struct pipe_frontend_screen *
 b2l_fscreen(void)
 {
 	if (b2l.fscreen.screen != NULL) {
