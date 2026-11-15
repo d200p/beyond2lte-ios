@@ -359,6 +359,140 @@ gli_link_program(void *c, void *program)
 	}
 }
 
+/*
+ * Boot 56: the clock and calendar icons, Settings' icons, the lock screen
+ * time and Control Center's controls stayed blank. Some of Core Animation's
+ * fragment shaders use s0 without declaring it ("`s0' undeclared"), so they
+ * did not compile and every draw with them failed. The first came right after
+ * an 'LA08' surface (grey and alpha: glyphs Core Animation tints); its OpenGL
+ * ES shader generator writes no sampling line for such textures. Every other
+ * shader declares "uniform lowp sampler2D textureN;" and opens main with
+ * "lowp vec4 sN = texture2D(textureN, texcoordN_0);": a fragment shader
+ * that uses sN (N 0-3) without declaring it gets those two lines (a
+ * luminance-alpha texture samples as L, L, L, A).
+ */
+static unsigned shader_patches;
+
+static bool
+is_ident(char ch)
+{
+	return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_';
+}
+
+/* The first whole-word `word` in text at or after from, or NULL. */
+static const char *
+find_word(const char *text, const char *from, const char *word)
+{
+	size_t n = strlen(word);
+	for (const char *at = strstr(from, word); at != NULL; at = strstr(at + 1, word)) {
+		if ((at == text || !is_ident(at[-1])) && !is_ident(at[n])) {
+			return at;
+		}
+	}
+	return NULL;
+}
+
+/* name declared as some vec4 ("lowp vec4 s0 = ..."). */
+static bool
+declares_vec4(const char *text, const char *name)
+{
+	for (const char *at = find_word(text, text, name); at != NULL; at = find_word(text, at + 1, name)) {
+		const char *p = at;
+		while (p > text && p[-1] == ' ') {
+			p--;
+		}
+		if (p - text >= 4 && strncmp(p - 4, "vec4", 4) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* All the strings of a glShaderSource call as one, NUL-terminated (malloc'd). */
+static char *
+join_sources(int32_t count, const void *strings, const void *lengths)
+{
+	size_t total = 0;
+	for (int32_t i = 0; i < count; i++) {
+		const char *s = ((const char *const *)strings)[i];
+		GLint len = lengths != NULL ? ((const GLint *)lengths)[i] : -1;
+		total += s == NULL ? 0 : len >= 0 ? (size_t)len : strlen(s);
+	}
+	char *out = malloc(total + 1);
+	if (out == NULL) {
+		return NULL;
+	}
+	size_t at = 0;
+	for (int32_t i = 0; i < count; i++) {
+		const char *s = ((const char *const *)strings)[i];
+		GLint len = lengths != NULL ? ((const GLint *)lengths)[i] : -1;
+		size_t n = s == NULL ? 0 : len >= 0 ? (size_t)len : strlen(s);
+		memcpy(out + at, s, n);
+		at += n;
+	}
+	out[at] = '\0';
+	return out;
+}
+
+/* source with the missing sampling lines (malloc'd), or NULL when none is missing. */
+static char *
+patch_fragment(const char *source, unsigned *mask)
+{
+	char decls[4][48], lines[4][80];
+	size_t extra = 0;
+	*mask = 0;
+	const char *main_at = find_word(source, source, "main");
+	while (main_at != NULL && (main_at - source < 5 || strncmp(main_at - 5, "void ", 5) != 0)) {
+		main_at = find_word(source, main_at + 1, "main");
+	}
+	const char *brace = main_at != NULL ? strchr(main_at, '{') : NULL;
+	if (brace == NULL) {
+		return NULL;
+	}
+	main_at -= 5;
+	for (unsigned n = 0; n < 4; n++) {
+		char s[4], texture[12], coord[16];
+		snprintf(s, sizeof(s), "s%u", n);
+		snprintf(texture, sizeof(texture), "texture%u", n);
+		snprintf(coord, sizeof(coord), "texcoord%u_0", n);
+		decls[n][0] = lines[n][0] = '\0';
+		if (find_word(source, brace, s) == NULL || declares_vec4(source, s) || find_word(source, source, coord) == NULL) {
+			continue;
+		}
+		if (find_word(source, source, texture) == NULL) {
+			snprintf(decls[n], sizeof(decls[n]), "uniform lowp sampler2D %s;\n", texture);
+		}
+		snprintf(lines[n], sizeof(lines[n]), "\n  lowp vec4 %s = texture2D(%s, %s);", s, texture, coord);
+		extra += strlen(decls[n]) + strlen(lines[n]);
+		*mask |= 1u << n;
+	}
+	if (*mask == 0) {
+		return NULL;
+	}
+	size_t length = strlen(source);
+	char *out = malloc(length + extra + 1);
+	if (out == NULL) {
+		return NULL;
+	}
+	size_t at = 0, head = (size_t)(main_at - source), body = (size_t)(brace + 1 - main_at);
+	memcpy(out, source, head);
+	at = head;
+	for (unsigned n = 0; n < 4; n++) {
+		memcpy(out + at, decls[n], strlen(decls[n]));
+		at += strlen(decls[n]);
+	}
+	memcpy(out + at, main_at, body);
+	at += body;
+	for (unsigned n = 0; n < 4; n++) {
+		memcpy(out + at, lines[n], strlen(lines[n]));
+		at += strlen(lines[n]);
+	}
+	memcpy(out + at, brace + 1, length - (size_t)(brace + 1 - source));
+	at += length - (size_t)(brace + 1 - source);
+	out[at] = '\0';
+	return out;
+}
+
 static void
 gli_shader_source(void *c, void *shader, int32_t count, const void *strings, const void *lengths)
 {
@@ -367,11 +501,31 @@ gli_shader_source(void *c, void *shader, int32_t count, const void *strings, con
 		return;
 	}
 	struct _glapi_table *d = GET_DISPATCH();
-	CALL_ShaderSource(d, (HANDLE(shader), count, (const GLchar *const *)strings, (const GLint *)lengths));
+	GLint kind = 0;
+	CALL_GetShaderiv(d, (HANDLE(shader), GL_SHADER_TYPE, &kind));
+	char *joined = NULL, *patched = NULL;
+	unsigned mask = 0;
+	if (kind == GL_FRAGMENT_SHADER && strings != NULL && count > 0) {
+		joined = join_sources(count, strings, lengths);
+		patched = joined != NULL ? patch_fragment(joined, &mask) : NULL;
+	}
+	if (patched != NULL) {
+		const GLchar *one = patched;
+		CALL_ShaderSource(d, (HANDLE(shader), 1, &one, NULL));
+	} else {
+		CALL_ShaderSource(d, (HANDLE(shader), count, (const GLchar *const *)strings, (const GLint *)lengths));
+	}
 	b2l_gli_leave((unsigned)idx_shader_source);
+	if (patched != NULL && shader_patches++ < 8) {
+		note("fragment shader %u: sampling added for s0-s3 mask 0x%x (Core Animation left it out)", HANDLE(shader),
+		    mask);
+		if (shader_patches <= 2) {
+			note_text("patched src", HANDLE(shader), patched, strlen(patched));
+		}
+	}
+	free(joined);
+	free(patched);
 	if (logged < SHADERS_LOGGED && strings != NULL && count > 0) {
-		GLint kind = 0;
-		CALL_GetShaderiv(d, (HANDLE(shader), GL_SHADER_TYPE, &kind));
 		unsigned id = logged++;
 		note("shader %u: %s, name %u, %d strings", id, kind == GL_VERTEX_SHADER ? "vertex" : "fragment",
 		    HANDLE(shader), count);

@@ -293,6 +293,24 @@ now logged with their compile logs. (4) 3-4 frames a second with the GPU
 busy a fifth of the time: the 5-second summary now gives the CPU time spent
 inside Mesa (and the slowest entries) and in the IOSurface paths.
 
+Boot 56 (build 55): Control Center opens (no fault), but the icons and the
+lock screen time were still missing and Control Center showed only the
+battery. The shadow textures were made (every attach ok); the new link log
+named the cause: several of Core Animation's fragment shaders use `s0`
+without declaring it (`'s0' undeclared`), the first right after an 'LA08'
+surface (grey and alpha glyphs, tinted by Core Animation): its OpenGL ES
+shader generator writes no sampling line for such textures. The EAGL layer
+now adds the two lines every other shader has (`uniform lowp sampler2D
+textureN;`, `lowp vec4 sN = texture2D(textureN, texcoordN_0);`) to a
+fragment shader that uses sN undeclared. Speed: with the screen still,
+~10 frames a second, 40-60 ms per 5 s inside Mesa and 25-30 ms of GPU wait
+per frame; while interacting, shader compiles (also inside draws, for
+Panfrost's variants), texture uploads and partial clears take 0.8-2.3 s per
+5 s. The GPU wait includes the kernel cleaning every imported IOSurface
+whole before and after each job (two 12 MB display buffers among them):
+before a job only surfaces whose seed moved are cleaned now, and the kernel
+logs run and cleaning times every 500 jobs.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer

@@ -184,6 +184,8 @@ struct b2l_mali_bo {
 	uint64_t va, bytes, resident;           /* VA range; memory behind its start */
 	uint32_t flags;
 	B2LSurface *surface;                    /* an imported IOSurface (kB2LMaliBoImport) */
+	uint32_t cleanedSeed;                   /* the surface's seed at its last clean */
+	bool cleaned;                           /* cleaned since the import */
 };
 
 class B2LMali : public IOService {
@@ -276,6 +278,7 @@ private:
 	struct b2l_mali_bo *bos;
 	uint64_t *boPages;              /* one bit per 4 KiB page of the BO range */
 	uint64_t boBytes, boJobs, boFaults;
+	uint64_t boRunNS, boCleanBeforeNS, boCleanAfterNS, boCleanBytes, boCleanSkips;
 	unsigned clients;
 	bool drawOpen;
 	void readProps();
@@ -290,7 +293,7 @@ private:
 	void boFreeAll(void *owner);
 	IOMemoryDescriptor *boMemory(void *owner, uint32_t handle);
 	IOReturn boImport(void *owner, uint32_t id, uint64_t *out);
-	void boSurfacesClean(void);
+	void boSurfacesClean(bool before);
 	unsigned boSurfaces;            /* imported surfaces alive */
 	IOReturn jobSubmit(uint64_t jc, uint64_t requirements, uint64_t *out);
 	IOReturn clientBegin(bool draw);
@@ -1901,20 +1904,45 @@ B2LMali::boImport(void *owner, uint32_t id, uint64_t *out)
 	return kIOReturnSuccess;
 }
 
-/* Imported surfaces: CPU lines written back and dropped (clean + invalidate). */
+/*
+ * Imported surfaces: CPU lines written back and dropped (clean + invalidate).
+ * Boot 56: every submission cleaned every imported surface whole, before and
+ * after the job (the two display buffers alone are 12 MB each), and the
+ * GPU's share of even a trivial frame stayed 25-70 ms. After a job every
+ * imported surface is still cleaned, so CPU readers see what the GPU wrote,
+ * which leaves no line of them in the cache; before a job only those the CPU
+ * may have written since (their seed moved: CPU writes go through IOSurface
+ * locks, which move it) can hold dirty lines, so only those are cleaned.
+ * Both passes are timed and logged every 500 jobs.
+ */
 void
-B2LMali::boSurfacesClean(void)
+B2LMali::boSurfacesClean(bool before)
 {
+	uint64_t start = nowNS();
 	for (unsigned i = 0, seen = 0; boSurfaces != 0 && i < B2L_MALI_MAX_BOS && seen < boSurfaces; i++) {
 		B2LSurface *surface = bos[i].surface;
 		if (surface == NULL) {
 			continue;
 		}
 		seen++;
+		uint32_t seed = b2l_surface_current_seed(surface);
+		if (before && bos[i].cleaned && bos[i].cleanedSeed == seed) {
+			boCleanSkips++;
+			continue;
+		}
 		uintptr_t address = surface->kernelAddress();
 		if (address != 0) {
-			flush_dcache64((addr64_t)address + surface->offset, surface->bytesPerRow * surface->height, FALSE);
+			unsigned bytes = surface->bytesPerRow * surface->height;
+			flush_dcache64((addr64_t)address + surface->offset, bytes, FALSE);
+			boCleanBytes += bytes;
 		}
+		bos[i].cleaned = true;
+		bos[i].cleanedSeed = seed;
+	}
+	if (before) {
+		boCleanBeforeNS += nowNS() - start;
+	} else {
+		boCleanAfterNS += nowNS() - start;
 	}
 }
 
@@ -1945,13 +1973,21 @@ B2LMali::jobSubmit(uint64_t jc, uint64_t requirements, uint64_t *out)
 	}
 	checkTemperature();
 	unsigned slot = (requirements & B2L_MALI_REQ_FS) ? B2L_MALI_SLOT_FRAGMENT : B2L_MALI_SLOT_TILER;
-	boSurfacesClean();              /* the CPU's writes reach memory */
+	boSurfacesClean(true);          /* the CPU's writes reach memory */
 	uint64_t begin = nowNS();
 	uint32_t status = b2l_mali_run_job(&io, slot, jc, B2L_RT_JOB_TIMEOUT_US);
-	boSurfacesClean();              /* and no stale line hides the GPU's */
+	uint64_t ran = nowNS() - begin;
+	boSurfacesClean(false);         /* and no stale line hides the GPU's */
 	out[0] = status;
-	out[1] = nowNS() - begin;
+	out[1] = ran;
+	boRunNS += ran;
 	boJobs++;
+	if (boJobs % 500 == 0) {
+		b2l_diag_record("B2L GPU BO: %llu jobs: last 500 ran %llu ms, surface cleaning %llu ms before + %llu ms after"
+		    " (%llu MB, %llu skipped unchanged), %u surfaces imported\n", boJobs, boRunNS / 1000000,
+		    boCleanBeforeNS / 1000000, boCleanAfterNS / 1000000, boCleanBytes >> 20, boCleanSkips, boSurfaces);
+		boRunNS = boCleanBeforeNS = boCleanAfterNS = boCleanBytes = boCleanSkips = 0;
+	}
 	if (status != B2L_MALI_STATUS_DONE) {
 		if (boFaults++ < 16) {
 			b2l_diag_record("B2L GPU BO: job 0x%llx slot %u status 0x%x js_status=0x%x\n", jc, slot, status,
