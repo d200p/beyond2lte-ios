@@ -2113,22 +2113,37 @@ static const uint32_t GLES_NEW_WORDS[2] = { 0xb9400008, 0x71000d1f };   /* ldr w
  * (scripts/patch-ca-software-surface.py). Here push_surface's entry first
  * calls b2l_gles_track, which lists the surface with track_surface when the
  * context is ours and the surface is not on its list yet.
+ *
+ * Boot 53: the display surfaces stayed listed for good, and Core Animation
+ * frees them without unlisting (the GLES context never lists them itself):
+ * after the screen went off and on, two new display surfaces came and the
+ * two freed ones stayed on the list, until CA::OGL::Context::end_rendering,
+ * which logs every surface still on the 0x58 list at the end of a frame
+ * (every frame, here), read a freed one's link (0x14) and faulted. Only
+ * push_surface's own check needs the surface listed (the list is not used
+ * after it), so the hook now runs the rest of push_surface as a call and
+ * b2l_gles_untrack takes the surface it listed off the list right after.
  */
 #define PUSH_SURFACE     0x183f13150ull /* Context::push_surface(Surface *, bool, unsigned, unsigned) */
 #define TRACK_SURFACE    0x1840d8c58ull /* Context::track_surface(Surface *) */
 static const uint32_t PUSH_SURFACE_WORDS[4] = { 0xd503201f, 0xd10203ff, 0xa90367fa, 0xa9045ff8 };
 static const uint32_t TRACK_SURFACE_WORDS[4] = { 0xd503201f, 0xd10183ff, 0xa90357f6, 0xa9044ff4 };
 
-void b2l_gles_track(void *ctx, void *surface);
+int b2l_gles_track(void *ctx, void *surface);
+void b2l_gles_untrack(void *ctx, void *surface, int listed);
 void b2l_push_surface_hook(void);
+void b2l_push_surface_body(void);
 uint64_t b2l_push_surface_resume;
 __asm__(".text\n.p2align 2\n.globl _b2l_push_surface_hook\n_b2l_push_surface_hook:\n"
-    " stp x29, x30, [sp, #-0x40]!\n mov x29, sp\n"
+    " stp x29, x30, [sp, #-0x50]!\n mov x29, sp\n"
     " stp x0, x1, [sp, #0x10]\n stp x2, x3, [sp, #0x20]\n str x4, [sp, #0x30]\n"
-    " bl _b2l_gles_track\n"
+    " bl _b2l_gles_track\n str x0, [sp, #0x38]\n"
     " ldp x0, x1, [sp, #0x10]\n ldp x2, x3, [sp, #0x20]\n ldr x4, [sp, #0x30]\n"
-    " ldp x29, x30, [sp], #0x40\n"
-    /* push_surface's displaced entry words, then the rest of it */
+    " bl _b2l_push_surface_body\n str x0, [sp, #0x40]\n"
+    " ldp x0, x1, [sp, #0x10]\n ldr x2, [sp, #0x38]\n bl _b2l_gles_untrack\n"
+    " ldr x0, [sp, #0x40]\n ldp x29, x30, [sp], #0x50\n ret\n"
+    /* push_surface's displaced entry words, then the rest of it, which returns to the hook */
+    ".globl _b2l_push_surface_body\n_b2l_push_surface_body:\n"
     " nop\n sub sp, sp, #0x80\n stp x26, x25, [sp, #0x30]\n stp x24, x23, [sp, #0x40]\n"
     " adrp x16, _b2l_push_surface_resume@PAGE\n ldr x16, [x16, _b2l_push_surface_resume@PAGEOFF]\n br x16\n");
 
@@ -2160,7 +2175,7 @@ __asm__(".text\n.p2align 2\n.globl _b2l_swap_layer_hook\n_b2l_swap_layer_hook:\n
 
 static void *gles_ctx;                  /* the window server's GLESContext */
 static void (*track_surface_function)(void *, void *);
-static unsigned gles_tracked;
+static unsigned gles_tracked, gles_untracked;
 static int (*eagl_flush_function)(void);
 static unsigned gles_swaps;
 
@@ -2176,11 +2191,12 @@ b2l_gles_before_swap(void *surface)
 	}
 }
 
-void
+/* 1 when the surface was listed by the hook (and is to be unlisted after push_surface). */
+int
 b2l_gles_track(void *ctx, void *surface)
 {
 	if (ctx == NULL || ctx != gles_ctx || surface == NULL) {
-		return;
+		return 0;
 	}
 	uint32_t flags = *(const uint32_t *)((const char *)surface + 0x5c);
 	/* Either list counts as listed (the flag can change after tracking). */
@@ -2188,7 +2204,7 @@ b2l_gles_track(void *ctx, void *surface)
 		void *const *head = (void *const *)((const char *)ctx + list);
 		for (void *s = *head; s != NULL; s = *(void *const *)((const char *)s + 0x10)) {
 			if (s == surface) {
-				return;
+				return 0;
 			}
 		}
 	}
@@ -2210,6 +2226,34 @@ b2l_gles_track(void *ctx, void *surface)
 	if (gles_tracked++ < 16) {
 		log_line("gles: surface %p (flags 0x%x) put on the context's list before push_surface (%u)", surface,
 		    flags, gles_tracked);
+	}
+	return 1;
+}
+
+/* After push_surface: the surface the hook listed comes off the list again, link cleared. */
+void
+b2l_gles_untrack(void *ctx, void *surface, int listed)
+{
+	if (!listed) {
+		return;
+	}
+	for (unsigned list = 0x58; list <= 0x60; list += 8) {
+		void **link = (void **)((char *)ctx + list);
+		for (void *s = *link; s != NULL; link = (void **)((char *)s + 0x10), s = *link) {
+			if (s == surface) {
+				void **next = (void **)((char *)surface + 0x10);
+				*link = *next;
+				*next = NULL;
+				if (gles_untracked++ < 8) {
+					log_line("gles: surface %p off the context's list after push_surface (%u)", surface,
+					    gles_untracked);
+				}
+				return;
+			}
+		}
+	}
+	if (gles_untracked++ < 8) {
+		log_line("gles: surface %p was no longer on the list after push_surface", surface);
 	}
 }
 

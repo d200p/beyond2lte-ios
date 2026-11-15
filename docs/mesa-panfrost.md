@@ -239,6 +239,29 @@ the primitives do not use (`B2L_EAGL_EXPAND=0` keeps indexed draws). The
 library also logs its load address, for crash backtraces (boot 52 died in
 `capture_backdrop` with two frames inside our libraries).
 
+Boot 53 (build 52): every Core Animation draw was expanded (6952, none kept)
+and the quads still broke the same way, so neither the indices nor the copy
+of the vertices is the cause; expansion is off again (`B2L_EAGL_EXPAND=1`
+turns it on). The kernel side matches the Android driver (memory attributes,
+cache clean and invalidate at the start and end of every job, TLB flush when
+the cores power up), and our `memcpy` is right for every alignment. For boot
+54 the EAGL layer runs a self-test when the context is made: a grid of 8 x 8
+quads drawn off screen with Core Animation's own vertex shader and vertex
+layout, one quad per indexed draw as Core Animation does, as non-indexed
+draws, as two draws per quad, as one draw for all, with the triangle that
+uses vertex 3 first, and with scissor and blending on; plus the texture
+coordinates as colour. The pixels are read back and the middle of every
+triangle checked, three runs per way (`B2L_EAGL_SELFTEST=0` skips it).
+
+Boot 53 also explained the crash after the screen went off and on (boots 49,
+51, 53): the push_surface hook left the display surfaces on the context's
+surface list, which Core Animation's GLES context never does itself, so when
+the display surfaces were replaced the freed ones stayed listed, and
+`CA::OGL::Context::end_rendering`, which logs every surface still on that
+list at the end of each frame, followed a freed one. The hook now lists a
+display surface only for `push_surface`'s own check and takes it off right
+after.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer

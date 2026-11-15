@@ -41,6 +41,7 @@
 #include "pipe/p_screen.h"
 #include "pipe/p_state.h"
 #include "util/format/u_format.h"
+#include "util/half_float.h"
 #include "util/u_inlines.h"
 #include "glapi/glapi.h"
 #include "main/dispatch.h"
@@ -327,7 +328,8 @@ gli_attrib_pointer(void *c, uint32_t index, int32_t size, uint32_t type, uint8_t
  * and workaround if it holds: the draw is expanded on the CPU into a
  * non-indexed one (the vertices in index order, from the client arrays) with
  * one more vertex than the primitives use, so no needed vertex is last.
- * B2L_EAGL_EXPAND=0 keeps the indexed draws.
+ * Boot 53 (all 6952 draws expanded): the same broken quads, so the indices
+ * are not the cause. Off since; B2L_EAGL_EXPAND=1 turns it back on.
  */
 #define EXPAND_ATTRIBS  8
 static int expand_enabled = -1;
@@ -432,8 +434,8 @@ gli_draw_elements(void *c, uint32_t mode, int32_t count, uint32_t type, const vo
 	struct _glapi_table *d = GET_DISPATCH();
 	if (expand_enabled < 0) {
 		const char *env = getenv("B2L_EAGL_EXPAND");
-		expand_enabled = env == NULL || env[0] != '0';
-		note("indexed draws %s", expand_enabled ? "expanded on the CPU (B2L_EAGL_EXPAND=0 keeps them)" : "kept");
+		expand_enabled = env != NULL && env[0] == '1';
+		note("indexed draws %s", expand_enabled ? "expanded on the CPU (B2L_EAGL_EXPAND=1)" : "kept");
 	}
 	if (expand_enabled) {
 		if (draw_expanded(d, mode, count, type, indices)) {
@@ -1136,6 +1138,353 @@ eagl_class(void)
 	return cls;
 }
 
+/* ---- Self-test ---- */
+
+/*
+ * Boot 53: with every indexed Core Animation draw expanded into DrawArrays
+ * (6952 expanded, none kept) quads still lost or stretched one triangle,
+ * flickering, so neither the indices nor the copy of the vertices is the
+ * cause. Right after the context is made, the self-test draws off screen a
+ * grid of 8 x 8 quads with Core Animation's own vertex shader (logged at boot
+ * 52) and vertex layout (48 bytes: position 4 floats, two texture coordinate
+ * pairs, colour 4 halves), in several ways, reads the pixels back and checks
+ * the middle of each quad's two triangles. Each way runs 3 times, as the
+ * defect flickers; one log line per run. B2L_EAGL_SELFTEST=0 skips it.
+ */
+#define SFT_SIZE         256
+#define SFT_GRID         8
+#define SFT_QUADS        (SFT_GRID * SFT_GRID)
+#define SFT_CELL         (SFT_SIZE / SFT_GRID)
+#define SFT_MARGIN       4
+#define SFT_RUNS         3
+
+struct sft_vertex {
+	float position[4];
+	float texcoord0[2], texcoord1[2];
+	uint16_t colour[4];
+	uint16_t unused[4];
+};
+_Static_assert(sizeof(struct sft_vertex) == 48, "Core Animation's vertex is 48 bytes");
+
+static const char sft_vertex_source[] =
+    "#define NOISE_SIZE 32\n"
+    "uniform highp mat4 vertex_matrix;\n"
+    "uniform highp vec4 texmat0, texmat1, texmat2;\n"
+    "uniform highp vec4 texmatD;\n"
+    "uniform highp vec4 texmatW;\n"
+    "attribute highp vec4 vertex_position;\n"
+    "attribute lowp vec4 vertex_color;\n"
+    "attribute highp vec2 vertex_texcoord0, vertex_texcoord1;\n"
+    "attribute mediump vec3 vertex_normal;\n"
+    "varying lowp vec4 color;\n"
+    "varying highp vec2 texcoord0_0;\n"
+    "varying highp vec2 texcoord1_0;\n"
+    "varying highp vec3 texcoordD;\n"
+    "varying highp vec3 texcoordN;\n"
+    "void main() {\n"
+    "  gl_Position = vertex_matrix * vertex_position;\n"
+    "  color = vertex_color;\n"
+    "  texcoord0_0 = vertex_texcoord0 * texmat0.xy + texmat0.zw;\n"
+    "  texcoord1_0 = vertex_texcoord1 * texmat1.xy + texmat1.zw;\n"
+    "  texcoordD = vec3(gl_Position.xy * texmatD.xy + texmatD.zw * gl_Position.w, gl_Position.w);\n"
+    "  texcoordN = vec3(gl_Position.xy * texmatW.xy + texmatW.zw * gl_Position.w,"
+    " gl_Position.w * float(NOISE_SIZE));\n"
+    "}\n";
+
+/* Core Animation's plain colour fragment shader (boot 52, shader 1). */
+static const char sft_colour_source[] =
+    "uniform highp vec4 texmat0, texmat1, texmat2;\n"
+    "varying lowp vec4 color;\n"
+    "void main(void) {\n"
+    "  gl_FragData[0] = color;\n"
+    "}\n";
+
+/* The first texture coordinates as the colour: where a stretch shows. */
+static const char sft_texcoord_source[] =
+    "varying highp vec2 texcoord0_0;\n"
+    "void main(void) {\n"
+    "  gl_FragData[0] = vec4(texcoord0_0, 0.0, 1.0);\n"
+    "}\n";
+
+enum { SFT_INDEXED, SFT_ARRAYS, SFT_SPLIT, SFT_ONE_DRAW, SFT_REVERSED, SFT_SCISSOR_BLEND, SFT_METHODS };
+static const char *const sft_method_name[SFT_METHODS] = {
+	"indexed 0,1,2,2,3,0",          /* as Core Animation: one quad per draw, client arrays */
+	"arrays",                       /* the same six vertices, not indexed */
+	"split",                        /* each triangle a draw of its own */
+	"one draw",                     /* all quads, 384 indices, 256 vertices */
+	"indexed 2,3,0,0,1,2",          /* the triangle with vertex 3 first */
+	"indexed+scissor+blend",        /* with Core Animation's usual state */
+};
+
+static GLuint
+sft_shader(struct _glapi_table *d, GLenum kind, const char *source)
+{
+	GLuint shader = CALL_CreateShader(d, (kind));
+	const GLchar *text = source;
+	CALL_ShaderSource(d, (shader, 1, &text, NULL));
+	CALL_CompileShader(d, (shader));
+	GLint ok = 0;
+	CALL_GetShaderiv(d, (shader, GL_COMPILE_STATUS, &ok));
+	if (!ok) {
+		char log[160] = "";
+		CALL_GetShaderInfoLog(d, (shader, (GLsizei)sizeof(log), NULL, log));
+		note("selftest: shader 0x%x not compiled: %s", kind, log);
+	}
+	return shader;
+}
+
+static GLuint
+sft_program(struct _glapi_table *d, GLuint vertex, const char *fragment_source)
+{
+	static const char *const attributes[5] = { "vertex_position", "vertex_color", "vertex_texcoord0",
+		"vertex_texcoord1", "vertex_normal" };
+	static const char *const texmats[4] = { "texmat0", "texmat1", "texmatD", "texmatW" };
+	static const GLfloat identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+	GLuint fragment = sft_shader(d, GL_FRAGMENT_SHADER, fragment_source);
+	GLuint program = CALL_CreateProgram(d, ());
+	CALL_AttachShader(d, (program, vertex));
+	CALL_AttachShader(d, (program, fragment));
+	for (GLuint i = 0; i < 5; i++) {
+		CALL_BindAttribLocation(d, (program, i, attributes[i]));
+	}
+	CALL_LinkProgram(d, (program));
+	CALL_DeleteShader(d, (fragment));
+	GLint ok = 0;
+	CALL_GetProgramiv(d, (program, GL_LINK_STATUS, &ok));
+	if (!ok) {
+		char log[160] = "";
+		CALL_GetProgramInfoLog(d, (program, (GLsizei)sizeof(log), NULL, log));
+		note("selftest: program not linked: %s", log);
+		return program;
+	}
+	CALL_UseProgram(d, (program));
+	CALL_UniformMatrix4fv(d, (CALL_GetUniformLocation(d, (program, "vertex_matrix")), 1, GL_FALSE, identity));
+	for (unsigned i = 0; i < 4; i++) {
+		CALL_Uniform4f(d, (CALL_GetUniformLocation(d, (program, texmats[i])), 1.0f, 1.0f, 0.0f, 0.0f));
+	}
+	return program;
+}
+
+/* Quad q: cell (q % 8, q / 8), corners in Core Animation's order 0..3. */
+static void
+sft_quads(struct sft_vertex *v)
+{
+	static const unsigned corner[4][2] = { { 0, 0 }, { 1, 0 }, { 1, 1 }, { 0, 1 } };
+	for (unsigned q = 0; q < SFT_QUADS; q++) {
+		unsigned cx = q % SFT_GRID, cy = q / SFT_GRID;
+		float x[2] = { (float)(cx * SFT_CELL + SFT_MARGIN), (float)((cx + 1) * SFT_CELL - SFT_MARGIN) };
+		float y[2] = { (float)(cy * SFT_CELL + SFT_MARGIN), (float)((cy + 1) * SFT_CELL - SFT_MARGIN) };
+		float colour[4] = { (float)(16 + 32 * cx) / 255.0f, (float)(16 + 32 * cy) / 255.0f, 128.0f / 255.0f, 1.0f };
+		for (unsigned k = 0; k < 4; k++) {
+			struct sft_vertex *p = &v[q * 4 + k];
+			memset(p, 0, sizeof(*p));
+			p->position[0] = x[corner[k][0]] * 2.0f / SFT_SIZE - 1.0f;
+			p->position[1] = y[corner[k][1]] * 2.0f / SFT_SIZE - 1.0f;
+			p->position[3] = 1.0f;
+			p->texcoord0[0] = p->texcoord1[0] = (float)corner[k][0];
+			p->texcoord0[1] = p->texcoord1[1] = (float)corner[k][1];
+			for (unsigned c = 0; c < 4; c++) {
+				p->colour[c] = _mesa_float_to_half(colour[c]);
+			}
+		}
+	}
+}
+
+static void
+sft_pointers(struct _glapi_table *d, const struct sft_vertex *v)
+{
+	const GLsizei stride = (GLsizei)sizeof(*v);
+	CALL_VertexAttribPointer(d, (0, 4, GL_FLOAT, GL_FALSE, stride, v->position));
+	CALL_VertexAttribPointer(d, (1, 4, GL_HALF_FLOAT, GL_TRUE, stride, v->colour));
+	CALL_VertexAttribPointer(d, (2, 2, GL_FLOAT, GL_FALSE, stride, v->texcoord0));
+	CALL_VertexAttribPointer(d, (3, 2, GL_FLOAT, GL_FALSE, stride, v->texcoord1));
+}
+
+static void
+sft_draw(struct _glapi_table *d, unsigned method, const struct sft_vertex *quads)
+{
+	static const GLushort quad[6] = { 0, 1, 2, 2, 3, 0 };
+	static const GLushort reversed[6] = { 2, 3, 0, 0, 1, 2 };
+	static GLushort all[SFT_QUADS * 6];
+	if (method == SFT_ONE_DRAW) {
+		for (unsigned q = 0; q < SFT_QUADS; q++) {
+			for (unsigned k = 0; k < 6; k++) {
+				all[q * 6 + k] = (GLushort)(q * 4 + quad[k]);
+			}
+		}
+		sft_pointers(d, quads);
+		CALL_DrawElements(d, (GL_TRIANGLES, SFT_QUADS * 6, GL_UNSIGNED_SHORT, all));
+		return;
+	}
+	if (method == SFT_SCISSOR_BLEND) {
+		CALL_Enable(d, (GL_SCISSOR_TEST));
+		CALL_Scissor(d, (0, 0, SFT_SIZE, SFT_SIZE));
+		CALL_Enable(d, (GL_BLEND));
+		CALL_BlendFunc(d, (GL_ONE, GL_ONE_MINUS_SRC_ALPHA));
+	}
+	for (unsigned q = 0; q < SFT_QUADS; q++) {
+		const struct sft_vertex *v = quads + q * 4;
+		if (method == SFT_ARRAYS) {
+			struct sft_vertex expanded[6];
+			for (unsigned k = 0; k < 6; k++) {
+				expanded[k] = v[quad[k]];
+			}
+			sft_pointers(d, expanded);
+			CALL_DrawArrays(d, (GL_TRIANGLES, 0, 6));
+		} else if (method == SFT_SPLIT) {
+			sft_pointers(d, v);
+			CALL_DrawElements(d, (GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, quad));
+			CALL_DrawElements(d, (GL_TRIANGLES, 3, GL_UNSIGNED_SHORT, quad + 3));
+		} else {
+			sft_pointers(d, v);
+			CALL_DrawElements(d, (GL_TRIANGLES, 6, GL_UNSIGNED_SHORT, method == SFT_REVERSED ? reversed : quad));
+		}
+	}
+	if (method == SFT_SCISSOR_BLEND) {
+		CALL_Disable(d, (GL_SCISSOR_TEST));
+		CALL_Disable(d, (GL_BLEND));
+		CALL_BlendFunc(d, (GL_ONE, GL_ZERO));
+	}
+}
+
+/*
+ * The pixel a third of the way in from each triangle's right angle (its
+ * centroid): triangle 1 is 0,1,2 (corner 1), triangle 2 is 2,3,0 (corner 3).
+ */
+static void
+sft_check(const uint8_t *pixels, bool texcoords, unsigned bad[2], char *first, size_t first_size)
+{
+	bad[0] = bad[1] = 0;
+	first[0] = '\0';
+	for (unsigned q = 0; q < SFT_QUADS; q++) {
+		unsigned cx = q % SFT_GRID, cy = q / SFT_GRID;
+		unsigned x0 = cx * SFT_CELL + SFT_MARGIN, x1 = (cx + 1) * SFT_CELL - SFT_MARGIN;
+		unsigned y0 = cy * SFT_CELL + SFT_MARGIN, y1 = (cy + 1) * SFT_CELL - SFT_MARGIN;
+		for (unsigned t = 0; t < 2; t++) {
+			unsigned px = t == 0 ? (x0 + 2 * x1) / 3 : (2 * x0 + x1) / 3;
+			unsigned py = t == 0 ? (2 * y0 + y1) / 3 : (y0 + 2 * y1) / 3;
+			const uint8_t *got = pixels + ((size_t)py * SFT_SIZE + px) * 4;
+			uint8_t want[4];
+			int tolerance;
+			if (texcoords) {
+				want[0] = t == 0 ? 170 : 85;
+				want[1] = t == 0 ? 85 : 170;
+				want[2] = 0;
+				tolerance = 12;
+			} else {
+				want[0] = (uint8_t)(16 + 32 * cx);
+				want[1] = (uint8_t)(16 + 32 * cy);
+				want[2] = 128;
+				tolerance = 3;
+			}
+			want[3] = 255;
+			bool ok = true;
+			for (unsigned c = 0; c < 4; c++) {
+				int diff = (int)got[c] - (int)want[c];
+				if (diff > tolerance || diff < -tolerance) {
+					ok = false;
+				}
+			}
+			if (!ok) {
+				if (bad[0] + bad[1] == 0) {
+					snprintf(first, first_size, "quad %u triangle %u at %u,%u: %02x%02x%02x%02x, want %02x%02x%02x%02x",
+					    q, t + 1, px, py, got[0], got[1], got[2], got[3], want[0], want[1], want[2], want[3]);
+				}
+				bad[t]++;
+			}
+		}
+	}
+}
+
+static void
+selftest(struct _glapi_table *d)
+{
+	const char *env = getenv("B2L_EAGL_SELFTEST");
+	if (env != NULL && env[0] == '0') {
+		note("selftest skipped (B2L_EAGL_SELFTEST=0)");
+		return;
+	}
+	uint64_t start = now_ms();
+	struct sft_vertex *quads = calloc(SFT_QUADS * 4, sizeof(*quads));
+	uint8_t *pixels = malloc((size_t)SFT_SIZE * SFT_SIZE * 4);
+	if (quads == NULL || pixels == NULL) {
+		note("selftest: no memory");
+		free(quads);
+		free(pixels);
+		return;
+	}
+	sft_quads(quads);
+	GLint viewport[4] = { 0, 0, 0, 0 }, scissor[4] = { 0, 0, 0, 0 };
+	CALL_GetIntegerv(d, (GL_VIEWPORT, viewport));
+	CALL_GetIntegerv(d, (GL_SCISSOR_BOX, scissor));
+	GLuint texture = 0, framebuffer = 0;
+	CALL_GenTextures(d, (1, &texture));
+	CALL_BindTexture(d, (GL_TEXTURE_2D, texture));
+	CALL_TexImage2D(d, (GL_TEXTURE_2D, 0, GL_RGBA, SFT_SIZE, SFT_SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL));
+	CALL_TexParameteri(d, (GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST));
+	CALL_GenFramebuffers(d, (1, &framebuffer));
+	CALL_BindFramebuffer(d, (GL_FRAMEBUFFER, framebuffer));
+	CALL_FramebufferTexture2D(d, (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, texture, 0));
+	GLenum status = CALL_CheckFramebufferStatus(d, (GL_FRAMEBUFFER));
+	GLuint vertex = sft_shader(d, GL_VERTEX_SHADER, sft_vertex_source);
+	GLuint programs[2] = { sft_program(d, vertex, sft_colour_source), sft_program(d, vertex, sft_texcoord_source) };
+	note("selftest: framebuffer 0x%x, setup GL error 0x%x; %d x %d quads, %d runs per way", status,
+	    CALL_GetError(d, ()), SFT_GRID, SFT_GRID, SFT_RUNS);
+	if (status == GL_FRAMEBUFFER_COMPLETE) {
+		unsigned total[2] = { 0, 0 }, runs = 0;
+		CALL_Viewport(d, (0, 0, SFT_SIZE, SFT_SIZE));
+		CALL_ClearColor(d, (0.0f, 0.0f, 0.0f, 0.0f));
+		for (GLuint i = 0; i < 4; i++) {
+			CALL_EnableVertexAttribArray(d, (i));
+		}
+		for (unsigned p = 0; p < 2; p++) {
+			CALL_UseProgram(d, (programs[p]));
+			for (unsigned m = 0; m < SFT_METHODS; m++) {
+				if (p == 1 && m != SFT_INDEXED && m != SFT_ONE_DRAW) {
+					continue;
+				}
+				for (unsigned r = 0; r < SFT_RUNS; r++) {
+					unsigned bad[2];
+					char first[100];
+					CALL_Clear(d, (GL_COLOR_BUFFER_BIT));
+					sft_draw(d, m, quads);
+					CALL_Finish(d, ());
+					memset(pixels, 0x5a, (size_t)SFT_SIZE * SFT_SIZE * 4);
+					CALL_ReadPixels(d, (0, 0, SFT_SIZE, SFT_SIZE, GL_RGBA, GL_UNSIGNED_BYTE, pixels));
+					sft_check(pixels, p == 1, bad, first, sizeof(first));
+					note("selftest %s, %s, run %u: wrong first triangles %u/%d, second %u/%d%s%s (GL 0x%x)",
+					    p == 1 ? "texcoord" : "colour", sft_method_name[m], r, bad[0], SFT_QUADS, bad[1], SFT_QUADS,
+					    first[0] != '\0' ? "; " : "", first, CALL_GetError(d, ()));
+					total[0] += bad[0];
+					total[1] += bad[1];
+					runs++;
+				}
+			}
+		}
+		note("selftest done in %llu ms: %u runs, wrong first triangles %u, second %u",
+		    (unsigned long long)(now_ms() - start), runs, total[0], total[1]);
+	}
+	/* Back to a new context's state for Core Animation. */
+	CALL_UseProgram(d, (0));
+	CALL_DeleteProgram(d, (programs[0]));
+	CALL_DeleteProgram(d, (programs[1]));
+	CALL_DeleteShader(d, (vertex));
+	for (GLuint i = 0; i < 5; i++) {
+		CALL_DisableVertexAttribArray(d, (i));
+		CALL_VertexAttribPointer(d, (i, 4, GL_FLOAT, GL_FALSE, 0, NULL));
+	}
+	CALL_BindFramebuffer(d, (GL_FRAMEBUFFER, 0));
+	CALL_DeleteFramebuffers(d, (1, &framebuffer));
+	CALL_BindTexture(d, (GL_TEXTURE_2D, 0));
+	CALL_DeleteTextures(d, (1, &texture));
+	CALL_Viewport(d, (viewport[0], viewport[1], viewport[2], viewport[3]));
+	CALL_Scissor(d, (scissor[0], scissor[1], scissor[2], scissor[3]));
+	while (CALL_GetError(d, ()) != GL_NO_ERROR) {
+	}
+	free(quads);
+	free(pixels);
+}
+
 /*
  * The EAGLContext-like object for GLESContext: one per process, an OpenGL ES
  * 3.0 context on the Panfrost screen with no window-system buffers (Core
@@ -1204,6 +1553,7 @@ b2l_eagl_context_create(void)
 	    (unsigned long long)(now_ms() - start), renderer ? (const char *)renderer : "?",
 	    version ? (const char *)version : "?", max_texture, extensions ? strlen((const char *)extensions) : 0,
 	    (void *)object, where.dli_fbase);
+	selftest(d);
 	return object;
 }
 
