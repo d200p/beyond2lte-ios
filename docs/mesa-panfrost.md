@@ -262,6 +262,22 @@ list at the end of each frame, followed a freed one. The hook now lists a
 display surface only for `push_surface`'s own check and takes it off right
 after.
 
+Boot 54 (build 53): no crash through two screen off/on cycles (the display
+surfaces come off the list after each `push_surface`). The self-test: the
+first run of each new way of drawing lost nearly every quad (63 of 64,
+nothing but the clear colour), the two runs after it were right, and so were
+one draw for all and every later way; the job chains of the lost and the
+right runs sat at the same addresses, every job DONE. The GPU used what the
+previous run had left at the vertex shader's output addresses: identical
+when the same quads are drawn again, wrong when they change, as Core
+Animation's flickering triangles. Boot 43 saw the same within IDVS jobs. The
+GPU page table mapped every page non-shareable, where Linux maps Panfrost
+buffers inner shareable (with memory attribute 0x88, `SH_MIDGARD_INNER`: the
+Mali's internal domain, coherent through the L2); non-shareable write-back
+data from the shader cores was not coherent with the tiler's reads within a
+job chain. Build 54 maps pages inner shareable (`B2L_MALI_PT_PAGE`); the
+self-test checks it.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
