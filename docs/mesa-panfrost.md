@@ -144,6 +144,23 @@ as in the probe (rows must be multiples of 64 bytes for the Mali), kept in a
 first use of an entry, the GL errors of the first 4000 calls, entries Mesa
 lacks, imports and a 5 s summary go to the kernel log as `eagl:` lines.
 
+Boot 46 (build 45): the window server's renderer was a `GLESContext` on
+Mesa ("Mali-G76 (Panfrost)", OpenGL ES 3.1, context in 3.8 s, 897 of 975
+GLI entries on Mesa functions, `get_string 0x8a1e` answered ""), no GL error
+in its first 16 calls, and the display's IOSurface (1179 x 2556 BGRA, 4864
+bytes a row) imported and attached as a texture with its framebuffer. Then
+backboardd aborted in `CA::OGL::Context::push_surface` (ogl-context.cpp:1186,
+`found != slist->end ()`) called from `GLESContext::make_buffer_current`; the
+next backboardd of the boot found the marker and stayed on the CPU, as meant.
+In 23G90 `GLESContext::make_buffer_current` and
+`create_surface_from_iosurface` never call `Context::track_surface`
+(0x1840d8c58), unlike its `create_null_surface` and
+`create_surface_with_properties` and `MetalContext::get_surface`; the same gap
+in the software context is closed by `scripts/patch-ca-software-surface.py`.
+`b2l-gpu.c` now also hooks `push_surface`'s entry: for our GLES context, a
+surface that is not on the context's list is put there with `track_surface`
+first.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer

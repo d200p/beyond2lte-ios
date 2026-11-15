@@ -2095,6 +2095,86 @@ static const uint32_t SW_NEW_WORDS[2] = { 0xd503201f, 0xa9be4ff4 };
 static const uint32_t GLES_NEW_WORDS[2] = { 0xb9400008, 0x71000d1f };   /* ldr w8, [x0]; cmp w8, #3 */
 #define GLES_MARKER "/private/var/tmp/b2l-gles.running"
 
+/*
+ * Boot 46: the GLESContext was made, the display's IOSurface attached and its
+ * framebuffer built, then backboardd aborted in CA::OGL::Context::push_surface
+ * (ogl-context.cpp:1186, `found != slist->end ()`), called by
+ * GLESContext::make_buffer_current. Every surface pushed must be on the
+ * context's list (context+0x58, or +0x60 for surfaces flagged 0x400, linked
+ * through surface+0x10). In 23G90 the GLES context's create_null_surface and
+ * create_surface_with_properties put theirs there with
+ * Context::track_surface, but make_buffer_current (the display's buffers) and
+ * create_surface_from_iosurface do not; MetalContext::get_surface does. The
+ * same gap in the software context is closed in the root
+ * (scripts/patch-ca-software-surface.py). Here push_surface's entry first
+ * calls b2l_gles_track, which lists the surface with track_surface when the
+ * context is ours and the surface is not on its list yet.
+ */
+#define PUSH_SURFACE     0x183f13150ull /* Context::push_surface(Surface *, bool, unsigned, unsigned) */
+#define TRACK_SURFACE    0x1840d8c58ull /* Context::track_surface(Surface *) */
+static const uint32_t PUSH_SURFACE_WORDS[4] = { 0xd503201f, 0xd10203ff, 0xa90367fa, 0xa9045ff8 };
+static const uint32_t TRACK_SURFACE_WORDS[4] = { 0xd503201f, 0xd10183ff, 0xa90357f6, 0xa9044ff4 };
+
+void b2l_gles_track(void *ctx, void *surface);
+void b2l_push_surface_hook(void);
+uint64_t b2l_push_surface_resume;
+__asm__(".text\n.p2align 2\n.globl _b2l_push_surface_hook\n_b2l_push_surface_hook:\n"
+    " stp x29, x30, [sp, #-0x40]!\n mov x29, sp\n"
+    " stp x0, x1, [sp, #0x10]\n stp x2, x3, [sp, #0x20]\n str x4, [sp, #0x30]\n"
+    " bl _b2l_gles_track\n"
+    " ldp x0, x1, [sp, #0x10]\n ldp x2, x3, [sp, #0x20]\n ldr x4, [sp, #0x30]\n"
+    " ldp x29, x30, [sp], #0x40\n"
+    /* push_surface's displaced entry words, then the rest of it */
+    " nop\n sub sp, sp, #0x80\n stp x26, x25, [sp, #0x30]\n stp x24, x23, [sp, #0x40]\n"
+    " adrp x16, _b2l_push_surface_resume@PAGE\n ldr x16, [x16, _b2l_push_surface_resume@PAGEOFF]\n br x16\n");
+
+static void *gles_ctx;                  /* the window server's GLESContext */
+static void (*track_surface_function)(void *, void *);
+static unsigned gles_tracked;
+
+void
+b2l_gles_track(void *ctx, void *surface)
+{
+	if (ctx == NULL || ctx != gles_ctx || surface == NULL) {
+		return;
+	}
+	uint32_t flags = *(const uint32_t *)((const char *)surface + 0x5c);
+	void *const *head = (void *const *)((const char *)ctx + ((flags & 0x400) ? 0x60 : 0x58));
+	for (void *s = *head; s != NULL; s = *(void *const *)((const char *)s + 0x10)) {
+		if (s == surface) {
+			return;
+		}
+	}
+	void *next = *(void *const *)((const char *)surface + 0x10);
+	if (next != NULL) {
+		/* Linked elsewhere: track_surface would assert; leave it to push_surface. */
+		log_line("gles: surface %p (flags 0x%x) not on the list but linked to %p", surface, flags, next);
+		return;
+	}
+	track_surface_function(ctx, surface);
+	if (gles_tracked++ < 16) {
+		log_line("gles: surface %p (flags 0x%x) put on the context's list before push_surface (%u)", surface,
+		    flags, gles_tracked);
+	}
+}
+
+/* ldr x16, #8; br x16; .quad target over 16 bytes of code. */
+static kern_return_t
+patch_jump(uint32_t *at, void (*target)(void))
+{
+	vm_address_t page = (vm_address_t)at & ~(vm_address_t)(vm_page_size - 1);
+	kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE,
+	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+	if (kr) {
+		return kr;
+	}
+	struct { uint32_t ldr, br; uint64_t address; } patch = { 0x58000050, 0xd61f0200, (uint64_t)(uintptr_t)target };
+	memcpy(at, &patch, sizeof(patch));
+	sys_icache_invalidate(at, sizeof(patch));
+	vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+	return KERN_SUCCESS;
+}
+
 void *b2l_ca_context(void *server);
 void b2l_sw_renderer_stub(void);
 uint64_t b2l_swr_resume, b2l_swr_x21, b2l_swr_x22;
@@ -2130,33 +2210,39 @@ install_gles_hook(void)
 	const uint32_t *resume = (const uint32_t *)(SWR_RESUME + slide);
 	const uint32_t *sw = (const uint32_t *)(SW_NEW_CONTEXT + slide);
 	const uint32_t *gles = (const uint32_t *)(GLES_NEW_CONTEXT + slide);
+	uint32_t *push = (uint32_t *)(PUSH_SURFACE + slide);
+	const uint32_t *track = (const uint32_t *)(TRACK_SURFACE + slide);
 	if (memcmp(at, SWR_PATCH_WORDS, sizeof(SWR_PATCH_WORDS)) || memcmp(resume, SWR_RESUME_WORDS,
 	    sizeof(SWR_RESUME_WORDS)) || memcmp(sw, SW_NEW_WORDS, sizeof(SW_NEW_WORDS)) ||
-	    memcmp(gles, GLES_NEW_WORDS, sizeof(GLES_NEW_WORDS))) {
+	    memcmp(gles, GLES_NEW_WORDS, sizeof(GLES_NEW_WORDS)) ||
+	    memcmp(push, PUSH_SURFACE_WORDS, sizeof(PUSH_SURFACE_WORDS)) ||
+	    memcmp(track, TRACK_SURFACE_WORDS, sizeof(TRACK_SURFACE_WORDS))) {
 		snprintf(gles_install_note, sizeof(gles_install_note),
-		    "words differ: patch %08x resume %08x sw %08x gles %08x", at[0], resume[0], sw[1], gles[0]);
+		    "words differ: patch %08x resume %08x sw %08x gles %08x push %08x track %08x", at[0], resume[0], sw[1],
+		    gles[0], push[1], track[1]);
 		return;
 	}
 	sw_new_context_function = (void *(*)(void *, void *, unsigned))(uintptr_t)sw;
 	gles_new_context_function = (void *(*)(void *, void *, unsigned))(uintptr_t)gles;
+	track_surface_function = (void (*)(void *, void *))(uintptr_t)track;
 	b2l_swr_resume = (uint64_t)(uintptr_t)resume;
 	b2l_swr_x21 = SWR_X21_PAGE + slide;
 	b2l_swr_x22 = SWR_X22_PAGE + slide;
-	vm_address_t page = (vm_address_t)at & ~(vm_address_t)(vm_page_size - 1);
-	kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE,
-	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+	b2l_push_surface_resume = (uint64_t)(uintptr_t)(push + 4);
+	/* push_surface first: its hook does nothing until a GLES context exists. */
+	kern_return_t kr = patch_jump(push, b2l_push_surface_hook);
 	if (kr) {
-		snprintf(gles_install_note, sizeof(gles_install_note), "vm_protect write failed %d", kr);
+		snprintf(gles_install_note, sizeof(gles_install_note), "push_surface not writable (%d)", kr);
 		return;
 	}
-	struct { uint32_t ldr, br; uint64_t address; } patch = { 0x58000050, 0xd61f0200,
-		(uint64_t)(uintptr_t)b2l_sw_renderer_stub };
-	memcpy(at, &patch, sizeof(patch));
-	sys_icache_invalidate(at, sizeof(patch));
-	kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+	kr = patch_jump(at, b2l_sw_renderer_stub);
+	if (kr) {
+		snprintf(gles_install_note, sizeof(gles_install_note), "sw_renderer not writable (%d)", kr);
+		return;
+	}
 	gles_hooked = 1;
-	snprintf(gles_install_note, sizeof(gles_install_note), "sw_renderer patched at %p (protect back %d)",
-	    (void *)at, kr);
+	snprintf(gles_install_note, sizeof(gles_install_note), "sw_renderer patched at %p, push_surface at %p",
+	    (void *)at, (void *)push);
 }
 
 static void *
@@ -2206,6 +2292,7 @@ gles_context(void *server)
 	if (ctx == NULL) {
 		unlink(GLES_MARKER);
 	}
+	gles_ctx = ctx;
 	gles_active = ctx != NULL;
 	return ctx;
 #else
