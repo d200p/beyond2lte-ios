@@ -401,6 +401,15 @@ chronod made its surfaces this time, then called selectors 21
 (`IOSurfaceSetOwnershipIdentity`, memory accounting: accepted) and 11
 (`IOSurfaceRemoveValue`: implemented, the seed moves on as for a set).
 
+The tab bars (icons too, in software as well): Liquid Glass is
+`GlassBackgroundFilter` (shader kinds 0x44/0x45) and `GlassForegroundFilter`
+(0x48/0x49), kinds only `MetalContext::function_supported` takes
+(`GLContext`'s takes none above 0x39 but 0x78, `SWContext`'s none but 0x4a
+and 0x4c), so the glass and what sits on it were dropped. Both filters'
+`identity()` (slot 0 of the OGL filter subclass, which
+`Render::Filter::evaluate_identity` calls) now answers 1, in both modes:
+Core Animation skips the glass and draws the content plainly.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
