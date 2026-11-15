@@ -378,6 +378,29 @@ height, offset, bytes per row and size as u64 at +0, +8, +0x18, +0x20,
 and +0x33; the rest is compression and tiling. The driver now creates them
 and fills those records.
 
+Boot 59 (build 58): the screen-edge gestures work. Still missing: the lock
+screen time, Settings' icons and Control Center's controls on the GPU (all
+shown in software), the clock and calendar icons (both modes), and every
+app's tab bar (only its shadow, both modes: iOS 26's Liquid Glass, which
+expects Metal). Files dies switching tabs on an assertion in
+`DOCFullDocumentManagerViewController.provideContainerController` (also in
+software). The framebuffer-fetch self-test is right on the GPU (read under
+`IOSurfaceLock`); only glReadPixels saw stale CPU lines, and Core Animation
+never calls it. The GPU gaps: `GLESContext::get` passes `ContextProperty`
+10 to `GLContext::get`, which answers 1 for 10-12, so Core Animation draws
+paths on the GPU (shape layers, and the glyph outlines and symbols of
+vector content through `CG::fill_path` and `CG::DrawLines`), with
+`draw_path_cubics` / `draw_path_rects`, which only `MetalContext` has
+(`CA::OGL::Context`'s are a bare `ret`); the GL shader generator samples
+nothing for those texture functions either (the "s0 undeclared" shaders).
+b2l-gpu.c now points the jump-table entry for property 10 at the case that
+returns 0, and Core Animation scan-converts paths on the CPU, as for a
+context without GPU paths. Luminance and alpha surfaces sampled in place
+(EGL images in R8 or R8G8) now get the swizzle Core Animation expects.
+chronod made its surfaces this time, then called selectors 21
+(`IOSurfaceSetOwnershipIdentity`, memory accounting: accepted) and 11
+(`IOSurfaceRemoveValue`: implemented, the seed moves on as for a set).
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer

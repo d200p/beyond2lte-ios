@@ -2173,6 +2173,55 @@ __asm__(".text\n.p2align 2\n.globl _b2l_swap_layer_hook\n_b2l_swap_layer_hook:\n
     " nop\n stp x28, x27, [sp, #-0x60]!\n stp x26, x25, [sp, #0x10]\n stp x24, x23, [sp, #0x20]\n"
     " adrp x16, _b2l_swap_layer_resume@PAGE\n ldr x16, [x16, _b2l_swap_layer_resume@PAGEOFF]\n br x16\n");
 
+/*
+ * Boot 59: the lock screen time, Control Center's glyphs and Settings' icons
+ * stayed blank on the GPU (they show in software). GLESContext::get passes
+ * ContextProperty 10 to GLContext::get, which answers 1 for 10-12, so Core
+ * Animation draws paths on the GPU (Shape::render_path for shape layers,
+ * CG::fill_path and CG::DrawLines for vector content: glyph outlines,
+ * symbols): it sets up the path texture functions and calls
+ * draw_path_cubics / draw_path_rects, which only the Metal context
+ * implements (CA::OGL::Context's are a bare ret; the GL shader generator has
+ * no sampling for those functions either: the "s0 undeclared" shaders).
+ * Nothing was drawn. GLESContext::get's jump table entry for property 10 now
+ * points at the case that returns 0 (mov w0, #0; ret), and Core Animation
+ * scan-converts paths on the CPU and draws them as images, as it does for a
+ * context without GPU paths.
+ */
+#define GLES_GET_TABLE   0x184072efcull /* GLESContext::get: int32 offsets from GLES_GET_BASE, property 1 first */
+#define GLES_GET_BASE    0x1840d59acull
+#define GLES_GET_ZERO    0x1840d59e8ull /* mov w0, #0; ret */
+#define GLES_GET_PATHS   10             /* GPU path rendering */
+#define GLES_GET_PATHS_WAS 0x78         /* to 0x1840d5a24: b GLContext::get */
+static const uint32_t GLES_GET_WORDS[4] = { 0xb0fffcf1, 0x913bf231, 0xb8b07a30, 0x10000011 };  /* at 0x1840d59a0 */
+static const uint32_t GLES_GET_ZERO_WORDS[2] = { 0x52800000, 0xd65f03c0 };
+static char gles_paths_note[96] = "not patched";
+
+static void
+install_gles_no_paths(uint64_t slide)
+{
+	const uint32_t *code = (const uint32_t *)(GLES_GET_BASE - 0xc + slide);
+	const uint32_t *zero = (const uint32_t *)(GLES_GET_ZERO + slide);
+	int32_t *entry = (int32_t *)(GLES_GET_TABLE + slide) + (GLES_GET_PATHS - 1);
+	if (memcmp(code, GLES_GET_WORDS, sizeof(GLES_GET_WORDS)) ||
+	    memcmp(zero, GLES_GET_ZERO_WORDS, sizeof(GLES_GET_ZERO_WORDS)) || *entry != GLES_GET_PATHS_WAS) {
+		snprintf(gles_paths_note, sizeof(gles_paths_note), "words differ: %08x %08x entry 0x%x", code[0], zero[0],
+		    (unsigned)*entry);
+		return;
+	}
+	vm_address_t page = (vm_address_t)entry & ~(vm_address_t)(vm_page_size - 1);
+	kern_return_t kr = vm_protect(mach_task_self(), page, vm_page_size, FALSE,
+	    VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+	if (kr) {
+		snprintf(gles_paths_note, sizeof(gles_paths_note), "table not writable (%d)", kr);
+		return;
+	}
+	*entry = (int32_t)(GLES_GET_ZERO - GLES_GET_BASE);
+	vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+	snprintf(gles_paths_note, sizeof(gles_paths_note), "property %d answers 0 (entry at %p)", GLES_GET_PATHS,
+	    (void *)entry);
+}
+
 static void *gles_ctx;                  /* the window server's GLESContext */
 static void (*track_surface_function)(void *, void *);
 static unsigned gles_tracked, gles_untracked;
@@ -2348,6 +2397,7 @@ install_gles_hook(void)
 		snprintf(gles_install_note, sizeof(gles_install_note), "sw_renderer not writable (%d)", kr);
 		return;
 	}
+	install_gles_no_paths(slide);   /* only GLES contexts ask GLESContext::get */
 	gles_hooked = 1;
 	snprintf(gles_install_note, sizeof(gles_install_note),
 	    "sw_renderer patched at %p, push_surface at %p, fb_swap_set_layer at %p", (void *)at, (void *)push,
@@ -2446,6 +2496,7 @@ start_thread(void *unused)
 	}
 	log_line("library running in pid %d uid %d", getpid(), (int)getuid());
 	log_line("gles: %s", gles_install_note);
+	log_line("gles: GPU paths: %s", gles_paths_note);
 	keyboard_dictation_languages();
 	keyboard_dictation_off();
 	if (!B2L_GPU_HOOKS) {

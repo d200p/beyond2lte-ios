@@ -72,6 +72,10 @@ struct pipe_frontend_screen *b2l_fscreen(void);
 #define E_HALF_FLOAT_OES        0x8D61
 #define E_UINT_8888_REV         0x8367
 #define E_UINT_2101010_REV      0x8368
+#define E_TEXTURE_SWIZZLE_R     0x8E42
+#define E_TEXTURE_SWIZZLE_G     0x8E43
+#define E_TEXTURE_SWIZZLE_B     0x8E44
+#define E_TEXTURE_SWIZZLE_A     0x8E45
 #define E_CURRENT_PROGRAM       0x8B8D
 #define E_PROGRAM_OBJECT_ARB    0x8B40
 
@@ -375,6 +379,13 @@ gli_link_program(void *c, void *program)
  * "lowp vec4 sN = texture2D(textureN, texcoordN_0);": a fragment shader
  * that uses sN (N 0-3) without declaring it gets those two lines (a
  * luminance-alpha texture samples as L, L, L, A).
+ *
+ * Boot 59: the generator (GLContext::create_shader) samples nothing for the
+ * texture functions with no samples in its table (9-23, 37, 42: the GPU path
+ * functions, OGL_TEX_PATH_* and the like, which only the Metal context
+ * draws). Those shaders came from Core Animation drawing paths on the GPU,
+ * which b2l-gpu.c now turns off (GLESContext::get, property 10); the patch
+ * stays for any that still come.
  */
 static unsigned shader_patches;
 
@@ -1330,6 +1341,8 @@ eagl_macro(id self, SEL cmd)
 	return e != NULL ? (void *)&e->macro : NULL;
 }
 
+static void set_swizzle(uint32_t target, uint32_t format, bool in_place);
+
 static BOOL
 eagl_attach(id self, SEL cmd, uint32_t target, IOSurfaceRef surface, BOOL inverted)
 {
@@ -1356,6 +1369,9 @@ eagl_attach(id self, SEL cmd, uint32_t target, IOSurfaceRef surface, BOOL invert
 			ok = shadow = shadow_attach(surface, target, format, &error);
 			size_t used = strlen(why);
 			snprintf(why + used, sizeof(why) - used, "; shadow texture: %s", ok ? "ok" : "FAILED");
+		}
+		if (ok) {
+			set_swizzle(target, E_RGBA, false);     /* the name may have sampled a luminance surface */
 		}
 	}
 	surface_ticks += mach_absolute_time() - start;
@@ -1420,6 +1436,36 @@ upload_copy(IOSurfaceRef surface, unsigned plane, uint32_t target, uint32_t inte
 	return *error == GL_NO_ERROR;
 }
 
+/*
+ * Boot 59: a surface sampled in place gets the EGL image's own format, R8 or
+ * R8G8, for GL_LUMINANCE, GL_ALPHA and GL_LUMINANCE_ALPHA, which samples as
+ * (L, 0, 0, 1), (A, 0, 0, 1) and (L, A, 0, 1); Core Animation asked for (L, L,
+ * L, 1), (0, 0, 0, A) and (L, L, L, A), what the copy (glTexImage2D with those
+ * formats) gives. The texture's swizzle now makes up the difference, and is
+ * set back to identity for every other texImageIOSurface: Core Animation
+ * reuses texture names for other surfaces.
+ */
+static void
+set_swizzle(uint32_t target, uint32_t format, bool in_place)
+{
+	GLint r = GL_RED, g = GL_GREEN, b = GL_BLUE, a = GL_ALPHA;
+	if (in_place && format == E_LUMINANCE_ALPHA) {
+		g = b = GL_RED;
+		a = GL_GREEN;
+	} else if (in_place && format == E_LUMINANCE) {
+		g = b = GL_RED;
+		a = GL_ONE;
+	} else if (in_place && format == E_ALPHA) {
+		r = g = b = GL_ZERO;
+		a = GL_RED;
+	}
+	struct _glapi_table *d = GET_DISPATCH();
+	CALL_TexParameteri(d, (target, E_TEXTURE_SWIZZLE_R, r));
+	CALL_TexParameteri(d, (target, E_TEXTURE_SWIZZLE_G, g));
+	CALL_TexParameteri(d, (target, E_TEXTURE_SWIZZLE_B, b));
+	CALL_TexParameteri(d, (target, E_TEXTURE_SWIZZLE_A, a));
+}
+
 static BOOL
 eagl_teximage(id self, SEL cmd, IOSurfaceRef surface, uint32_t target, uint32_t internal, int32_t width,
     int32_t height, uint32_t format, uint32_t type, uint32_t plane, BOOL invert)
@@ -1449,8 +1495,14 @@ eagl_teximage(id self, SEL cmd, IOSurfaceRef surface, uint32_t target, uint32_t 
 			img = image_get(surface, plane, pf, (unsigned)width, (unsigned)height, why, sizeof(why));
 		}
 		ok = img != NULL && bind_image(target, img, &error);
+		if (ok) {
+			set_swizzle(target, format, true);
+		}
 		if (img == NULL && pf != PIPE_FORMAT_NONE) {
 			ok = upload_copy(surface, plane, target, internal, width, height, format, type, &error);
+			if (ok) {
+				set_swizzle(target, format, false);
+			}
 			copies++;
 			if (ok && copies > 4) {
 				surface_ticks += mach_absolute_time() - start;

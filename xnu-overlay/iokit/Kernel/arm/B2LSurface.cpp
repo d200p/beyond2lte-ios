@@ -58,6 +58,8 @@ enum {
 	kB2LSurfaceSetYCbCrMatrix     = 5,
 	kB2LSurfaceSetValue           = 9,
 	kB2LSurfaceCopyValues         = 10,
+	kB2LSurfaceRemoveValue        = 11,     /* IOSurfaceRemoveValue */
+	kB2LSurfaceSetOwnership       = 21,     /* IOSurfaceSetOwnershipIdentity */
 	kB2LSurfaceSetBulkAttachments = 27,
 	kB2LSurfaceSetPurgeable       = 20,
 	kB2LSurfaceLimits             = 13,
@@ -837,10 +839,26 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 	case kB2LSurfaceSetYCbCrMatrix:
 	case kB2LSurfaceSetValue:
 	case kB2LSurfaceCopyValues:
+	case kB2LSurfaceRemoveValue:
 	case kB2LSurfaceSetBulkAttachments:
 		return metadata(selector, args);
 	case kB2LSurfaceCreate:
 		return create(args);
+	case kB2LSurfaceSetOwnership: {
+		/*
+		 * Boot 59: chronod called selector 21 after each create and got
+		 * kIOReturnUnsupported. IOSurfaceSetOwnershipIdentity: in [id, task
+		 * identity token, ledger tag, options], nothing out; it moves the
+		 * surface's memory to another task's footprint. Nothing here
+		 * accounts surface memory per task, so a known surface is accepted.
+		 */
+		if (args->scalarInputCount != 4 || arg0 > UINT32_MAX) return kIOReturnBadArgument;
+		B2LSurface *s = b2l_surface_copy((uint32_t)arg0);
+		if (s == NULL) return kIOReturnNotFound;
+		s->release();
+		b2l_surf_log_once("sel", selector);
+		return kIOReturnSuccess;
+	}
 	case kB2LSurfaceSetCVBridgedKeys:
 		/*
 		 * Boot 58: chronod called selector 54 and got kIOReturnUnsupported.
@@ -1073,6 +1091,20 @@ b2l_surface_set_bulk(B2LSurface *s, const uint8_t *input, uint32_t size)
 	return kIOReturnSuccess;
 }
 
+static IOReturn b2l_surface_publish_values(B2LSurface *s, OSDictionary *next, bool ok,
+    IOExternalMethodArguments *args);
+
+/* size bytes of text with one NUL, the last. */
+static bool
+b2l_c_string(const uint8_t *text, uint32_t size)
+{
+	if (size < 2) return false;
+	for (uint32_t i = 0; i + 1 < size; i++) {
+		if (text[i] == 0) return false;
+	}
+	return text[size - 1] == 0;
+}
+
 /* Caller holds the surface lock. Publish only after every allocation and the
  * seed reply succeeds. A short output copy leaves dictionary and seed intact. */
 static IOReturn
@@ -1087,6 +1119,32 @@ b2l_surface_set_values(B2LSurface *s, OSArray *array, IOExternalMethodArguments 
 	    OSDictionary::withCapacity(updates ? updates->getCount() : 1);
 	if (next == NULL) return kIOReturnNoMemory;
 	bool ok = updates ? next->merge(updates) : next->setObject(key, array->getObject(0));
+	return b2l_surface_publish_values(s, next, ok, args);
+}
+
+/*
+ * Boot 59: chronod (the clock and calendar icons) called selector 11 and got
+ * kIOReturnUnsupported. IOSurface.framework's IOSurfaceRemoveValue sends the
+ * surface id, 8 more header bytes and the key as a C string (12 + length + 1
+ * bytes) and reads back 4 bytes: the values' seed, which it expects moved on
+ * as for a set ((seed | 1) + 2) to keep its own copy of the values.
+ * Caller holds the surface lock.
+ */
+static IOReturn
+b2l_surface_remove_value(B2LSurface *s, const char *key, IOExternalMethodArguments *args)
+{
+	OSDictionary *next = s->properties ? OSDictionary::withDictionary(s->properties) :
+	    OSDictionary::withCapacity(1);
+	if (next == NULL) return kIOReturnNoMemory;
+	next->removeObject(key);
+	return b2l_surface_publish_values(s, next, true, args);
+}
+
+/* Caller holds the surface lock; consumes next. Publish only after every
+ * allocation and the seed reply succeed. */
+static IOReturn
+b2l_surface_publish_values(B2LSurface *s, OSDictionary *next, bool ok, IOExternalMethodArguments *args)
+{
 	OSSerialize *serialized = ok ? OSSerialize::binaryWithCapacity(256) : NULL;
 	IOReturn ret = kIOReturnNoMemory;
 	if (serialized && next->serialize(serialized)) {
@@ -1143,7 +1201,8 @@ IOSurfaceRootUserClient::metadata(uint32_t selector, IOExternalMethodArguments *
 		if (ret != kIOReturnSuccess) return ret;
 		if ((selector == kB2LSurfaceSetBulkAttachments && size != 160) ||
 		    (selector == kB2LSurfaceCopyValues && size != 13) ||
-		    (selector == kB2LSurfaceSetValue && size <= 12)) {
+		    (selector == kB2LSurfaceSetValue && size <= 12) ||
+		    (selector == kB2LSurfaceRemoveValue && (size < 14 || !b2l_c_string(input + 12, size - 12)))) {
 			IOFreeData(input, size); return kIOReturnBadArgument;
 		}
 		memcpy(&id, input + (selector == kB2LSurfaceSetBulkAttachments ? 0x98 : 0), 4);
@@ -1172,6 +1231,8 @@ IOSurfaceRootUserClient::metadata(uint32_t selector, IOExternalMethodArguments *
 		ret = b2l_surface_set_values(s, array, args); break;
 	case kB2LSurfaceCopyValues:
 		ret = b2l_surface_copy_values(s, args); break;
+	case kB2LSurfaceRemoveValue:
+		ret = b2l_surface_remove_value(s, (const char *)input + 12, args); break;
 	default: ret = kIOReturnUnsupported; break;
 	}
 	IOLockUnlock(b2l_surface_lock);
