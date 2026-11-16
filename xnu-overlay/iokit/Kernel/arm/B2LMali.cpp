@@ -1195,8 +1195,7 @@ B2LMali::acpmStart()
 	}
 	acpmReady = true;
 	pmicReady = b2l_acpm_open(&acpm, B2L_ACPM_CHANNEL_PMIC, &acpmPmic) != 0;
-	b2l_diag_record("B2L ACPM: PMIC channel %u %s (len=%u elem=%u)
-", B2L_ACPM_CHANNEL_PMIC,
+	b2l_diag_record("B2L ACPM: PMIC channel %u %s (len=%u elem=%u)\n", B2L_ACPM_CHANNEL_PMIC,
 	    pmicReady ? "open" : "not usable", acpmPmic.len, acpmPmic.elem);
 
 	thread_t thread;
@@ -2331,8 +2330,7 @@ B2LMali::pmicPowerOffPrepare()
 	int r2 = pmicCall(B2L_PMIC_FUNC_UPDATE, B2L_PMIC_TYPE_RTC, B2L_PMIC_RTC_CAPSEL, 0, B2L_PMIC_SUB_SMPL_EN, NULL);
 	int r3 = pmicCall(B2L_PMIC_FUNC_READ, B2L_PMIC_TYPE_RTC, B2L_PMIC_RTC_WTSR_SMPL, 0, 0, &after);
 	int r4 = pmicCall(B2L_PMIC_FUNC_READ, B2L_PMIC_TYPE_RTC, B2L_PMIC_RTC_CAPSEL, 0, 0, &capsel);
-	b2l_diag_record("B2L POWER: PMIC WTSR/SMPL 0x%02x -> 0x%02x, CAPSEL 0x%02x (replies %d %d %d %d %d)
-",
+	b2l_diag_record("B2L POWER: PMIC WTSR/SMPL 0x%02x -> 0x%02x, CAPSEL 0x%02x (replies %d %d %d %d %d)\n",
 	    before, after, capsel, r0, r1, r2, r3, r4);
 }
 
