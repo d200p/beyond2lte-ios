@@ -685,6 +685,20 @@ b2l_fb_display_power(int on)
 	thread_call_enter(fb->fBlankCall);
 }
 
+/* 2026-11-16: the panel off now, from the power-off path (B2LPower.cpp), which
+ * may not sleep: display off and sleep in over DSI, whose waits are IODelay.
+ * Returns the DCS writes that went out (6 when all did). */
+extern "C" unsigned
+b2l_fb_panel_off_now(void)
+{
+	AppleCLCD *fb = gB2LCLCD;
+	/* Already off (a low-battery shutdown in standby): the DSI link may be
+	 * idle, so nothing is written to it. */
+	if (__atomic_exchange_n(&gB2LDisplayOff, 1, __ATOMIC_ACQ_REL) || fb == NULL) return 0;
+	__atomic_store_n(&fb->fBlankWanted, 1, __ATOMIC_RELEASE);
+	return fb->panelOff();
+}
+
 void
 AppleCLCD::blankWorker(thread_call_param_t owner, thread_call_param_t unused __unused)
 {

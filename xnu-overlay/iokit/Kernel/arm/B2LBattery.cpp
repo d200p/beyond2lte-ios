@@ -97,6 +97,10 @@ class B2LBattery : public IOService {
 	unsigned failures, logs, transferLogs, keepAliveLogs;
 	struct b2l_battery_state last;
 	bool published, keepAlive;
+public:
+	volatile bool halting;          /* the power-off path owns the bus: the poll stands down */
+	void haltKick();
+private:
 
 	uint32_t r(unsigned off) { uint32_t v = *(volatile uint32_t *)(i2c + off); __asm__ volatile("dmb oshld" ::: "memory"); return v; }
 	void w(unsigned off, uint32_t v) { *(volatile uint32_t *)(i2c + off) = v; __asm__ volatile("dsb oshst" ::: "memory"); }
@@ -303,8 +307,45 @@ B2LBattery::sample()
 void
 B2LBattery::poll(OSObject *owner, IOTimerEventSource *sender)
 {
+	if (((B2LBattery *)owner)->halting) {
+		return;                 /* powered off on a charger: B2LPower kicks the charger */
+	}
 	((B2LBattery *)owner)->sample();
 	sender->setTimeoutMS(B2L_BAT_POLL_MS);
+}
+
+/*
+ * 2026-11-16: "off" while a charger keeps the phone powered (B2LPower.cpp):
+ * the MAX77705 stops charging when its watchdog is not kicked, so the
+ * power-off path kicks it, and restores charging if it had expired, the
+ * poll's own way. Polled I2C only (IODelay), no sleeping.
+ */
+static B2LBattery *gB2LBatteryForHalt;
+
+void
+B2LBattery::haltKick()
+{
+	uint8_t c[3];
+	if (i2c != NULL && readRegs(B2L_CHG_ADDR, B2L_CHG_INT_OK, c, 3)) {
+		chargerKeepAlive(c[0], c[2]);
+	}
+}
+
+/* Stops the poll; the caller waits out a transfer in flight before the kicks. */
+extern "C" void
+b2l_battery_halt_begin(void)
+{
+	if (gB2LBatteryForHalt != NULL) {
+		gB2LBatteryForHalt->halting = true;
+	}
+}
+
+extern "C" void
+b2l_battery_halt_kick(void)
+{
+	if (gB2LBatteryForHalt != NULL && gB2LBatteryForHalt->halting) {
+		gB2LBatteryForHalt->haltKick();
+	}
 }
 
 bool
@@ -330,6 +371,7 @@ B2LBattery::start(IOService *provider)
 	loop = IOWorkLoop::workLoop();
 	timer = IOTimerEventSource::timerEventSource(this, &B2LBattery::poll);
 	if (!loop || !timer || loop->addEventSource(timer) != kIOReturnSuccess) return false;
+	if (keepAlive) gB2LBatteryForHalt = this;
 	timer->setTimeoutMS(1);
 	return true;
 }

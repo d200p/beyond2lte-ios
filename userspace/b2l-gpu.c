@@ -32,6 +32,7 @@
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <time.h>
 #include "b2l_flush_rect.h"
 #include "b2l_mali_draw.h"
 #include "b2l_mali_uapi.h"
@@ -2484,6 +2485,266 @@ b2l_ca_context(void *server)
 	return ctx != NULL ? ctx : sw_new_context_function(NULL, NULL, 0);
 }
 
+/*
+ * 2026-11-16: where Core Animation's render threads spend their time, to aim
+ * the speed work. A thread samples "com.apple.coreanimation.display.primary"
+ * and "...render-server" PROF_HZ times a second (thread_info for the run
+ * state, thread_get_state for the PC; the kernel stops the thread for the
+ * read) and every PROF_PERIOD_S logs: running samples per image (Mesa,
+ * QuartzCore, libsystem...), what the waiting ones wait in (mach_msg2_trap is
+ * idle, __ioctl the GPU, __psynch_* a lock), and the busiest 64-byte code
+ * ranges as image+offset, to symbolise offline (Mesa's nm list, the shared
+ * cache's symbols). Diagnostics only: B2L_PROFILE=0 builds without it.
+ */
+#ifndef B2L_PROFILE
+#define B2L_PROFILE 1
+#endif
+#define PROF_HZ          200
+#define PROF_PERIOD_S    15
+#define PROF_SLOTS       4096           /* power of two */
+#define PROF_THREADS     4
+#define PROF_TOP         24
+#define PROF_WAITS       12
+#define PROF_IMAGES      16
+
+struct prof_slot { uint64_t key; uint32_t count; };
+static struct prof_slot prof_slots[PROF_SLOTS];
+static struct { const char *name; uint32_t count; } prof_waits[PROF_WAITS];
+static uint32_t prof_dropped;
+
+static void
+prof_add(uint64_t pc)
+{
+	uint64_t key = pc >> 6;
+	uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 40) & (PROF_SLOTS - 1);
+	for (unsigned i = 0; i < PROF_SLOTS; i++, h = (h + 1) & (PROF_SLOTS - 1)) {
+		if (prof_slots[h].key == key) {
+			prof_slots[h].count++;
+			return;
+		}
+		if (prof_slots[h].key == 0) {
+			prof_slots[h].key = key;
+			prof_slots[h].count = 1;
+			return;
+		}
+	}
+	prof_dropped++;
+}
+
+static void
+prof_wait(uint64_t pc)
+{
+	Dl_info info;
+	const char *name = dladdr((void *)(uintptr_t)pc, &info) && info.dli_sname ? info.dli_sname : "?";
+	for (unsigned i = 0; i < PROF_WAITS; i++) {
+		if (prof_waits[i].name == name || prof_waits[i].name == NULL) {
+			prof_waits[i].name = name;
+			prof_waits[i].count++;
+			return;
+		}
+	}
+	prof_dropped++;
+}
+
+static const char *
+prof_base_name(const char *path)
+{
+	const char *slash = path ? strrchr(path, '/') : NULL;
+	return slash ? slash + 1 : path ? path : "?";
+}
+
+static unsigned
+prof_find_threads(thread_act_t *out, int *kinds)
+{
+	thread_act_array_t list = NULL;
+	mach_msg_type_number_t n = 0;
+	unsigned found = 0;
+	if (task_threads(mach_task_self(), &list, &n) != KERN_SUCCESS) {
+		return 0;
+	}
+	for (mach_msg_type_number_t i = 0; i < n; i++) {
+		char name[96] = "";
+		pthread_t p = pthread_from_mach_thread_np(list[i]);
+		if (p != NULL) {
+			pthread_getname_np(p, name, sizeof(name));
+		}
+		int kind = strstr(name, "coreanimation.display.primary") ? 0 :
+		    strstr(name, "coreanimation.render-server") ? 1 : -1;
+		if (kind >= 0 && found < PROF_THREADS) {
+			kinds[found] = kind;
+			out[found++] = list[i];
+		} else {
+			mach_port_deallocate(mach_task_self(), list[i]);
+		}
+	}
+	vm_deallocate(mach_task_self(), (vm_address_t)list, n * sizeof(*list));
+	return found;
+}
+
+/* 1 with the user PC and whether the thread was running. */
+static int
+prof_sample(thread_act_t thread, uint64_t *pc, int *running)
+{
+	thread_basic_info_data_t info;
+	mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
+	if (thread_info(thread, THREAD_BASIC_INFO, (thread_info_t)&info, &count) != KERN_SUCCESS) {
+		return 0;
+	}
+	arm_thread_state64_t state;
+	mach_msg_type_number_t state_count = ARM_THREAD_STATE64_COUNT;
+	if (thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&state, &state_count) != KERN_SUCCESS) {
+		return 0;
+	}
+#if __DARWIN_OPAQUE_ARM_THREAD_STATE64
+	*pc = (uint64_t)(uintptr_t)state.__opaque_pc;
+#else
+	*pc = state.__pc;
+#endif
+	*pc &= 0x00007fffffffffffull;   /* drop any pointer signature */
+	*running = info.run_state == TH_STATE_RUNNING;
+	return *pc != 0;
+}
+
+/* Appends to a log line; flushes it first when full. */
+static void
+prof_put(char *line, size_t size, size_t *used, const char *head, const char *format, ...)
+{
+	char item[96];
+	va_list ap;
+	va_start(ap, format);
+	int n = vsnprintf(item, sizeof(item), format, ap);
+	va_end(ap);
+	if (n <= 0) {
+		return;
+	}
+	if (*used + (size_t)n >= size) {
+		log_line("%s", line);
+		*used = (size_t)snprintf(line, size, "%s", head);
+	}
+	*used += (size_t)snprintf(line + *used, size - *used, "%s", item);
+}
+
+static void
+prof_report(unsigned samples, unsigned running, const unsigned *per_kind, unsigned threads)
+{
+	char line[240];
+	size_t used;
+	/* Running samples per image. */
+	struct { const char *name; uint32_t count; } images[PROF_IMAGES];
+	unsigned image_count = 0, other = 0;
+	for (unsigned s = 0; s < PROF_SLOTS; s++) {
+		if (prof_slots[s].count == 0) {
+			continue;
+		}
+		Dl_info info;
+		const char *name = dladdr((void *)(uintptr_t)(prof_slots[s].key << 6), &info) ?
+		    prof_base_name(info.dli_fname) : "?";
+		unsigned i;
+		for (i = 0; i < image_count && images[i].name != name; i++) {
+		}
+		if (i == image_count && image_count < PROF_IMAGES) {
+			images[image_count].name = name;
+			images[image_count++].count = 0;
+		}
+		if (i < image_count) {
+			images[i].count += prof_slots[s].count;
+		} else {
+			other += prof_slots[s].count;
+		}
+	}
+	used = (size_t)snprintf(line, sizeof(line), "prof: %u s, %u threads, %u samples, running %u (display %u, "
+	    "render-server %u), dropped %u:", PROF_PERIOD_S, threads, samples, running, per_kind[0], per_kind[1],
+	    prof_dropped);
+	for (unsigned k = 0; k < image_count; k++) {
+		unsigned best = k;
+		for (unsigned j = k + 1; j < image_count; j++) {
+			best = images[j].count > images[best].count ? j : best;
+		}
+		__typeof__(images[0]) t = images[k];
+		images[k] = images[best];
+		images[best] = t;
+		prof_put(line, sizeof(line), &used, "prof: images:", " %s %u.%u%%", images[k].name,
+		    running ? images[k].count * 100 / running : 0, running ? images[k].count * 1000 / running % 10 : 0);
+	}
+	if (other) {
+		prof_put(line, sizeof(line), &used, "prof: images:", " other %u", other);
+	}
+	log_line("%s", line);
+	/* What the waiting samples wait in. */
+	used = (size_t)snprintf(line, sizeof(line), "prof: waiting %u:", samples - running);
+	for (unsigned i = 0; i < PROF_WAITS && prof_waits[i].name != NULL; i++) {
+		prof_put(line, sizeof(line), &used, "prof: waiting:", " %s %u", prof_waits[i].name, prof_waits[i].count);
+	}
+	log_line("%s", line);
+	/* The busiest 64-byte ranges. */
+	used = (size_t)snprintf(line, sizeof(line), "prof: top:");
+	for (unsigned k = 0; k < PROF_TOP; k++) {
+		unsigned best = PROF_SLOTS;
+		for (unsigned s = 0; s < PROF_SLOTS; s++) {
+			if (prof_slots[s].count != 0 && (best == PROF_SLOTS || prof_slots[s].count > prof_slots[best].count)) {
+				best = s;
+			}
+		}
+		if (best == PROF_SLOTS) {
+			break;
+		}
+		uint64_t pc = prof_slots[best].key << 6;
+		Dl_info info;
+		if (dladdr((void *)(uintptr_t)pc, &info) && info.dli_fbase != NULL) {
+			prof_put(line, sizeof(line), &used, "prof: top:", " %s+0x%llx %u", prof_base_name(info.dli_fname),
+			    (unsigned long long)(pc - (uint64_t)(uintptr_t)info.dli_fbase), prof_slots[best].count);
+		} else {
+			prof_put(line, sizeof(line), &used, "prof: top:", " 0x%llx %u", (unsigned long long)pc,
+			    prof_slots[best].count);
+		}
+		prof_slots[best].count = 0;     /* taken; the table is cleared below */
+	}
+	log_line("%s", line);
+	memset(prof_slots, 0, sizeof(prof_slots));
+	memset(prof_waits, 0, sizeof(prof_waits));
+	prof_dropped = 0;
+}
+
+static void *
+profile_thread(void *unused)
+{
+	(void)unused;
+	pthread_setname_np("b2l.profile");
+	sleep(20);                      /* past Core Animation's start */
+	for (;;) {
+		thread_act_t threads[PROF_THREADS];
+		int kinds[PROF_THREADS];
+		unsigned count = prof_find_threads(threads, kinds);
+		unsigned samples = 0, running = 0, per_kind[2] = { 0, 0 };
+		uint64_t until = time(NULL) + PROF_PERIOD_S;
+		while ((uint64_t)time(NULL) < until) {
+			for (unsigned i = 0; i < count; i++) {
+				uint64_t pc;
+				int is_running;
+				if (!prof_sample(threads[i], &pc, &is_running)) {
+					continue;
+				}
+				samples++;
+				if (is_running) {
+					running++;
+					per_kind[kinds[i]]++;
+					prof_add(pc);
+				} else {
+					prof_wait(pc);
+				}
+			}
+			usleep(1000000 / PROF_HZ);
+		}
+		for (unsigned i = 0; i < count; i++) {
+			mach_port_deallocate(mach_task_self(), threads[i]);
+		}
+		if (count != 0) {
+			prof_report(samples, running, per_kind, count);
+		}
+	}
+	return NULL;
+}
+
 static void *
 start_thread(void *unused)
 {
@@ -2497,6 +2758,14 @@ start_thread(void *unused)
 	log_line("library running in pid %d uid %d", getpid(), (int)getuid());
 	log_line("gles: %s", gles_install_note);
 	log_line("gles: GPU paths: %s", gles_paths_note);
+	if (B2L_PROFILE) {
+		pthread_t profiler;
+		pthread_attr_t attributes;
+		pthread_attr_init(&attributes);
+		pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+		pthread_create(&profiler, &attributes, profile_thread, NULL);
+		pthread_attr_destroy(&attributes);
+	}
 	keyboard_dictation_languages();
 	keyboard_dictation_off();
 	if (!B2L_GPU_HOOKS) {

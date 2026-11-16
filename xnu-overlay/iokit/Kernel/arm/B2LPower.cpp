@@ -20,6 +20,13 @@ extern "C" void b2l_power_request_recovery(void);
 #define B2L_POWER_KEY_OFFSET   0x44            /* as B2LInput: low while pressed */
 #define B2L_POWER_KEY_MASK     (1u << 4)
 #define B2L_POWER_LOG_DRAIN_US 6000000         /* the persistent log drains every 5 s at most */
+#define B2L_POWER_STEP_MS      100             /* "off" on a charger: power key poll */
+#define B2L_POWER_KICK_MS      10000           /* and charger watchdog kick */
+#define B2L_POWER_ON_HOLD_MS   1000            /* power key held this long starts the phone */
+
+extern "C" unsigned b2l_fb_panel_off_now(void);
+extern "C" void b2l_battery_halt_begin(void);
+extern "C" void b2l_battery_halt_kick(void);
 
 static volatile uint8_t *b2l_power_pmu, *b2l_power_gpio;
 static volatile bool b2l_power_to_recovery;
@@ -71,9 +78,33 @@ b2l_power_halt_restart(unsigned int type)
 	    (recovery ? "restarting into recovery" : "restarting"));
 	IODelay(B2L_POWER_LOG_DRAIN_US);
 	if (type == kPEHaltCPU) {
+		unsigned panel = b2l_fb_panel_off_now();
 		b2l_power_off(&b2l_power_ops);
-		b2l_diag_record("B2L POWER: still on after PS_HOLD, restarting\n");
+		/*
+		 * 2026-11-16: still powered, which a charger does (the phone is
+		 * usually on USB). This used to restart, so iOS came straight back.
+		 * Stay off instead, as a phone switched off on a charger: panel
+		 * asleep, CPUs idle, the charger's watchdog kicked so it keeps
+		 * charging; a 1 s press of the power key starts the phone.
+		 * PS_HOLD is already low, so unplugging the charger cuts power.
+		 */
+		b2l_diag_record("B2L POWER: still powered after PS_HOLD (charger), panel off (%u DCS writes), "
+		    "staying off; hold the power key to start\n", panel);
 		IODelay(B2L_POWER_LOG_DRAIN_US);
+		b2l_battery_halt_begin();
+		IODelay(200000);        /* a battery poll's I2C transfer in flight ends */
+		uint32_t held = 0;
+		for (uint32_t ms = 0;; ms += B2L_POWER_STEP_MS) {
+			if (ms % B2L_POWER_KICK_MS == 0) {
+				b2l_battery_halt_kick();
+			}
+			held = power_key_down(NULL) ? held + B2L_POWER_STEP_MS : 0;
+			if (held >= B2L_POWER_ON_HOLD_MS) {
+				break;
+			}
+			IODelay(B2L_POWER_STEP_MS * 1000);
+		}
+		recovery = false;
 	}
 	b2l_power_restart(&b2l_power_ops, recovery);
 	for (;;) {

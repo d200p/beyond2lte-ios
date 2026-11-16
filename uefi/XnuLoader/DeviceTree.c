@@ -79,8 +79,19 @@ int b2l_build_device_tree(void *buffer, b2l_size capacity,
     prop(&w, &chosen, "random-seed", c->random_seed, sizeof(c->random_seed));
     if(c->has_wifi_mac)
         prop(&w, &chosen, "mac-address-wifi0", c->wifi_mac, B2L_WIFI_MAC_BYTES);
-    prop(&w, &chosen, "dram-base", &c->memory_base, 8);
-    prop(&w, &chosen, "dram-size", &c->memory_size, 8);
+    /* dram-base/size span every owned RAM range (sorted, validated above), not
+     * just the primary arena: XNU's pmap maps a write-combined page as Normal
+     * Non-cacheable only when is_dram_addr() (this span) holds, else as Device
+     * GRE, which faults on unaligned access and DC ZVA and is slow to write.
+     * The GPU's buffer objects are write-combined pages from any range. The
+     * span's holes are no MMIO on this SoC (devices sit below 0x80000000). */
+    b2l_u64 dram_base = c->memory_base, dram_size = c->memory_size;
+    if (c->ram_count) {
+        dram_base = c->ram[0].base;
+        dram_size = c->ram[c->ram_count - 1].base + c->ram[c->ram_count - 1].size - dram_base;
+    }
+    prop(&w, &chosen, "dram-base", &dram_base, 8);
+    prop(&w, &chosen, "dram-size", &dram_size, 8);
     if(c->ram_count)prop(&w,&chosen,"b2l,owned-ram-v1",c->ram,c->ram_count*sizeof(c->ram[0]));
     prop(&w, &chosen, "debug-enabled", &one, 4);
     text_prop(&w, &chosen, "crypto-hash-method", "sha2-384");

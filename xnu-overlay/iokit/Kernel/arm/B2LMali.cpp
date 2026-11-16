@@ -59,14 +59,20 @@ extern "C" void b2l_cpu_load_sample(uint64_t *busy, uint64_t *idle);
  * clusters sat at their boot rates, and every burst of a daemon boosted them.
  * These are entries of the validated FVMAP tables of earlier boots (A55 130..
  * 2106, A75 377..2400, M4 520..3016 MHz).
+ *
+ * 2026-11-16: lower still (were 650, 650, 728 MHz). Boot 53's table: A55 130
+ * 182 247 351 442 546 650..., A75 377 507 650..., M4 520 624 728... The middle
+ * and big clusters go to their lowest entries; the little one, which carries
+ * the daemons' standby work, to 442. Load still lifts all three to their boot
+ * rates while the display is off.
  */
 static const struct {
 	const char *name;
 	uint32_t domain, boot_khz, boost_khz, standby_khz;
 } b2l_cpu_clusters[] = {
-	{ "cl0", B2L_DVFS_CPUCL0, 1053000, 1586000, 650000 },
-	{ "cl1", B2L_DVFS_CPUCL1, 1222000, 2002000, 650000 },
-	{ "cl2", B2L_DVFS_CPUCL2, 1378000, 2080000, 728000 },
+	{ "cl0", B2L_DVFS_CPUCL0, 1053000, 1586000, 442000 },
+	{ "cl1", B2L_DVFS_CPUCL1, 1222000, 2002000, 377000 },
+	{ "cl2", B2L_DVFS_CPUCL2, 1378000, 2080000, 520000 },
 };
 extern "C" int b2l_fb_display_is_off(void);
 #define B2L_CPU_CLUSTERS (sizeof(b2l_cpu_clusters) / sizeof(b2l_cpu_clusters[0]))
@@ -75,6 +81,7 @@ static const uint32_t b2l_big_steps[] = { 2080000, 1820000, 1560000, 1378000 };
 #define B2L_BIG_STEPS (sizeof(b2l_big_steps) / sizeof(b2l_big_steps[0]))
 
 extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
+extern "C" uint64_t gDramBase, gDramSize;      /* osfmk/arm/arm_init.c, from /chosen dram-base/size */
 extern "C" int proc_selfpid(void);
 extern "C" int get_preemption_level(void);
 extern "C" ppnum_t pmap_find_phys(pmap_t map, addr64_t va);
@@ -153,7 +160,7 @@ extern "C" pmap_t get_task_pmap(task_t task);
 #define B2L_CPU_BIG_FIRST_C    80              /* the big sensor: that cluster steps down from here */
 #define B2L_CPU_BIG_PER_C      4               /* and one more step for each of these */
 #define B2L_MIF_KHZ            2093000         /* Android's boot memory clock; 0 leaves it */
-#define B2L_MIF_STANDBY_KHZ    546000          /* display off (MIF table 421..2093 MHz) */
+#define B2L_MIF_STANDBY_KHZ    421000          /* display off: the MIF table's lowest (421..2093 MHz; was 546) */
 /* S10: on again (build 41). Builds 36-40 kept the memory clock up while the
  * panel slept and the stripes stayed: they were S-Boot's self mask losing its
  * SRAM in panel sleep (see B2LFramebuffer.cpp), not this switch. The clock
@@ -282,6 +289,7 @@ private:
 	uint64_t *boPages;              /* one bit per 4 KiB page of the BO range */
 	uint64_t boBytes, boJobs, boFaults;
 	uint64_t boRunNS, boCleanBeforeNS, boCleanAfterNS, boCleanBytes, boCleanSkips, powerUps, powerUpNS;
+	uint64_t boPagesTotal, boPagesDevice;   /* BO pages created; those outside the DRAM span */
 	unsigned clients;
 	bool drawOpen;
 	void readProps();
@@ -1747,6 +1755,12 @@ B2LMali::boCreate(void *owner, uint64_t bytes, uint64_t flags, uint64_t *handle,
 		addr64_t pa = memory->getPhysicalSegment(off, &length, kIOMemoryMapperNone);
 		if (pa) {
 			flush_dcache64(pa, 4096, TRUE);
+			/* Diagnostics: XNU maps a write-combined page outside /chosen's
+			 * dram span as Device GRE (slow stores, no unaligned access). */
+			boPagesTotal++;
+			if (pa < gDramBase || pa >= gDramBase + gDramSize) {
+				boPagesDevice++;
+			}
 		}
 	}
 	if (!mapMemory(memory, base, resident, exec)) {
@@ -2007,6 +2021,10 @@ B2LMali::jobSubmit(uint64_t jc, uint64_t requirements, uint64_t *out)
 		    " (%llu MB, %llu skipped unchanged), %u surfaces imported, %llu power-ups (%llu ms)\n", boJobs,
 		    boRunNS / 1000000, boCleanBeforeNS / 1000000, boCleanAfterNS / 1000000, boCleanBytes >> 20, boCleanSkips,
 		    boSurfaces, powerUps, powerUpNS / 1000000);
+		if (boJobs % 5000 == 0) {
+			b2l_diag_record("B2L GPU BO: pages outside the DRAM span (Device GRE when write-combined) %llu of %llu,"
+			    " dram 0x%llx + 0x%llx\n", boPagesDevice, boPagesTotal, gDramBase, gDramSize);
+		}
 		boRunNS = boCleanBeforeNS = boCleanAfterNS = boCleanBytes = boCleanSkips = powerUps = powerUpNS = 0;
 	}
 	if (status != B2L_MALI_STATUS_DONE) {

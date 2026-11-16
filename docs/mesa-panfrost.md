@@ -416,6 +416,22 @@ the filter is made, and the layers' region-of-interest code still treats
 them as glass. That patch is undone; the lock screen time had no fair test
 in boot 60 (the GPU drew almost nothing).
 
+Speed (2026-11-16, not yet on the phone). The logs put the cost on the CPU
+inside Mesa (about 140 us per `draw_elements`), not on the GPU (60-100 ms per
+500 jobs, waits included). Mesa writes descriptors, uniforms and client
+arrays into write-combined buffer objects for every draw, and XNU maps a
+write-combined page as Normal Non-cacheable only when `is_dram_addr()`
+holds for it, which tests `/chosen`'s `dram-base`/`dram-size`; the loader
+gave only the primary arena there while the pages come from every owned
+range (patch 0055), so most BO pages were Device GRE: the unaligned-access
+and DC ZVA faults met earlier, and slow stores. The loader now gives the
+span of all owned ranges. B2LMali counts BO pages outside the span (a line
+every 5000 jobs), and b2l-gpu.c profiles Core Animation's display and
+render-server threads (200 samples a second, a summary every 15 s: share per
+image, what the waiting samples wait in, the busiest code ranges as
+image+offset) to aim the next changes. Not done yet: Mesa's shader cache
+(off in the build and at start), asynchronous job submission.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
