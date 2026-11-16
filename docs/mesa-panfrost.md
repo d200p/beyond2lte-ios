@@ -432,6 +432,22 @@ image, what the waiting samples wait in, the busiest code ranges as
 image+offset) to aim the next changes. Not done yet: Mesa's shader cache
 (off in the build and at start), asynchronous job submission.
 
+Draws with no program (2026-11-16, not yet on the phone). HakiOS, the
+iOS 16.5 port, found that Core Animation's OpenGL ES renderer, where it has
+no shader for one of its functions, still draws with `glUseProgram(0)`,
+which in OpenGL ES draws nothing: on iOS 16.5 the lock screen's wallpaper
+and clock and the home indicator went that way. iOS 26's GLContext refuses
+more functions (all kinds above 0x39 but 0x78), so the lock screen time,
+Control Center's glyphs, Settings' icons and the status bar's airplane may
+be such draws. `b2l_eagl.c` now owns `draw_arrays` and
+`uniform_matrix4fv_ARB` besides `draw_elements`: a draw with no program and
+a texture on unit 0 that it does not also draw into is made with HakiOS's
+plain program (Core Animation's arrays, the matrix read where Core Animation
+keeps it, colour times the texture at pixel coordinates), or with its
+home-indicator table program when unit 1 holds a one-row table. Each such
+draw is counted by Core Animation's function (shader kind byte, read from
+the GLESContext b2l-gpu.c hands over) in a census every 10 s.
+
 ## Why
 
 Core Animation in iOS 26 still contains its OpenGL ES renderer
@@ -485,3 +501,6 @@ Mesa: MIT (kept with its notices). The libdrm interface in
 `scripts/mesa/include/xf86drm.h` is newly written from libdrm's public API.
 ios-sailfish has no clear licence: its approach is followed, no code is
 copied.
+The draws-with-no-program handling in `b2l_eagl.c` (its two fragment
+shaders and the approach) is adapted from HakiOS
+(github.com/oosexgang/hackios-xnu-kernel, `userland/src/eagl.c`), MIT.
