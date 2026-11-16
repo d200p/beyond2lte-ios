@@ -19,6 +19,12 @@ extern "C" void b2l_hid_key(int,int);
 extern "C" void b2l_power_request_recovery(void);
 extern "C" void b2l_hid_touch(int,int,int,int);
 extern "C" void b2l_native_cache_input_activity(void);
+extern "C" int b2l_fb_display_is_off(void);
+/* Boot 62: with the display off the touch reads went on, 50 a second at about
+ * 2 ms of polled bus each (9 % of a core), through 4.4 h of standby that cost 52 %
+ * of the battery. Display off: no touch reads, the keys every 100 ms. */
+#define B2L_INPUT_POLL_MS      20
+#define B2L_INPUT_STANDBY_MS   100
 class B2LInput : public IOService {
     OSDeclareDefaultStructors(B2LInput);
     IOMemoryDescriptor *gpioDesc,*i2cDesc;
@@ -26,7 +32,7 @@ class B2LInput : public IOService {
     IOWorkLoop *loop;
     IOTimerEventSource *timer;
     volatile uint8_t *gpio,*i2c;
-    bool stable[4],candidate[4],touch;
+    bool stable[4],candidate[4],touch,touchResting;
     unsigned debounce[4],failures,keyLogs,transferLogs,timeoutUS;
     unsigned initAttempts;
     bool initPending;
@@ -190,7 +196,12 @@ void B2LInput::poll(OSObject *owner,IOTimerEventSource *sender){
         else if(begin-s->chordStart>=3000000)b2l_power_request_recovery();
     }else s->chordStart=0;
     if(s->initPending && begin>=s->nextInitUS)s->initializeTouch();
-    if(s->touch){
+    bool displayOff=b2l_fb_display_is_off()!=0;
+    if(displayOff && !s->touchResting){
+        s->touchResting=true;
+        b2l_hid_touch(0,0,s->pointer.X,s->pointer.Y);   /* no finger left down while the reads stop */
+    }else if(!displayOff)s->touchResting=false;
+    if(s->touch && !displayOff){
         /* Same bounded READ_ONE / READ_ALL sequence as B2LTouchDxe. Read
          * up to 32 FIFO records per tick instead of four individual commands.
          * Deliver the first event before the bulk read so a failed bulk read
@@ -238,7 +249,7 @@ void B2LInput::poll(OSObject *owner,IOTimerEventSource *sender){
             s->maxTransferUS,s->transferTimeUS,s->touch,s->initAttempts,s->initPending);
         s->maxPending=0;s->maxPollGapUS=0;s->maxPollWorkUS=0;s->maxTransferUS=0;
     }
-    sender->setTimeoutMS(20);
+    sender->setTimeoutMS(displayOff?B2L_INPUT_STANDBY_MS:B2L_INPUT_POLL_MS);
 }
 void B2LInput::stop(IOService *p){if(timer)timer->cancelTimeout();if(i2c)quiesce();IOService::stop(p);}
 void B2LInput::free(){

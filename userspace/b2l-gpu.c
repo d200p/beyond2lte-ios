@@ -2691,8 +2691,11 @@ prof_report(unsigned samples, unsigned running, const unsigned *per_kind, unsign
 		uint64_t pc = prof_slots[best].key << 6;
 		Dl_info info;
 		if (dladdr((void *)(uintptr_t)pc, &info) && info.dli_fbase != NULL) {
-			prof_put(line, sizeof(line), &used, "prof: top:", " %s+0x%llx %u", prof_base_name(info.dli_fname),
-			    (unsigned long long)(pc - (uint64_t)(uintptr_t)info.dli_fbase), prof_slots[best].count);
+			/* the exported name dladdr finds: right for libsystem's call stubs,
+			 * only a neighbour inside Mesa (its own symbols are hidden) */
+			prof_put(line, sizeof(line), &used, "prof: top:", " %s+0x%llx(%.40s) %u",
+			    prof_base_name(info.dli_fname), (unsigned long long)(pc - (uint64_t)(uintptr_t)info.dli_fbase),
+			    info.dli_sname ? info.dli_sname : "?", prof_slots[best].count);
 		} else {
 			prof_put(line, sizeof(line), &used, "prof: top:", " 0x%llx %u", (unsigned long long)pc,
 			    prof_slots[best].count);

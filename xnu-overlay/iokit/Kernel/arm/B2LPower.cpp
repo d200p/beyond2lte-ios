@@ -25,6 +25,7 @@ extern "C" void b2l_power_request_recovery(void);
 #define B2L_POWER_ON_HOLD_MS   1000            /* power key held this long starts the phone */
 
 extern "C" unsigned b2l_fb_panel_off_now(void);
+extern "C" void b2l_pmic_power_off_prepare(void);
 extern "C" void b2l_battery_halt_begin(void);
 extern "C" void b2l_battery_halt_kick(void);
 
@@ -74,11 +75,17 @@ b2l_power_halt_restart(unsigned int type)
 		return false;
 	}
 	bool recovery = b2l_power_to_recovery;
+	/* Off: the panel goes dark at once, not after the log has drained. */
+	unsigned panel = type == kPEHaltCPU ? b2l_fb_panel_off_now() : 0;
 	b2l_diag_record("B2L POWER: %s\n", type == kPEHaltCPU ? "powering off" :
 	    (recovery ? "restarting into recovery" : "restarting"));
+	if (type == kPEHaltCPU) {
+		/* The PMIC must not start the phone again by itself (B2LMali.cpp,
+		 * pmicPowerOffPrepare); both lines are let drain, power may go next. */
+		b2l_pmic_power_off_prepare();
+	}
 	IODelay(B2L_POWER_LOG_DRAIN_US);
 	if (type == kPEHaltCPU) {
-		unsigned panel = b2l_fb_panel_off_now();
 		b2l_power_off(&b2l_power_ops);
 		/*
 		 * 2026-11-16: still powered, which a charger does (the phone is

@@ -82,6 +82,16 @@ static const uint32_t b2l_big_steps[] = { 2080000, 1820000, 1560000, 1378000 };
 
 extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 extern "C" uint64_t gDramBase, gDramSize;      /* osfmk/arm/arm_init.c, from /chosen dram-base/size */
+#define B2L_BO_CPU_PAGE        16384ull        /* user processes' page size: BOs come in whole ones */
+#define B2L_CALL_KINDS         12              /* selectors timed by externalMethod */
+#define B2L_ACPM_CHANNEL_PMIC  2               /* DT s2mps19mfd acpm-ipc-channel */
+#define B2L_PMIC_TYPE_RTC      2               /* s2mps19_core.c I2C_ADDR_RTC */
+#define B2L_PMIC_FUNC_READ     0               /* acpm_mfd.h FUNC_* */
+#define B2L_PMIC_FUNC_UPDATE   2
+#define B2L_PMIC_RTC_WTSR_SMPL 0x01            /* rtc-s2mp.h */
+#define B2L_PMIC_RTC_CAPSEL    0x03
+#define B2L_PMIC_WTSR_SMPL_EN  0xc0            /* WTSR_EN bit 6, SMPL_EN bit 7 */
+#define B2L_PMIC_SUB_SMPL_EN   0x08            /* SUB_SMPL_EN bit 3 */
 extern "C" int proc_selfpid(void);
 extern "C" int get_preemption_level(void);
 extern "C" ppnum_t pmap_find_phys(pmap_t map, addr64_t va);
@@ -173,6 +183,8 @@ extern "C" pmap_t get_task_pmap(task_t task);
 #define B2L_CPU_LOAD_UP        15              /* percent of all CPUs: about one core busy */
 #define B2L_CPU_LOAD_DOWN      8
 #define B2L_CPU_QUIET_POLLS    12              /* 3 s under the lower mark */
+#define B2L_CPU_STANDBY_UP     30              /* display off: percent of all CPUs to lift the rates */
+#define B2L_CPU_STANDBY_DOWN   15
 #define B2L_CPU_TEMP_POLLS     8               /* polls per temperature reading */
 #define B2L_CPU_REPORT_READS   8               /* readings per log line */
 #define B2L_GPU_TEMP_EVERY_NS  2000000000ull
@@ -238,8 +250,8 @@ class B2LMali : public IOService {
 	IOMemoryMap *acpmMailbox, *acpmSram;
 	volatile uint32_t *acpmMailboxBase, *acpmSramBase;
 	struct b2l_acpm_io acpm;
-	struct b2l_acpm_channel acpmDvfs, acpmTmu;
-	bool acpmReady, tmuReady, thermalHold, clockChecked;
+	struct b2l_acpm_channel acpmDvfs, acpmTmu, acpmPmic;
+	bool acpmReady, tmuReady, thermalHold, clockChecked, pmicReady;
 	uint32_t gpuBaseKHz, gpuBoostKHz, gpuRateKHz, temperatureReads;
 	uint64_t lastTemperatureNS;
 	static uint32_t acpmRead(void *ctx, uint32_t offset);
@@ -253,6 +265,8 @@ class B2LMali : public IOService {
 	uint32_t mifKHz;                /* the last memory clock asked for, 0 unknown */
 public:
 	void displayMemory(bool on);
+	void pmicPowerOffPrepare();
+	int pmicCall(uint8_t func, uint8_t type, uint8_t reg, uint8_t value, uint8_t mask, uint8_t *read);
 private:
 	void clusterBoost();
 	void acpmStart();
@@ -290,6 +304,9 @@ private:
 	uint64_t boBytes, boJobs, boFaults;
 	uint64_t boRunNS, boCleanBeforeNS, boCleanAfterNS, boCleanBytes, boCleanSkips, powerUps, powerUpNS;
 	uint64_t boPagesTotal, boPagesDevice;   /* BO pages created; those outside the DRAM span */
+	/* Per selector (B2LMaliUserClient::externalMethod): calls, time under the lock, the
+	 * longest; and the time spent waiting for runtimeLock. Logged every 500 jobs. */
+	uint64_t callCount[B2L_CALL_KINDS], callNS[B2L_CALL_KINDS], callMaxNS[B2L_CALL_KINDS], lockWaitNS, lockWaitMaxNS;
 	unsigned clients;
 	bool drawOpen;
 	void readProps();
@@ -999,6 +1016,10 @@ B2LMali::clusterBoost()
 	}
 	memoryClock();
 	struct b2l_acpm_load load = { 0, 0 };
+	/* Boot 62: 4.4 h of standby read 16-17 % load (the touch reads and a profiler),
+	 * just over B2L_CPU_LOAD_UP, so the standby rates hardly ever held. With the
+	 * display off the lift to boot rates takes a load of its own. */
+	struct b2l_acpm_load standbyLoad = { 0, 0 };
 	unsigned bigStep = 0;
 	int holding = 0;
 	bool measured = false, wasStandby = false;
@@ -1022,6 +1043,7 @@ B2LMali::clusterBoost()
 		if (total != 0) {
 			percent = (unsigned)((nowBusy - busy) * 100 / total);
 			b2l_acpm_load_step(&load, percent, B2L_CPU_LOAD_UP, B2L_CPU_LOAD_DOWN, B2L_CPU_QUIET_POLLS);
+			b2l_acpm_load_step(&standbyLoad, percent, B2L_CPU_STANDBY_UP, B2L_CPU_STANDBY_DOWN, B2L_CPU_QUIET_POLLS);
 			busy = nowBusy;
 			idle = nowIdle;
 		}
@@ -1066,7 +1088,7 @@ B2LMali::clusterBoost()
 		for (unsigned i = 0; i < B2L_CPU_CLUSTERS; i++) {
 			uint32_t want = b2l_cpu_clusters[i].boot_khz;
 			if (standby) {
-				want = load.boosted ? b2l_cpu_clusters[i].boot_khz : b2l_cpu_clusters[i].standby_khz;
+				want = standbyLoad.boosted ? b2l_cpu_clusters[i].boot_khz : b2l_cpu_clusters[i].standby_khz;
 			} else if (enabled && load.boosted && !holding) {
 				want = i == B2L_CPU_CLUSTERS - 1 ? b2l_big_steps[bigStep] : b2l_cpu_clusters[i].boost_khz;
 			}
@@ -1172,6 +1194,10 @@ B2LMali::acpmStart()
 		gpuBoostKHz = B2L_GPU_UNGUARDED_KHZ;
 	}
 	acpmReady = true;
+	pmicReady = b2l_acpm_open(&acpm, B2L_ACPM_CHANNEL_PMIC, &acpmPmic) != 0;
+	b2l_diag_record("B2L ACPM: PMIC channel %u %s (len=%u elem=%u)
+", B2L_ACPM_CHANNEL_PMIC,
+	    pmicReady ? "open" : "not usable", acpmPmic.len, acpmPmic.elem);
 
 	thread_t thread;
 	retain();
@@ -1717,7 +1743,15 @@ B2LMali::boCreate(void *owner, uint64_t bytes, uint64_t flags, uint64_t *handle,
 	if (bos == NULL || bytes == 0 || bytes > B2L_RT_BO_LIMIT || (flags & ~known)) {
 		return kIOReturnBadArgument;
 	}
-	bytes = (bytes + 4095) & ~4095ull;
+	/*
+	 * Boot 62: backboardd died in Mesa's pan_preload_fb_part writing at
+	 * 0x12f9c0068, 0x68 past a 16 KiB boundary (an earlier crash: 0x127300068).
+	 * A process maps memory in 16 KiB pages, so a BO of 4 KiB granularity got
+	 * a CPU mapping that stopped at the last 16 KiB boundary below its end,
+	 * and Mesa's pool wrote into the unmapped tail. BOs now come in whole
+	 * 16 KiB pages (the GPU side keeps its 4 KiB pages within them).
+	 */
+	bytes = (bytes + B2L_BO_CPU_PAGE - 1) & ~(B2L_BO_CPU_PAGE - 1);
 	bool heap = (flags & B2L_MALI_BO_HEAP) != 0;
 	bool exec = !heap && !(flags & B2L_MALI_BO_NOEXEC);
 	uint64_t resident = heap && bytes > B2L_MALI_BO_HEAP_RESIDENT ? B2L_MALI_BO_HEAP_RESIDENT : bytes;
@@ -2021,6 +2055,19 @@ B2LMali::jobSubmit(uint64_t jc, uint64_t requirements, uint64_t *out)
 		    " (%llu MB, %llu skipped unchanged), %u surfaces imported, %llu power-ups (%llu ms)\n", boJobs,
 		    boRunNS / 1000000, boCleanBeforeNS / 1000000, boCleanAfterNS / 1000000, boCleanBytes >> 20, boCleanSkips,
 		    boSurfaces, powerUps, powerUpNS / 1000000);
+		/* Calls since the last line: count/total ms/longest us, per kind. */
+		b2l_diag_record("B2L GPU CALLS: create %llu/%llu/%llu free %llu/%llu/%llu import %llu/%llu/%llu"
+		    " submit %llu/%llu/%llu other %llu/%llu; lock wait %llu ms (longest %llu us)\n",
+		    callCount[kB2LMaliBoCreate], callNS[kB2LMaliBoCreate] / 1000000, callMaxNS[kB2LMaliBoCreate] / 1000,
+		    callCount[kB2LMaliBoFree], callNS[kB2LMaliBoFree] / 1000000, callMaxNS[kB2LMaliBoFree] / 1000,
+		    callCount[kB2LMaliBoImport], callNS[kB2LMaliBoImport] / 1000000, callMaxNS[kB2LMaliBoImport] / 1000,
+		    callCount[kB2LMaliJobSubmit], callNS[kB2LMaliJobSubmit] / 1000000, callMaxNS[kB2LMaliJobSubmit] / 1000,
+		    callCount[kB2LMaliInfo] + callCount[kB2LMaliProps], (callNS[kB2LMaliInfo] + callNS[kB2LMaliProps]) / 1000000,
+		    lockWaitNS / 1000000, lockWaitMaxNS / 1000);
+		bzero(callCount, sizeof(callCount));
+		bzero(callNS, sizeof(callNS));
+		bzero(callMaxNS, sizeof(callMaxNS));
+		lockWaitNS = lockWaitMaxNS = 0;
 		if (boJobs % 5000 == 0) {
 			b2l_diag_record("B2L GPU BO: pages outside the DRAM span (Device GRE when write-combined) %llu of %llu,"
 			    " dram 0x%llx + 0x%llx\n", boPagesDevice, boPagesTotal, gDramBase, gDramSize);
@@ -2250,6 +2297,54 @@ b2l_mif_for_display(int on)
 	}
 }
 
+/*
+ * 2026-11-16: switched off from iOS (no cable), boot 62 came straight back on.
+ * Samsung's S2MPS19 RTC driver clears WTSR (bit 6) and SMPL (bit 7) of RTC
+ * register 0x01 and SUB_SMPL (bit 3) of 0x03 in its shutdown callback, which
+ * the power-off path runs before PS_HOLD drops; left on, the PMIC can start
+ * the phone again. The PMIC is reached through ACPM: the device tree's
+ * s2mps19mfd has acpm-ipc-channel 2 and speedy channel 0, and acpm_mfd.c packs
+ * cmd[0] = type << 8 | reg | channel << 12 (RTC type 2) and cmd[1] = func |
+ * value << 8 | mask << 16 (read 0, update 2), the reply's status in cmd[1] bits
+ * 31:24 and a read value in bits 15:8. Polled IPC on its own channel, no lock:
+ * the power-off path may not sleep.
+ */
+int
+B2LMali::pmicCall(uint8_t func, uint8_t type, uint8_t reg, uint8_t value, uint8_t mask, uint8_t *read)
+{
+	uint32_t cmd[4] = { (uint32_t)(type & 0xf) << 8 | reg, (uint32_t)func | (uint32_t)value << 8 | (uint32_t)mask << 16, 0, 0 };
+	if (!pmicReady || !b2l_acpm_call(&acpm, &acpmPmic, cmd)) {
+		return -1;
+	}
+	if (read != NULL) {
+		*read = (uint8_t)(cmd[1] >> 8);
+	}
+	return (int)((cmd[1] >> 24) & 0xff);
+}
+
+void
+B2LMali::pmicPowerOffPrepare()
+{
+	uint8_t before = 0, after = 0, capsel = 0;
+	int r0 = pmicCall(B2L_PMIC_FUNC_READ, B2L_PMIC_TYPE_RTC, B2L_PMIC_RTC_WTSR_SMPL, 0, 0, &before);
+	int r1 = pmicCall(B2L_PMIC_FUNC_UPDATE, B2L_PMIC_TYPE_RTC, B2L_PMIC_RTC_WTSR_SMPL, 0, B2L_PMIC_WTSR_SMPL_EN, NULL);
+	int r2 = pmicCall(B2L_PMIC_FUNC_UPDATE, B2L_PMIC_TYPE_RTC, B2L_PMIC_RTC_CAPSEL, 0, B2L_PMIC_SUB_SMPL_EN, NULL);
+	int r3 = pmicCall(B2L_PMIC_FUNC_READ, B2L_PMIC_TYPE_RTC, B2L_PMIC_RTC_WTSR_SMPL, 0, 0, &after);
+	int r4 = pmicCall(B2L_PMIC_FUNC_READ, B2L_PMIC_TYPE_RTC, B2L_PMIC_RTC_CAPSEL, 0, 0, &capsel);
+	b2l_diag_record("B2L POWER: PMIC WTSR/SMPL 0x%02x -> 0x%02x, CAPSEL 0x%02x (replies %d %d %d %d %d)
+",
+	    before, after, capsel, r0, r1, r2, r3, r4);
+}
+
+extern "C" void
+b2l_pmic_power_off_prepare(void)
+{
+	B2LMali *mali = gB2LMaliPresent;
+	if (mali != NULL) {
+		mali->pmicPowerOffPrepare();
+	}
+}
+
 extern "C" int
 b2l_mali_present_scaled(uint32_t source_id, uint32_t panel_id, uint32_t width, uint32_t height, uint64_t *gpu_ns)
 {
@@ -2295,7 +2390,13 @@ B2LMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
 	}
 
 	IOReturn ret = kIOReturnUnsupported;
+	uint64_t asked = B2LMali::nowNS();
 	IOLockLock(owner->runtimeLock);
+	uint64_t locked = B2LMali::nowNS();
+	owner->lockWaitNS += locked - asked;
+	if (locked - asked > owner->lockWaitMaxNS) {
+		owner->lockWaitMaxNS = locked - asked;
+	}
 	bool draw = clientType == B2L_MALI_CLIENT_DRAW;
 	if (!opened) {
 		ret = owner->clientBegin(draw);
@@ -2394,6 +2495,14 @@ B2LMaliUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
 		break;
 	default:
 		break;
+	}
+	if (selector < B2L_CALL_KINDS) {
+		uint64_t spent = B2LMali::nowNS() - locked;
+		owner->callCount[selector]++;
+		owner->callNS[selector] += spent;
+		if (spent > owner->callMaxNS[selector]) {
+			owner->callMaxNS[selector] = spent;
+		}
 	}
 	IOLockUnlock(owner->runtimeLock);
 	return ret;
