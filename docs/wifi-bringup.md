@@ -170,11 +170,13 @@ Look for all three results: `Gen1 link up`, `Gen1 quiesce verified`, and
 
 ## Read-only endpoint identity
 
-Mode 5 repeats the verified
+`b2l_wifi_diag=5` repeats the verified
 Gen1 sequence, then reads only CFG0 words at offsets `0x00`, `0x04`, `0x08`
 and `0x2c` for bus 1/device 0/function 0. These contain vendor/device IDs,
-command/status, PCI class/revision and subsystem IDs. The physical outcome
-of this additional checkpoint is pending.
+command/status, PCI class/revision and subsystem IDs. This checkpoint completed
+on the phone: `14e4:4475`, subsystem `14e4:4375`, PCI revision 5, class
+`0x028000`, command zero, followed by verified CFG0/PHY/power cleanup and
+interactive Home.
 
 The live DT's configuration resource is `0x14ffe000`, length `0x2000`.
 Samsung splits it into 4 KiB CFG0 and CFG1 halves and uses outbound viewport
@@ -221,30 +223,198 @@ cleanup=verified`, `Gen1 quiesce verified` and `power probe restore verified`.
 Boot 28 on the S10 (beyond1lte, 2026-11-12) verified mode 5: endpoint
 `14e4:4475`, subsystem `14e4:4375`, PCI revision 5, class `0x28000`, with
 `endpoint probe end: stage=complete cleanup=verified`, `Gen1 quiesce
-verified` and `power probe restore verified`.
+verified` and `power probe restore verified`. The S10 then ran its own mode 6
+(BAR0 sized and placed at `0x14000000` through outbound ATU2, window moved to
+ChipCommon) on every boot up to build 61: chip ID `0x10054375`, BCM4375
+revision 5, capabilities `0x58400009`, as on the S10+. On 2026-11-16 the
+S10 branch took the S10+ branch's modes 6-10 below in its place (same SoC and
+chip; the S10's unassigned BAR0 `0x4` is one of the two states they accept).
 
-## BAR0 and chip ID
+## Internal chip identity
 
-`b2l_wifi_diag=6` (the userspace loader's choice from the S10 build of
-2026-11-13) runs mode 5 and, only after a verified identity with ATU1/CFG0
-still enabled, makes the first endpoint writes:
+`b2l_wifi_diag=6` follows the verified endpoint identity. It temporarily assigns
+the first BAR0 aperture and Broadcom's
+`PCI_BAR0_WIN` to read three chipcommon words: chip ID at `0x00`, capabilities
+at `0x04` and the EROM pointer at `0xfc`. This completed on the phone:
+chip ID `0x10054375` (BCM4375, revision 5, package 0, AI interconnect 1),
+capabilities `0x58400009`, EROM pointer `0x18111000`, all cleanup verified and
+interactive Home. The EROM pointer was not followed in this mode.
+There are no chip register writes, RAM mappings, core resets, firmware loads,
+interrupts or DMA clients in this checkpoint.
 
-1. Size BAR0 (write all ones, read, restore) with memory decoding off.
-2. Place BAR0 at `0x14000000`, the bottom of PCIe0's memory aperture (live
-   DT `ranges`: PCI = CPU `0x14000000`, `0xff0000` bytes); clear the upper
-   half of a 64-bit BAR.
-3. Root memory base/limit (DBI `0x20`) = `0x14001400`: forward
-   `0x14000000..0x140fffff`.
-4. Outbound ATU2, memory type, `0x14000000..0x14003fff` to PCI
-   `0x14000000`, accepted only from an inactive zero control word.
-5. Endpoint command: memory space enable only; bus mastering stays off.
-6. Move config `0x80` (Broadcom BAR0 window) to ChipCommon `0x18000000` (it was
-   `0x18003000` in boot 33) and read ChipCommon's chip ID and
-   capabilities at BAR0 `+0` and `+4`; success requires chip `0x4375`.
+Recovery's cached BAR0 is a 64 KiB, non-prefetchable 64-bit aperture at
+`0x14400000`; the separate 4 MiB RAM aperture is not used. Mode 6 maps a
+16 KiB envelope at `0x14400000`, but programs outbound ATU0 for only the first
+4 KiB, with CPU and PCI base `0x14400000` and limit `0x14400fff`. ATU0 must
+initially have zero control. Other active or invalid ATU0 state skips the
+probe. Mode 5 still programs no memory translation or endpoint register.
 
-Every step is undone before mode 5's own cleanup: command, ATU2, viewport
-back to ATU1, root window, BAR0. No DMA mapping, firmware, interrupt or
-network service. The host tests do not simulate mode 6 yet.
+The probe saves endpoint command, BAR0 low/high and vendor window. It accepts
+only I/O/memory/master command bits zero, high BAR0 zero, and low BAR0 either
+`4` (unassigned 64-bit memory) or `0x14400004` (the measured recovery address).
+It does not write a sizing pattern or access BAR2. With memory decoding still
+off it programs/checks BAR0 and PCI configuration offset `0x80` to
+`0x18000000`, the pinned Broadcom enumeration base. It then enables endpoint
+memory decoding only, preserving other command bits and writing zero to
+status W1C bits. Endpoint and root bus mastering remain disabled.
+
+The three reads share a 100 ms deadline. Before each, the probe verifies
+the memory route, CFG0 prerequisites, Gen1 x1, root command, endpoint command,
+BAR0 and vendor window. A bad chip ID or all-ones word stops further reads.
+Success requires chip ID `0x4375`; revision/package/interconnect fields are
+decoded using Broadcom's `CID_*` masks. The EROM pointer is logged but never
+followed. Neither the PCI revision nor the internal chip revision alone
+selects the board's NVRAM variant.
+
+Cleanup first disables endpoint memory decoding with checked bounded retries.
+Only after that succeeds does it restore the saved window and BAR0 words.
+It disables its owned ATU0 and returns viewport selection to CFG0, then mode 5
+performs its normal CFG0/bus/viewport cleanup. If link prerequisites fail, no
+further endpoint request is issued. Inaccessible or failed restoration is
+explicit, contributes to the overall quiescence failure result, and still
+permits PERST assertion and common PHY/power shutdown. Descriptor contents
+remain programmed while disabled. A successful chip read and successful
+cleanup are separate results.
+
+## Bounded EROM capture
+
+`b2l_wifi_diag=7` repeats the verified chipcommon reads and accepts only the
+measured ID `0x10054375` and EROM pointer
+`0x18111000`. With memory decoding off it switches `PCI_BAR0_WIN` to that
+page, verifies it, and re-enables memory decoding only. It uses the same first
+4 KiB BAR0 translation, with no additional CPU mapping or descriptor target.
+This checkpoint completed on the phone: 133 contiguous words, exact completion
+count and terminator, followed by all cleanup checks and interactive Home.
+The full console had dropped records elsewhere; the EROM words themselves
+were complete and passed host structural validation.
+
+The raw capture has a 100 ms deadline and a limit of 896 aligned words, ending
+before EROM control offset `0xe00`. Before every read it checks the memory
+route, CFG0/link/root command, endpoint command, BAR0 and current window.
+All-ones data or a failed guard stops the capture. The exact `0x0000000f`
+terminator is recognized only at an entry boundary: untagged high address,
+size and high-size extension words are consumed as data, even if they equal
+the terminator. The capture never follows any address descriptor or reads
+the EROM control registers.
+
+Each line records the ROM offset and raw word. `EROM capture complete` means
+that a terminator was captured within the bounds, not that the component
+table has been validated. Host analysis must verify every offset/count and
+decode the captured table before using core IDs, revisions or addresses.
+Missing data, a deadline, a bound stop or malformed entries must not become
+an invented core map. Normal BAR0/window/ATU/PHY/power cleanup still runs, and
+its result is independent of capture completion. No core is reset, no chip
+register is written, and no RAM, DMA or firmware is used.
+
+Host decoding identified 20 components. Selected validated backplane targets:
+
+| Component | Revision | Register base | First master wrapper |
+| --- | --- | --- | --- |
+| Chipcommon | 64 | `0x18000000` | `0x18100000` |
+| ARM Cortex-R4 | 15 | `0x18002000` | `0x18102000` |
+| PCIe2 | 64 | `0x18003000` | `0x18103000` |
+| D11 MAC, instance 0 | 82 | `0x18001000` | `0x18101000` |
+| D11 MAC, instance 1 | 82 | `0x18004000` | `0x18104000` |
+
+These are chip backplane addresses, not host physical MMIO addresses. R4 slave
+port 1 describes apertures at `0x0`/`0x150000` and `0x170000`/`0x190000`
+(base/size). Aperture descriptors alone do not establish enabled RAM capacity.
+
+The host-only decoder checks raw offsets/count, identity pairs, master-port
+order, slave-port coverage, wrapper count/order/size, 64-bit extensions and
+range overflow. It makes no device access:
+
+```sh
+rtk proxy python3 scripts/decode-b2l-erom.py /private/path/epoch-console.txt
+```
+
+## Read-only core state
+
+`b2l_wifi_diag=8` repeats the capture and
+requires 133 words plus eight exact measured CIA/CIB/register-base/wrapper
+witnesses for the two fixed targets. This is an additional guard for the
+already validated targets, not a replacement for the host table decoder.
+Any changed witness/count skips all following component access. This checkpoint
+completed on the phone with interactive Home and all cleanup checks verified.
+
+The probe switches the existing BAR0 window, with memory decoding off during
+each switch, to PCIe2 wrapper `0x18103000` and R4 wrapper `0x18102000`. It reads
+only IOCTRL `0x408`, IOSTATUS `0x500` and RESETCTRL `0x800` in each. A 100 ms
+deadline and the existing BAR/link/configuration guards apply to every word.
+It never writes a wrapper register, resets a core or changes its clock.
+
+Broadcom's `ai_iscoreup` requires IOCTRL CLOCK_EN set and FGC clear (low two
+bits equal 1), with RESETCTRL bit zero clear. Only when R4 satisfies those
+checks does the probe select R4 register page `0x18002000` and read capabilities
+at `0x04`. Otherwise it logs a skipped capability read. CPUHALT is reported
+from IOCTRL bit 5 and is never modified. A successful state snapshot does not
+mean the core is ready for firmware or that RAM banks have been sized.
+All existing BAR/window/ATU/PHY/power cleanup still runs on success or error.
+
+The measured PCIe2 wrapper has IOCTRL `0x1`, IOSTATUS `0x0`, RESETCTRL `0x0`.
+R4 has IOCTRL `0x21`, IOSTATUS `0x0`, RESETCTRL `0x0`: its clock is enabled,
+reset is released, and CPUHALT is set. R4 capabilities read `0x351585`.
+The low two nibbles declare 5 TCM-A and 8 TCM-B banks, sized in the following
+checkpoint. Bank count alone does not establish memory capacity or power state.
+
+## TCM bank inventory
+
+`b2l_wifi_diag=9` repeats all preceding
+checks and additionally requires the exact measured capabilities `0x351585`
+and an active R4 with CPUHALT set. It never forces that state. Changed EROM,
+capabilities, clock/reset or CPUHALT prerequisites skip all selector access.
+This checkpoint completed on the phone: all 13 bank records, verified selector
+restoration, all parent cleanup checks and user-confirmed interactive Home.
+The retained trial log reaches 238 seconds; a five-minute stability interval
+was not established by this capture.
+
+Following Broadcom's `si_tcm_size`, the inventory selects each of the 13 banks
+through R4 BANKIDX `0x40` and reads BANKINFO `0x44`. The original selector must
+be within those 13 banks. Each write is guarded and read back; every access
+uses the existing link/BAR/window guards and a 100 ms inventory deadline.
+Size is `(BANKINFO[6:0] + 1)` times 1 KiB when bit 9 is set, otherwise 8 KiB.
+The result measures the capacity reported by BANKINFO, not bank power state.
+
+BANKIDX is the only chip register written. The probe saves its original value
+before modification and restores it on success or failure, with at most three
+attempts within a separate 100 ms cleanup budget. If access disappears it
+reports failed restoration and still attempts normal parent power cleanup.
+It never writes BANKPDA, core clocks/resets, RAM, firmware, DMA or IRQ registers.
+All existing BAR/window/ATU/PHY/power cleanup remains active.
+
+The original selector was zero. Banks 0 through 3 and 5 through 12 each report
+128 KiB; bank 4 reports 64 KiB. Total reported capacity is **1,638,400 bytes**
+(`0x190000`), matching the original Android DHD report at base `0x170000`.
+This establishes reported capacity, without testing RAM contents or power state.
+
+## Firmware copy with R4 halted
+
+The userspace loader now selects `b2l_wifi_diag=10`. A private BOOT attachment
+provides the original 1,297,036-byte `bcmdhd_sta.bin_b1`. Public CI artifacts
+contain no firmware. The loader copies the optional attachment into its owned
+arena before the device tree and boot arguments; `top_of_kernel_data` keeps it
+out of the free-page allocator. `/chosen/b2l,wifi-firmware` describes that range.
+The [BOOT packaging contract](packaging.md) defines the explicit descriptor.
+
+XNU requires the exact length, page-aligned range wholly inside reserved boot
+data and pinned SHA-256 before it maps any Wi-Fi registers. It repeats mode 9
+and requires every measured BANKINFO word, the exact `0x190000` total, verified
+selector restoration, and the preceding EROM/core prerequisites. The physical
+outcome of this firmware-copy checkpoint is pending.
+
+The copy uses only the existing first 4 KiB BAR0 route and switches its window
+over `[0x170000, 0x2aca8c)`. Before each page it checks R4 CLOCK_EN, FGC, RESET
+and CPUHALT through the measured wrapper. A single five-second deadline covers
+the transfer. Each bounded 64-byte burst has link/configuration/BAR/window
+guards before writes and before readback; every written word must compare
+equal to the authenticated source. It checks R4 halt again after the final
+readback. A guard, deadline or comparison failure stops further RAM writes.
+
+No CPUHALT release, core reset, reset vector at address zero, NVRAM, RAM-size
+token, DMA or IRQ setup is performed. The copied RAM is volatile and is not
+restored to its old contents; all normal BAR/window/ATU/PHY/power cleanup still
+runs. Copy/readback completion and cleanup are separate results. This step
+does not execute firmware or provide networking.
 
 ## Recovery evidence
 
@@ -265,15 +435,23 @@ device node was created to bypass that limitation.
 
 Original Wi-Fi station firmware, CLM and nine candidate NVRAM files have been
 extracted privately from the verified original vendor backup. They are not
-repository or CI inputs. Selecting the correct module/board NVRAM remains
-open; no random variant is used.
+repository or CI inputs. The live original recovery driver resolved the module
+through its OTP board-information path and selected `bcmdhd_sta.bin_b1` with
+`nvram.txt_CS01_semco_b1`.
+
+Using temporary copies of those exact verified files in recovery, the original
+Linux driver successfully opened its interface, completed the ARM shared-memory
+handshake and loaded CLM. Firmware reported version `18.41.117`, build date
+2022-07-19, FWID `01-1b4772fd`. No scan, AP association or DHCP was requested.
+This validates the firmware pairing under Linux. Firmware execution, transport
+and networking under XNU remain unimplemented.
 
 ## Following checkpoints
 
-1. Validate the bounded endpoint identity reads and CFG0/PHY/power cleanup,
-   preserving the validated Gen1 BOOT as rollback.
-2. Read the backplane chip revision, select verified board firmware/NVRAM,
-   and bring up firmware with an appropriate DMA/SysMMU design.
+1. Validate bounded XNU firmware staging/download and full readback with
+   R4 held halted, preserving the validated TCM-inventory BOOT as rollback.
+2. Bring up firmware execution and the shared command/ring protocol with an
+   appropriate DMA/SysMMU and interrupt design.
 3. Establish scanning, authentication, packet transport and DHCP, then adapt
    the HakiOS network and Apple80211 interfaces to this iOS release.
 
@@ -317,6 +495,45 @@ power restoration still runs. Prior viewport selection and root bus numbers
 are restored, including a previously selected inbound viewport. No endpoint
 writes, memory/inbound region programming or BAR access is permitted.
 
+Mode 6 tests the exact first-page memory translation, three ordered chip reads,
+64-bit BAR0/window setup, W1C-safe memory-only command and restoration. It
+exercises all eleven mapping failures, every dropped write, wrong/all-ones
+chip words, deadline expiry, unexpected BAR/window state, occupied ATU0 and
+failed enable. Permanent command/window/ATU0 cleanup failures and link loss
+remain explicit while common power restoration still runs. The backend rejects
+endpoint bus mastering, BAR2/RAM access and every chip-register write.
+
+Mode 7 tests the measured EROM window, ordered ROM offsets below `0xe00`,
+the 896-word and deadline bounds, and terminators inside 64-bit address/size
+extension data. It covers invalid data, changed chip/pointer prerequisites,
+loss of link, missing/final-bound terminators, every dropped write in the new
+path, and failed final window/command cleanup with common power restoration.
+
+`rtk proxy python3 tests/test_wifi_erom.py` independently tests host decoding
+with synthetic 32/64-bit descriptors, extension words equal to terminators,
+duplicate core instances, zero-based memory, malformed/missing captures,
+port/wrapper mismatches and overflowing ranges.
+
+Mode 8 additionally tests all eight target witnesses and the exact count,
+fixed wrapper read scope, gated/forced-clock/reset R4 capability rejection,
+invalid state/capability words, deadline/link loss, every dropped write in the
+new path, and failed final cleanup. The backend permits no component writes.
+
+Mode 9 permits only BANKIDX writes on the measured halted R4. Tests cover
+all 13 banks, both size-unit encodings, changed capability/EROM witnesses,
+running/gated/reset R4, invalid original selector/BANKINFO, deadlines before
+and after a selector write, link loss, every lost write, and failed selector
+restoration with bounded retries and continued parent power restoration.
+
+Mode 10 tests a complete synthetic image in a backplane RAM model, exact
+address bounds, halt checks per page, altered raw bank profile, staging bounds
+and authentication failures, lost data/window writes at boundary positions,
+readback corruption, clock/reset/halt changes, deadline/link loss, and failed
+final cleanup. SHA authentication is mocked in the MMIO fixture; the actual
+SHA primitive has separate known-answer cache tests. No vendor image is in CI.
+The real EFI BOOT reader also runs against synthetic devices to check explicit
+attachment presence, partition bounds, read/allocation failures and cleanup.
+
 ## Source references
 
 Samsung/LineageOS is pinned to
@@ -329,6 +546,17 @@ Samsung/LineageOS is pinned to
 - [DesignWare root-port link setup](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/pci/dwc/pcie-designware.c)
 - [DesignWare root configuration semantics](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/pci/dwc/pcie-designware-host.c)
 - [GPIO bank offsets](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/pinctrl/samsung/pinctrl-exynos-arm64.c)
+- [Broadcom BAR0 window definitions](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/pcicfg.h)
+- [Broadcom enumeration base](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/hndsoc.h)
+- [Chipcommon layout and identity masks](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/sbchipc.h)
+- [Broadcom chip attachment and identity decoding](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/siutils.c)
+- [Broadcom PCIe chip-ID reader](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/dhd_pcie.c)
+- [AI EROM format and control-register boundary](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/aidmp.h)
+- [Broadcom AI EROM scan](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/aiutils.c)
+- [ARM R4 register layout](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/sbhndarm.h)
+- [TCM bank inventory algorithm](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/siutils.c)
+- [R4 bank fields and offsets](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/include/siutils.h)
+- [Module OTP parsing and firmware/NVRAM naming](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/dhd_custom_cis.c)
 - [Clock register bases, offsets and fields](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/soc/samsung/cal-if/exynos9820/cmucal-sfr.c)
 - [WLAN power and PCIe channel setup](https://github.com/LineageOS/android_kernel_samsung_exynos9820/blob/a412cfaf86b980ce35cae96a35f678c8ea551575/drivers/net/wireless/broadcom/bcmdhd_101_16/dhd_custom_exynos.c)
 
