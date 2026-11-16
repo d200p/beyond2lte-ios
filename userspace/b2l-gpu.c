@@ -2715,9 +2715,10 @@ profile_thread(void *unused)
 		thread_act_t threads[PROF_THREADS];
 		int kinds[PROF_THREADS];
 		unsigned count = prof_find_threads(threads, kinds);
-		unsigned samples = 0, running = 0, per_kind[2] = { 0, 0 };
+		unsigned samples = 0, running = 0, per_kind[2] = { 0, 0 }, quiet = 0;
 		uint64_t until = time(NULL) + PROF_PERIOD_S;
 		while ((uint64_t)time(NULL) < until) {
+			unsigned ran = 0;
 			for (unsigned i = 0; i < count; i++) {
 				uint64_t pc;
 				int is_running;
@@ -2727,19 +2728,31 @@ profile_thread(void *unused)
 				samples++;
 				if (is_running) {
 					running++;
+					ran++;
 					per_kind[kinds[i]]++;
 					prof_add(pc);
 				} else {
 					prof_wait(pc);
 				}
 			}
-			usleep(1000000 / PROF_HZ);
+			/*
+			 * Boot 62: sampling 200 times a second kept the CPUs awake in
+			 * standby too (52 % of the battery overnight). After a second
+			 * without a running render thread (display off, nothing drawn)
+			 * it looks once a second until they run again.
+			 */
+			quiet = ran ? 0 : quiet + 1;
+			usleep(quiet >= PROF_HZ ? 1000000 : 1000000 / PROF_HZ);
 		}
 		for (unsigned i = 0; i < count; i++) {
 			mach_port_deallocate(mach_task_self(), threads[i]);
 		}
-		if (count != 0) {
+		if (count != 0 && running != 0) {
 			prof_report(samples, running, per_kind, count);
+		} else {
+			memset(prof_slots, 0, sizeof(prof_slots));      /* idle: nothing worth a log line */
+			memset(prof_waits, 0, sizeof(prof_waits));
+			prof_dropped = 0;
 		}
 	}
 	return NULL;
