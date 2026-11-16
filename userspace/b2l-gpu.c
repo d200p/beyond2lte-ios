@@ -29,9 +29,14 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
+#include <spawn.h>
+#include <pthread/qos.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <time.h>
 #include "b2l_flush_rect.h"
 #include "b2l_mali_draw.h"
@@ -2031,11 +2036,196 @@ mesa_probe(void)
 	unlink(MESA_MARKER);
 	log_line("mesa: probe returned %d", result);
 }
+
+/*
+ * Metal milestone M0 (docs/metal-on-panfrost.md), with boot argument
+ * b2l_mtl_sweep=1: every function of QuartzCore's default.metallib through
+ * the AIR frontend and Panfrost's compiler (b2l_mtl_sweep in the Mesa
+ * library), on the CPU, in a child process: another backboardd started with
+ * B2L_MTL_SWEEP=<first job> in its environment, which this library's
+ * constructor sends here before anything of backboardd's own runs, and which
+ * exits there. A child that dies (a compiler crash) or stops progressing is
+ * started again after the job it was on; the jobs and their results are in
+ * the kernel log ("mtl M0:").
+ */
+#define MTL_SWEEP_MARKER   "/private/var/tmp/b2l-mtl-sweep.running"
+#define MTL_SWEEP_PROGRESS "/private/var/tmp/b2l-mtl-sweep.next"
+#define MTL_SWEEP_DELAY_S  45u    /* after backboardd starts: the UI first */
+#define MTL_SWEEP_STALL_S  120u   /* one job this long is taken as hung */
+#define MTL_SWEEP_RESTARTS 40u
+#define MTL_SWEEP_FINISHED 4294967295L /* the progress file once b2l_mtl_sweep returns */
+
+extern char **environ;
+
+static void
+mtl_sweep_child(const char *start)
+{
+	setpriority(PRIO_PROCESS, 0, 20);
+	pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+	void *mesa = dlopen(B2L_MESA_LIBRARY, RTLD_NOW | RTLD_LOCAL);
+	int (*sweep)(unsigned, const char *) =
+	    mesa != NULL ? (int (*)(unsigned, const char *))dlsym(mesa, "b2l_mtl_sweep") : NULL;
+	_exit(sweep != NULL ? sweep((unsigned)strtoul(start, NULL, 10), MTL_SWEEP_PROGRESS) : 4);
+}
+
+static int
+boot_arg_present(const char *token)
+{
+	char args[2048];
+	size_t size = sizeof(args) - 1;
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0) {
+		return 0;
+	}
+	args[size < sizeof(args) ? size : sizeof(args) - 1] = 0;
+	size_t n = strlen(token);
+	for (const char *p = args; *p != 0;) {
+		while (*p == ' ') {
+			p++;
+		}
+		const char *end = strchr(p, ' ');
+		if (end == NULL) {
+			end = p + strlen(p);
+		}
+		if ((size_t)(end - p) == n && memcmp(p, token, n) == 0) {
+			return 1;
+		}
+		p = end;
+	}
+	return 0;
+}
+
+static long
+mtl_sweep_progress(void)
+{
+	char text[16] = { 0 };
+	int fd = open(MTL_SWEEP_PROGRESS, O_RDONLY);
+	if (fd < 0) {
+		return -1;
+	}
+	ssize_t n = read(fd, text, sizeof(text) - 1);
+	close(fd);
+	return n > 0 ? strtol(text, NULL, 10) : -1;
+}
+
+static void *
+mtl_sweep_thread(__unused void *argument)
+{
+	pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+	sleep(MTL_SWEEP_DELAY_S);
+	char path[1024];
+	uint32_t path_size = sizeof(path);
+	if (_NSGetExecutablePath(path, &path_size) != 0) {
+		log_line("mtl M0: no executable path");
+		return NULL;
+	}
+	unsigned envc = 0;
+	while (environ[envc] != NULL) {
+		envc++;
+	}
+	char **envp = calloc(envc + 2, sizeof(char *));
+	if (envp == NULL) {
+		return NULL;
+	}
+	unlink(MTL_SWEEP_PROGRESS);
+	unsigned start = 0, restarts = 0;
+	for (;;) {
+		char variable[48];
+		snprintf(variable, sizeof(variable), "B2L_MTL_SWEEP=%u", start);
+		for (unsigned i = 0; i < envc; i++) {
+			envp[i] = environ[i];
+		}
+		envp[envc] = variable;
+		envp[envc + 1] = NULL;
+		char *argv[] = { path, NULL };
+		pid_t pid = 0;
+		int error = posix_spawn(&pid, path, NULL, NULL, argv, envp);
+		if (error != 0) {
+			log_line("mtl M0: posix_spawn %s failed: %d", path, error);
+			break;
+		}
+		log_line("mtl M0: child %d from job %u", pid, start);
+		long last = -2;
+		unsigned still = 0;
+		/* known: 1 when waitpid gave the status. When backboardd ignores
+		 * SIGCHLD the child is reaped without one (ECHILD), and only its
+		 * progress file says whether it finished (MTL_SWEEP_FINISHED). */
+		int status = 0, known = 0, killed = 0;
+		for (;;) {
+			pid_t done = waitpid(pid, &status, WNOHANG);
+			if (done == pid) {
+				known = 1;
+				break;
+			}
+			if (done < 0 && errno != EINTR && kill(pid, 0) != 0) {
+				break;
+			}
+			sleep(1);
+			long now = mtl_sweep_progress();
+			still = now == last ? still + 1 : 0;
+			last = now;
+			if (still >= MTL_SWEEP_STALL_S) {
+				log_line("mtl M0: job %ld still running after %u s, child %d killed", now, still, pid);
+				kill(pid, SIGKILL);
+				known = waitpid(pid, &status, 0) == pid;
+				killed = 1;
+				break;
+			}
+		}
+		long at = mtl_sweep_progress();
+		if (at == MTL_SWEEP_FINISHED) {
+			log_line("mtl M0: child %d finished the sweep", pid);
+			break;
+		}
+		if (!killed && known && WIFEXITED(status)) {
+			log_line("mtl M0: child %d exited %d (last job %ld)", pid, WEXITSTATUS(status), at);
+			break;
+		}
+		log_line("mtl M0: child %d %s (signal %d) at job %ld", pid, killed ? "killed" : "died",
+		    killed ? SIGKILL : ((known && WIFSIGNALED(status)) ? WTERMSIG(status) : -1), at);
+		if (at < 0 || ++restarts > MTL_SWEEP_RESTARTS) {
+			break;
+		}
+		start = (unsigned)at + 1;
+	}
+	free(envp);
+	return NULL;
+}
+
+static void
+mtl_sweep_start(void)
+{
+	if (!boot_arg_present("b2l_mtl_sweep=1")) {
+		return;
+	}
+	/* Once per boot: a second backboardd (after a crash) does not start it
+	 * again. The marker stays; the next boot finds it older than itself. */
+	if (!once_per_boot(MTL_SWEEP_MARKER)) {
+		log_line("mtl M0: sweep already started in this boot");
+		return;
+	}
+	pthread_t thread;
+	pthread_attr_t attributes;
+	pthread_attr_init(&attributes);
+	pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+	pthread_create(&thread, &attributes, mtl_sweep_thread, NULL);
+	pthread_attr_destroy(&attributes);
+}
 #else
 static void
 mesa_probe(void)
 {
 	log_line("mesa: no library in this build");
+}
+
+static void
+mtl_sweep_child(__unused const char *start)
+{
+	_exit(4);
+}
+
+static void
+mtl_sweep_start(void)
+{
 }
 #endif
 
@@ -2824,9 +3014,15 @@ b2l_gpu_start(void)
 	pthread_t thread;
 	pthread_attr_t attributes;
 
+	/* The Metal M0 sweep's child: compile, log, exit (mtl_sweep_thread). */
+	const char *sweep = getenv("B2L_MTL_SWEEP");
+	if (sweep != NULL) {
+		mtl_sweep_child(sweep);
+	}
 	install_gles_hook();
 	pthread_attr_init(&attributes);
 	pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
 	pthread_create(&thread, &attributes, start_thread, NULL);
 	pthread_attr_destroy(&attributes);
+	mtl_sweep_start();
 }

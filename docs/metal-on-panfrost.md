@@ -1,0 +1,126 @@
+# Metal on the Mali-G76 (Panfrost)
+
+Goal: Core Animation's own Metal renderer (`CA::OGL::MetalContext`) drawing the
+window server on the S10's GPU, so that the effects iOS 26 only has in Metal
+(Liquid Glass, vibrancy, SDF shapes, the blur passes) are drawn by Apple's own
+shaders instead of being approximated on the OpenGL ES path.
+
+Status (2026-11-17): M0 written, not built yet. The OpenGL ES path
+(`docs/mesa-panfrost.md`) stays the default and the fallback.
+
+## M0 as written
+
+- `scripts/mesa/air/`: HakiOS's AIR frontend, unchanged (its README says from
+  which commit); `build-panfrost-ios.sh` copies it to `src/compiler/air` and
+  adds `subdir('air')`; the b2l target links `idep_air`.
+- `scripts/mesa/b2l-target/b2l_mtl_sweep.c`, exported `b2l_mtl_sweep(start,
+  progress_path)`: thin the fat library to its AIR64 slice, `air_metallib_parse`,
+  then per job `air_to_nir` (Panfrost v7's NIR options) →
+  `nir_assign_io_var_locations` → `bifrost_preprocess_nir(0x7211)` →
+  `panfrost_nir_lower_sysvals` → `pan_shader_compile_v7`. Jobs: every function
+  once with no function constant supplied, then each `fixed_frag_*` once per
+  texture function in the GLES census list with constant 28 supplied. One log
+  line per job through a B2LMali client that only logs (the kernel's runtime is
+  reached by no log call).
+- `userspace/b2l-gpu.c`: with `b2l_mtl_sweep=1`, 45 s after backboardd starts,
+  once per boot, `posix_spawn` another `/usr/libexec/backboardd` with
+  `B2L_MTL_SWEEP=<job>`; the library's constructor sees it first and runs the
+  sweep at background QoS, then exits. A child that dies or makes no progress
+  for 120 s is restarted after its job (40 restarts at most); the progress file
+  is `/private/var/tmp/b2l-mtl-sweep.next`, 4294967295 when finished.
+- `uefi/XnuLoader/XnuLoader.c`: `b2l_mtl_sweep=1`.
+
+What its log is to answer: which of QuartzCore's functions the frontend takes
+on iOS 26's AIR (HakiOS measured iOS 16.5's), where Bifrost's compiler stops,
+and how long the uber shader takes to compile on the phone's CPU.
+
+## What iOS 26 does (read from the 23G90 cache)
+
+- **Discovery.** `-[MTLIOAccelServiceGlobalContext init]` (Metal) matches
+  `IOAcceleratorES` services; `getMetalPluginClassForService` reads the
+  service's `MetalPluginName` (bundle `/System/Library/Extensions/<name>.bundle`)
+  and `MetalPluginClassName` (`-classNamed:`, else the principal class), and
+  keeps the class only if it is a subclass of Metal's base device class
+  (`_MTLDevice`, as HakiOS found on iOS 16). The device is then made with
+  `-initWithAcceleratorPort:`. Same mechanism as iOS 16.
+- **Core Animation's side.** `CAMetalContextCreate` probes `IOAcceleratorES`
+  for about 30 s today and falls back to OpenGL ES (`docs/build-0065.md`).
+  QuartzCore's Metal code (600 functions) sends 353 distinct selectors. It asks
+  the device first what it can do: `supportsTileShaders`,
+  `supportsMemorylessRenderTargets`, `supportsRasterOrderGroups`,
+  `supportsSIMDGroup`, `supportsSIMDReduction`, `supportsSIMDShuffleAndFill`,
+  `supportsNativeHardwareFP16`, `supportsLossyCompression`, `supportsFamily:`,
+  limits (`maxTextureWidth2D`, `maxFragmentTextures`, alignments). Answering NO
+  where the Mali has nothing keeps CA off tile shaders and imageblocks.
+- **Shaders.** `QuartzCore.framework/default.metallib` exists on iOS 26 (fat:
+  AIR64 slice + Apple GPU binary; 189 functions per slice). The window server's
+  fragment work is one uber shader (`fixed_frag_lph_cph`) specialised by
+  function constants; `FragmentShaderConfig` field 2 (`texture_function`) is the
+  same function code the OpenGL ES path reports (52 = `vcm`, 59 = `dff`, ...).
+  Separate functions: downsample/blur passes, variable blur (render and
+  compute), glass background/foreground, SDF field generation, path rendering.
+  LLVM 23's `llvm-dis` reads the AIR (tools/third-party, not committed).
+
+## Architecture
+
+```
+backboardd (CA::OGL::MetalContext)
+   |  Metal.framework: MTLCreateSystemDefaultDevice -> IOAcceleratorES -> bundle
+   v
+B2LMetal.bundle (Objective-C)       _MTLDevice / _MTLCommandQueue / ... subclasses,
+   |                                MTLDevice + MTLDeviceSPI etc. declared,
+   |                                unknown selectors logged once, answered 0
+   v
+libb2l-mesa.dylib: b2l_mtl_* (C)    a Gallium frontend over the same pipe_screen
+   |                                the EAGL layer uses (b2l_fscreen):
+   |                                buffers, textures (IOSurface import), samplers,
+   |                                pipelines (blend/raster/DSA CSOs + shaders),
+   |                                render passes (framebuffer, clears, draws),
+   |                                blits, compute dispatch, fences
+   |  shaders: AIR --air_to_nir (HakiOS, MIT)--> NIR --Metal lowering--> Panfrost
+   v
+Panfrost (Gallium, Mesa 25.0.7) -> b2l_drm -> B2LMali (kernel)
+```
+
+Why Gallium and not a hand-written backend (hakios-metal does PM4 for the
+Adreno by hand) or Metal on Vulkan (metal2vulkan + PanVK): Panfrost already
+runs here, handles job chains, tiler, blend shaders, framebuffer fetch, AFBC
+and IOSurface import; PanVK on Bifrost v7 is not conformant in 25.0.7 and the
+Vulkan route measured half the speed on the Adreno.
+
+### Metal semantics on Gallium
+
+| Metal | Gallium / NIR |
+|---|---|
+| NDC y up, row 0 at the top, depth 0..1 | viewport y scale negated, `clip_halfz`, front face flipped with it, `[[position]]` upper-left origin |
+| `[[buffer(n)]]` constant / `setVertexBytes` | UBO n+1 (user buffers for bytes) |
+| `[[buffer(n)]]` device | SSBO n |
+| `[[texture(n)]]`, `[[sampler(m)]]` | sampler view n, sampler state m (separate indices in NIR tex) |
+| `constexpr sampler` | a sampler state made at pipeline creation, bound past the API's |
+| `[[color(n)]]` input (framebuffer fetch) | `load_output` in the fragment shader (Panfrost: tile buffer read) |
+| function constants | folded by air_to_nir (`is_function_constant_defined` kept) |
+| vertex descriptor | `pipe_vertex_element` + vertex buffers |
+| blend descriptor per attachment | `pipe_blend_state` (independent blend) |
+| load/store actions | `clear` at pass begin; store Don'tCare = invalidate |
+| shared storage buffers | persistent coherent mapped `pipe_resource` |
+| `MTLSharedEvent`, completion handlers | `pipe_fence_handle` + a completion thread |
+| memoryless textures | ordinary textures |
+| tile shaders, imageblocks, raster order groups, SIMD-group functions | not offered (device answers NO) |
+
+## Milestones (each a build and a boot; GLES stays the default)
+
+| # | What | Checked by |
+|---|---|---|
+| M0 | air_to_nir in the Mesa build; at boot `b2l-gpu` compiles every function of the phone's own QuartzCore `default.metallib` (no file leaves the phone) through NIR to Bifrost code, the uber shader with the function-constant sets the GLES census saw | kernel log: compiled / refused per function, with the reason |
+| M1 | kernel: an `IOAcceleratorES` nub under B2LMali with `MetalPluginName`/`MetalPluginClassName` behind boot-arg `b2l_metal=N` (1: a test program only); B2LMetal.bundle installed in the root; device + queue + caps, every other selector logged | `b2l-mtltest`: the device, its name, the first unanswered selectors |
+| M2 | buffers, textures (IOSurface), samplers, library/functions, render and compute pipelines, command buffers, blit, render pass with clear and draw | `b2l-mtltest` draws a triangle and a textured quad into an IOSurface, read back pixel by pixel |
+| M3 | backboardd shown the device (`b2l_metal=2`); a marker falls back to OpenGL ES after a crash, as the GLES bring-up did | the lock screen and home screen drawn by Metal; crash reports |
+| M4 | the rest CA asks: events, heaps/residency sets, variable blur compute, glass passes; speed | the GLES glitches gone (labels, Calculator keys, widgets, tab bars), frame rate |
+
+## Licences
+
+- HakiOS `tools/mesa/air/` (AIR to NIR, metallib reader): MIT, "Darwin on
+  redwood contributors"; copied with its headers.
+- hakios-metal `plugin/HakiosMetal.m`: MIT; read as reference.
+- HakiOS `userland/src/HakiosMetalCA.m`: origin unverified there; not copied.
+- Apple's `default.metallib` and the AIR disassembly stay off the repository.

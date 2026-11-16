@@ -9,7 +9,7 @@
 
 libb2l_mesa = shared_library(
   'b2l-mesa',
-  [files('b2l_mesa.c', 'b2l_drm.c', 'b2l_eagl.c', 'b2l_memset.c'), main_dispatch_h],
+  [files('b2l_mesa.c', 'b2l_drm.c', 'b2l_eagl.c', 'b2l_memset.c', 'b2l_mtl_sweep.c'), main_dispatch_h],
   gnu_symbol_visibility : 'hidden',
   include_directories : [
     inc_include, inc_src, inc_gallium, inc_gallium_aux, inc_gallium_winsys,
@@ -19,6 +19,7 @@ libb2l_mesa = shared_library(
   link_whole : [libglapi_static],
   link_with : [libmesa, libgallium, libglapi],
   link_args : ['-framework', 'IOKit', '-framework', 'CoreFoundation', '-framework', 'IOSurface', '-lobjc'],
-  dependencies : [driver_panfrost, idep_mesautil, idep_xmlconfig, dep_thread],
+  # idep_air: the AIR (Metal shader) frontend in src/compiler/air (b2l_mtl_sweep.c).
+  dependencies : [driver_panfrost, idep_mesautil, idep_xmlconfig, dep_thread, idep_air],
   install : false,
 )

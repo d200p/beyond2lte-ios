@@ -88,11 +88,26 @@ python3 "$repo/scripts/mesa/b2l-drm/patch_pan_shader_idvs.py" "$src/src/gallium/
 python3 "$repo/scripts/mesa/b2l-drm/patch_pan_jm_barrier.py" "$src/src/gallium/drivers/panfrost/pan_jm.c"
 # A refused IOSurface import returns NULL instead of crashing (boot 58): see the script.
 python3 "$repo/scripts/mesa/b2l-drm/patch_pan_bo_import.py" "$src/src/gallium/drivers/panfrost/pan_bo.c"
+# The AIR (Metal shader) frontend, HakiOS's (scripts/mesa/air, MIT): it lives
+# in src/compiler/air and one subdir() after spirv's reaches it, as HakiOS's
+# tools/mesa/air-frontend.patch does (docs/metal-on-panfrost.md).
+rm -rf "$src/src/compiler/air"
+cp -R "$repo/scripts/mesa/air" "$src/src/compiler/air"
+python3 - "$src/src/compiler/meson.build" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+if "subdir('air')" not in s:
+    if "\nsubdir('spirv')\n" not in s:
+        raise SystemExit("src/compiler/meson.build: no subdir('spirv') line to put subdir('air') after")
+    s = s.replace("\nsubdir('spirv')\n", "\nsubdir('spirv')\n\nsubdir('air')\n", 1)
+    open(p, 'w').write(s)
+PY
 # Our target, built by Mesa's own meson like the OSMesa one.
 target="$src/src/gallium/targets/b2l"
 mkdir -p "$target"
 cp "$repo/scripts/mesa/b2l-target/meson.build" "$repo/scripts/mesa/b2l-target/b2l_mesa.c" \
   "$repo/scripts/mesa/b2l-target/b2l_eagl.c" "$repo/scripts/mesa/b2l-target/b2l_memset.c" \
+  "$repo/scripts/mesa/b2l-target/b2l_mtl_sweep.c" \
   "$repo/scripts/mesa/b2l-drm/b2l_drm.c" "$repo/scripts/mesa/b2l-drm/b2l_drm.h" \
   "$repo/xnu-overlay/iokit/Kernel/arm/b2l_mali_uapi.h" "$target/"
 # The EAGL layer's GLI dispatch table, from the build machine's macOS SDK

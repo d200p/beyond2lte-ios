@@ -431,6 +431,11 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * BOOT without the attachment (every CI image) skips all Wi-Fi
                  * MMIO; scripts/attach-wifi-firmware.py makes the private one. */
                 "b2l_wifi_diag=10 "
+                /* Metal M0 (docs/metal-on-panfrost.md): backboardd's library
+                 * compiles QuartzCore's default.metallib through the AIR
+                 * frontend and Panfrost in a child process, 45 s after start,
+                 * and logs each function ("mtl M0:"). Nothing is drawn. */
+                "b2l_mtl_sweep=1 "
                 /* S10: the per-syscall/IPC boundary diagnostics are off in
                  * the working system. With b2l_diag=1 every system call of
                  * backboardd, SpringBoard and Settings went through them, and
