@@ -26,6 +26,10 @@ void b2l_hid_key(int,int){}
 static unsigned recovery_requests;
 void b2l_power_request_recovery(){recovery_requests++;}
 void b2l_hid_touch(int f,int d,int x,int y){delivered.emplace_back(f,d,x,y);}
+static int display_off;
+int b2l_fb_display_is_off(){return display_off;}
+#define B2L_INPUT_POLL_MS 20
+#define B2L_INPUT_STANDBY_MS 100
 void IOLog(const char*,...){}
 void b2l_diag_record(const char*,...){}
 using Event=std::array<uint8_t,8>;
@@ -36,7 +40,7 @@ static Event event(unsigned action,unsigned x,unsigned y,unsigned remaining){
 class B2LInput:public OSObject{
 public:
  alignas(uint32_t) uint8_t backing[128]={};uint8_t*gpio=backing;
- bool stable[4]={},candidate[4]={},touch=true;
+ bool stable[4]={},candidate[4]={},touch=true,touchResting=false;
  unsigned debounce[4]={},failures=0,keyLogs=0;
  B2L_SEC_TS_POINTER pointer={};
  uint64_t pollCount=0,eventCount=0,updateCount=0,bulkCount=0,transferFailures=0;
@@ -99,6 +103,12 @@ int main(){
  // Diagnostics expose scheduling gaps without changing GPIO debounce cadence.
  {B2LInput s;s.add(0x60,{Event{}});B2LInput::poll(&s,&timer);tick+=75000;
   s.add(0x60,{Event{}});B2LInput::poll(&s,&timer);assert(s.maxPollGapUS>=75000&&s.maxPollWorkUS&&timer.ms==20);}
+ // Display off: no touch reads, the keys every 100 ms, one release so no finger stays down;
+ // back on, reads and the 20 ms cadence return.
+ {B2LInput s;delivered.clear();display_off=1;B2LInput::poll(&s,&timer);
+  assert(s.next==0&&timer.ms==100&&delivered.size()==1&&std::get<1>(delivered[0])==0&&s.touchResting);
+  B2LInput::poll(&s,&timer);assert(s.next==0&&delivered.size()==1&&timer.ms==100);
+  display_off=0;s.add(0x60,{Event{}});B2LInput::poll(&s,&timer);assert(s.next==1&&timer.ms==20&&!s.touchResting);}
 }
 '''
 with tempfile.TemporaryDirectory(prefix='b2l-input-poll-') as td:
@@ -106,4 +116,4 @@ with tempfile.TemporaryDirectory(prefix='b2l-input-poll-') as td:
  subprocess.run(shlex.split(os.environ.get('CC','clang'))+['-std=c11','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I',str(arm),'-c',str(arm/'B2LSecTsParser.c'),'-o',str(p/'parser.o')],check=True)
  subprocess.run(shlex.split(os.environ.get('CXX','clang++'))+['-std=c++17','-Wall','-Wextra','-Werror','-fsanitize=address,undefined','-I',str(arm),str(p/'test.cpp'),str(p/'parser.o'),'-o',str(p/'test')],check=True)
  subprocess.run([str(p/'test')],check=True)
-print('actual poll + real parser: FIFO ordering, 32-record bound, 63 backlog, partial failure, cutoff, timing PASS')
+print('actual poll + real parser: FIFO ordering, 32-record bound, 63 backlog, partial failure, cutoff, timing, display-off PASS')
