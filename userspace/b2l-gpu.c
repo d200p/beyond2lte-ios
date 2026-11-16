@@ -2468,6 +2468,12 @@ gles_context(void *server)
 	if (ctx == NULL) {
 		unlink(GLES_MARKER);
 	}
+	/* b2l_eagl.c reads Core Animation's current function from it for the draws made with no
+	 * program (see "Draws with no program" there). */
+	void (*set_ca_context)(void *) = (void (*)(void *))dlsym(mesa, "b2l_eagl_set_ca_context");
+	if (set_ca_context != NULL && ctx != NULL) {
+		set_ca_context(ctx);
+	}
 	gles_ctx = ctx;
 	gles_active = ctx != NULL;
 	return ctx;

@@ -287,7 +287,7 @@ static int idx_get_string, idx_tex_image2D, idx_tex_sub_image2D, idx_finish_obje
     idx_create_shader_object, idx_create_program_object, idx_attach_object, idx_detach_object,
     idx_get_object_parameteriv, idx_get_object_parameterfv, idx_get_info_log, idx_get_attached_objects,
     idx_get_handle, idx_insert_marker, idx_push_marker, idx_pop_marker, idx_shader_source, idx_attrib_pointer,
-    idx_draw_elements, idx_link_program;
+    idx_draw_elements, idx_link_program, idx_draw_arrays, idx_uniform_matrix4fv;
 
 #define HANDLE(h) ((GLuint)(uintptr_t)(h))
 #define TO_HANDLE(n) ((void *)(uintptr_t)(n))
@@ -679,6 +679,273 @@ draw_expanded(struct _glapi_table *d, uint32_t mode, int32_t count, uint32_t typ
 	return true;
 }
 
+/*
+ * ---- Draws with no program ----
+ *
+ * Adapted from HakiOS (github.com/oosexgang/hackios-xnu-kernel, userland/src/eagl.c, MIT):
+ * where Core Animation's OpenGL ES renderer has no shader for one of its "functions" it still
+ * draws, with glUseProgram(0). On Apple's library that meant something; in OpenGL ES it draws
+ * nothing. On iOS 16.5 HakiOS found the lock screen's wallpaper and clock among them, and the
+ * home indicator (a filter with a one-row table on the second unit); iOS 26's GLContext refuses
+ * more functions still (GLContext::function_supported: no kind above 0x39 but 0x78, the Liquid
+ * Glass ones among them). Such a draw is made here with a program of ours, the plainest: Core
+ * Animation's own arrays (position 0, colour 1, texture coordinates 2, the latter in the
+ * texture's pixels), the matrix it gives its own programs (read where it keeps it: the pointer
+ * it last passed to glUniformMatrix4fv), and the colour times the texture on the first unit; or,
+ * with a one-row table on the second unit, HakiOS's home-indicator arithmetic. A draw that would
+ * read the texture it draws into, or has no texture, is left as it was (nothing drawn).
+ *
+ * Every such draw is counted by Core Animation's function (the shader kind byte of its current
+ * state, context + 0x10 -> + 0x10, as GLContext::function_supported reads it) and a census goes
+ * to the log every 10 s; the first ones are described. B2L_EAGL_PLAIN=0 turns the drawing off
+ * (the census stays).
+ */
+static const char plain_vertex_source[] =
+    "#version 300 es\n"
+    "uniform highp mat4 vertex_matrix;\n"
+    "in highp vec4 vertex_position;\n"
+    "in lowp vec4 vertex_color;\n"
+    "in highp vec2 vertex_texcoord0;\n"
+    "out lowp vec4 color;\n"
+    "out highp vec2 texcoord;\n"
+    "void main() {\n"
+    "  gl_Position = vertex_matrix * vertex_position;\n"
+    "  color = vertex_color;\n"
+    "  texcoord = vertex_texcoord0;\n"
+    "}\n";
+static const char plain_fragment_source[] =
+    "#version 300 es\n"
+    "uniform lowp sampler2D texture0;\n"
+    "in lowp vec4 color;\n"
+    "in highp vec2 texcoord;\n"
+    "out lowp vec4 result;\n"
+    "void main() {\n"
+    "  result = color * texture(texture0, texcoord / vec2(textureSize(texture0, 0)));\n"
+    "}\n";
+static const char table_fragment_source[] =
+    "#version 300 es\n"
+    "uniform lowp sampler2D texture0;\n"
+    "uniform lowp sampler2D table;\n"
+    "in lowp vec4 color;\n"
+    "in highp vec2 texcoord;\n"
+    "out lowp vec4 result;\n"
+    "const mediump float white = .284, amount = 1., overlay = .31;\n"
+    "void main() {\n"
+    "  mediump vec4 behind = texture(texture0, texcoord / vec2(textureSize(texture0, 0)));\n"
+    "  mediump vec4 entry = texture(table, vec2(dot(behind.rgb, vec3(.2125, .7154, .0721)), .5));\n"
+    "  mediump vec4 bar = clamp(entry + vec4(vec3(white), 1.), 0., 1.) * amount;\n"
+    "  mediump vec4 under = behind * (1. - bar.a) + bar;\n"
+    "  mediump vec4 over = under * overlay;\n"
+    "  mediump vec3 dark = 2. * under.rgb * over.rgb;\n"
+    "  mediump vec3 light = over.a * under.a - 2. * (under.a - under.rgb) * (over.a - over.rgb);\n"
+    "  mediump vec3 both = mix(dark, light, step(under.a * .5, under.rgb));\n"
+    "  mediump float opacity = over.a + under.a * (1. - over.a);\n"
+    "  result = vec4(clamp(both + over.rgb * (1. - under.a) + under.rgb * (1. - over.a), 0., opacity), opacity);\n"
+    "}\n";
+
+#define PLAIN_FUNCTIONS 256
+enum { PLAIN_DRAWN, PLAIN_TABLE, PLAIN_UNTEXTURED, PLAIN_SELF, PLAIN_OFF, PLAIN_KINDS };
+static const char plain_kind_names[PLAIN_KINDS] = { 'p', 't', 'u', 's', 'o' };
+static void *plain_ca_context;                  /* CA::OGL::GLESContext (b2l-gpu.c) */
+static const GLfloat *plain_matrix;             /* where Core Animation keeps its programs' matrix */
+static GLuint plain_programs[2];                /* colour x texture; home-indicator table */
+static GLint plain_matrix_at[2];
+static int plain_enabled = -1;
+static unsigned plain_counts[PLAIN_FUNCTIONS][PLAIN_KINDS], plain_described;
+static uint64_t plain_window_start;
+
+B2L_EXPORT void b2l_eagl_set_ca_context(void *context);
+void
+b2l_eagl_set_ca_context(void *context)
+{
+	plain_ca_context = context;
+}
+
+/* Core Animation's current function, 255 when it cannot be read. */
+static unsigned
+plain_function(void)
+{
+	const uint8_t *const *state = plain_ca_context != NULL ? (const uint8_t *const *)((const char *)plain_ca_context + 0x10) :
+	    NULL;
+	return state != NULL && *state != NULL ? (*state)[0x10] : 255;
+}
+
+static GLuint
+plain_compile(struct _glapi_table *d, const char *fragment_source)
+{
+	static const char *const attributes[3] = { "vertex_position", "vertex_color", "vertex_texcoord0" };
+	const GLchar *text[2] = { plain_vertex_source, fragment_source };
+	GLuint program = CALL_CreateProgram(d, ());
+	for (unsigned i = 0; i < 2; i++) {
+		GLuint shader = CALL_CreateShader(d, (i == 0 ? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER));
+		CALL_ShaderSource(d, (shader, 1, &text[i], NULL));
+		CALL_CompileShader(d, (shader));
+		CALL_AttachShader(d, (program, shader));
+		CALL_DeleteShader(d, (shader));
+	}
+	for (GLuint i = 0; i < 3; i++) {
+		CALL_BindAttribLocation(d, (program, i, attributes[i]));
+	}
+	CALL_LinkProgram(d, (program));
+	GLint ok = 0;
+	CALL_GetProgramiv(d, (program, GL_LINK_STATUS, &ok));
+	if (!ok) {
+		char log[160] = "";
+		CALL_GetProgramInfoLog(d, (program, (GLsizei)sizeof(log), NULL, log));
+		note("no-program draws: our %s program not linked: %s", fragment_source == plain_fragment_source ? "plain" : "table",
+		    log);
+		CALL_DeleteProgram(d, (program));
+		return 0;
+	}
+	CALL_UseProgram(d, (program));
+	CALL_Uniform1i(d, (CALL_GetUniformLocation(d, (program, "texture0")), 0));
+	if (fragment_source == table_fragment_source) {
+		CALL_Uniform1i(d, (CALL_GetUniformLocation(d, (program, "table")), 1));
+	}
+	return program;
+}
+
+static void
+plain_census(void)
+{
+	uint64_t now = now_ms();
+	if (plain_window_start == 0) {
+		plain_window_start = now;
+	}
+	if (now - plain_window_start < 10000) {
+		return;
+	}
+	plain_window_start = now;
+	char line[220];
+	size_t used = 0;
+	for (unsigned f = 0; f < PLAIN_FUNCTIONS && used < sizeof(line) - 24; f++) {
+		for (unsigned k = 0; k < PLAIN_KINDS && used < sizeof(line) - 24; k++) {
+			if (plain_counts[f][k] != 0) {
+				used += (size_t)snprintf(line + used, sizeof(line) - used, " f%u%c=%u", f, plain_kind_names[k],
+				    plain_counts[f][k]);
+				plain_counts[f][k] = 0;
+			}
+		}
+	}
+	if (used != 0) {
+		note("no-program draws in 10 s (function, p plain, t table, u untextured, s self, o off):%s", line);
+	}
+}
+
+/* Before a draw: 1 when it is one of ours, set up (plain_end after it). */
+static int
+plain_begin(struct _glapi_table *d, GLint enabled[3], GLint *unit_before)
+{
+	GLint program = 0;
+	CALL_GetIntegerv(d, (GL_CURRENT_PROGRAM, &program));
+	if (program != 0) {
+		return 0;
+	}
+	if (plain_enabled < 0) {
+		const char *env = getenv("B2L_EAGL_PLAIN");
+		plain_enabled = env == NULL || env[0] != '0';
+		note("draws with no program %s", plain_enabled ? "made with our programs" : "left alone (B2L_EAGL_PLAIN=0)");
+	}
+	unsigned function = plain_function();
+	GLint unit = 0, textures[2] = { 0, 0 }, framebuffer = 0, attached = 0, type = 0, rows = 0;
+	CALL_GetIntegerv(d, (GL_ACTIVE_TEXTURE, &unit));
+	for (unsigned i = 0; i < 2; i++) {
+		CALL_ActiveTexture(d, (GL_TEXTURE0 + i));
+		CALL_GetIntegerv(d, (GL_TEXTURE_BINDING_2D, &textures[i]));
+	}
+	if (textures[1] != 0) {
+		CALL_GetTexLevelParameteriv(d, (GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &rows));
+	}
+	CALL_ActiveTexture(d, ((GLenum)unit));
+	CALL_GetIntegerv(d, (GL_FRAMEBUFFER_BINDING, &framebuffer));
+	if (framebuffer != 0) {
+		CALL_GetFramebufferAttachmentParameteriv(d, (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+		    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type));
+		if (type == GL_TEXTURE) {
+			CALL_GetFramebufferAttachmentParameteriv(d, (GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+			    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &attached));
+		}
+	}
+	bool table = textures[0] != 0 && rows == 1;
+	unsigned kind = !plain_enabled ? PLAIN_OFF : textures[0] == 0 ? PLAIN_UNTEXTURED :
+	    attached != 0 && attached == textures[0] ? PLAIN_SELF : table ? PLAIN_TABLE : PLAIN_DRAWN;
+	plain_counts[function < PLAIN_FUNCTIONS ? function : PLAIN_FUNCTIONS - 1][kind]++;
+	if (plain_described < 12) {
+		plain_described++;
+		const GLfloat *m = plain_matrix;
+		note("no-program draw: function %u into framebuffer %d (colour %d), textures %d %d (%d rows), %s; matrix %s%s",
+		    function, framebuffer, attached, textures[0], textures[1], rows,
+		    kind == PLAIN_DRAWN ? "drawn plainly" : kind == PLAIN_TABLE ? "drawn through the table" :
+		    kind == PLAIN_UNTEXTURED ? "left alone: no texture" : kind == PLAIN_SELF ? "left alone: reads what it writes" :
+		    "left alone: off", m != NULL ? "seen" : "not seen yet", m != NULL && m[15] == 0.0f ? " (w 0)" : "");
+	}
+	plain_census();
+	if (kind != PLAIN_DRAWN && kind != PLAIN_TABLE) {
+		return 0;
+	}
+	unsigned which = kind == PLAIN_TABLE ? 1 : 0;
+	if (plain_programs[which] == 0) {
+		plain_programs[which] = plain_compile(d, which ? table_fragment_source : plain_fragment_source);
+		if (plain_programs[which] == 0) {
+			plain_enabled = 0;
+			return 0;
+		}
+		plain_matrix_at[which] = CALL_GetUniformLocation(d, (plain_programs[which], "vertex_matrix"));
+	}
+	static const GLfloat identity[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+	CALL_UseProgram(d, (plain_programs[which]));
+	CALL_UniformMatrix4fv(d, (plain_matrix_at[which], 1, GL_FALSE, plain_matrix != NULL ? plain_matrix : identity));
+	for (GLuint i = 0; i < 3; i++) {
+		CALL_GetVertexAttribiv(d, (i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled[i]));
+		if (!enabled[i]) {
+			CALL_EnableVertexAttribArray(d, (i));
+		}
+	}
+	*unit_before = unit;
+	return 1;
+}
+
+static void
+plain_end(struct _glapi_table *d, const GLint enabled[3])
+{
+	for (GLuint i = 0; i < 3; i++) {
+		if (!enabled[i]) {
+			CALL_DisableVertexAttribArray(d, (i));
+		}
+	}
+	CALL_UseProgram(d, (0));
+}
+
+/* Core Animation hands every program its matrix from one place: that place is kept. */
+static void
+gli_uniform_matrix4fv(void *c, int32_t location, int32_t count, uint8_t transpose, const void *value)
+{
+	if (!begin(c, (unsigned)idx_uniform_matrix4fv, (uint64_t)location)) {
+		return;
+	}
+	if (value != NULL && count == 1) {
+		plain_matrix = value;
+	}
+	CALL_UniformMatrix4fv(GET_DISPATCH(), (location, count, transpose, value));
+	b2l_gli_leave((unsigned)idx_uniform_matrix4fv);
+}
+
+static void
+gli_draw_arrays(void *c, uint32_t mode, int32_t first, int32_t count)
+{
+	if (!begin(c, (unsigned)idx_draw_arrays, mode)) {
+		return;
+	}
+	struct _glapi_table *d = GET_DISPATCH();
+	GLint enabled[3] = { 1, 1, 1 }, unit = 0;
+	int ours = plain_begin(d, enabled, &unit);
+	CALL_DrawArrays(d, (mode, first, count));
+	if (ours) {
+		plain_end(d, enabled);
+	}
+	b2l_gli_leave((unsigned)idx_draw_arrays);
+}
+
 static void
 gli_draw_elements(void *c, uint32_t mode, int32_t count, uint32_t type, const void *indices)
 {
@@ -721,7 +988,12 @@ gli_draw_elements(void *c, uint32_t mode, int32_t count, uint32_t type, const vo
 		note("draw %u: mode 0x%x count %d type 0x%x indices %p (element buffer %d) program %d range %u..%u first %s",
 		    logged++, mode, count, type, indices, element_buffer, program, lo, hi, first);
 	}
+	GLint enabled[3] = { 1, 1, 1 }, unit = 0;
+	int ours = plain_begin(d, enabled, &unit);
 	CALL_DrawElements(d, (mode, count, type, indices));
+	if (ours) {
+		plain_end(d, enabled);
+	}
 	b2l_gli_leave((unsigned)idx_draw_elements);
 }
 
@@ -1013,7 +1285,9 @@ gli_fill(struct b2l_eagl *e)
 	gli_own(e, "vertex_attrib_pointer_ARB", (void *)gli_attrib_pointer, &idx_attrib_pointer);
 	gli_own(e, "draw_elements", (void *)gli_draw_elements, &idx_draw_elements);
 	gli_own(e, "link_program_ARB", (void *)gli_link_program, &idx_link_program);
-	note("GLI table: %u entries, %u with a Mesa function, 21 our own", (unsigned)B2L_GLI_COUNT, mapped);
+	gli_own(e, "draw_arrays", (void *)gli_draw_arrays, &idx_draw_arrays);
+	gli_own(e, "uniform_matrix4fv_ARB", (void *)gli_uniform_matrix4fv, &idx_uniform_matrix4fv);
+	note("GLI table: %u entries, %u with a Mesa function, 23 our own", (unsigned)B2L_GLI_COUNT, mapped);
 }
 
 /* ---- IOSurfaces as EGL images ---- */
