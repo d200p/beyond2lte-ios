@@ -416,6 +416,29 @@ restored to its old contents; all normal BAR/window/ATU/PHY/power cleanup still
 runs. Copy/readback completion and cleanup are separate results. This step
 does not execute firmware or provide networking.
 
+## S10 (beyond1lte): firmware and attachment
+
+The S10's own vendor partition (G973FXXUHHXJ1, read from TWRP with
+`mount -o ro,noload`, nothing written) holds the same station firmware the
+S10+ branch pins: `bcmdhd_sta.bin_b1`, 1,297,036 bytes, SHA-256
+`1676f46c...3c54ad`, so mode 10 needs no S10 variant. The files and the
+phone's Wi-Fi address stay in a private folder outside the repository.
+
+`scripts/attach-wifi-firmware.py` turns a CI BOOT image into a private one:
+it writes `B2LWIFI1`, the six address octets and the `B2LFW001` descriptor
+at trailer + 288, appends the firmware after the Mach-O and checks the
+result with `package-boot.py`'s verifier (build 61's image grew from
+27,985,800 to 29,282,836 bytes, inside the 32 MiB flash image). The S10's
+loader now selects `b2l_wifi_diag=10`; a CI image without the attachment
+skips all Wi-Fi MMIO.
+
+NVRAM is not chosen yet. The S10 has two B1 candidates, Semco
+`nvram.txt_CS01_semco_b1` (the S10+'s pick) and Murata
+`nvram.txt_1rh_es43_b1`; the recovery driver reads the module from the
+chip's OTP only when the interface comes up, and its boot log says
+"Couldn't find the nvram tag". Firmware execution (the next checkpoint)
+needs that answer.
+
 ## Recovery evidence
 
 With one rooted beyond2lte in TWRP, collect cached PCI IDs, resources, driver
