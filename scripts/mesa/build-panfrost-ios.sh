@@ -29,7 +29,11 @@ cross="$build/ios-arm64e.txt"
 # into one pair) wrote across a page boundary of an upload buffer and took
 # an alignment fault; the load/store pair pass is off, so every access to
 # such memory stays one aligned access that cannot cross a page.
-flags="'-target', 'arm64e-apple-ios26.0', '-isysroot', '$sdk', '-fno-ptrauth-returns', '-fno-ptrauth-calls', '-fno-ptrauth-intrinsics', '-mstrict-align', '-mllvm', '-aarch64-enable-ldst-opt=false', '-I$repo/scripts/mesa/include'"
+# -D_DARWIN_C_SOURCE (2026-11-16, Xcode 27.1): its SDK has <endian.h>, so Mesa's
+# u_endian.h tests BYTE_ORDER, which Darwin's headers hide where a file defines
+# _POSIX_C_SOURCE (flex's lexers do): program_lex.yy.c stopped the build with
+# "UTIL_ARCH_LITTLE_ENDIAN and/or UTIL_ARCH_BIG_ENDIAN were unset".
+flags="'-target', 'arm64e-apple-ios26.0', '-isysroot', '$sdk', '-fno-ptrauth-returns', '-fno-ptrauth-calls', '-fno-ptrauth-intrinsics', '-mstrict-align', '-mllvm', '-aarch64-enable-ldst-opt=false', '-D_DARWIN_C_SOURCE', '-I$repo/scripts/mesa/include'"
 cat > "$cross" <<EOF
 [binaries]
 c = '$cc'
@@ -127,6 +131,7 @@ if [[ -f "$lib" ]]; then
   shasum -a 256 "$lib" "$build/b2l-mesa/libb2l-mesa.dylib" > "$build/b2l-mesa-symbols/SHA256SUMS"
 else
   echo "b2l-mesa: not built" | tee "$build/b2l-mesa.log"
+  mesa_missing=1
 fi
 # The B2LMali libdrm alone, against this release's DRM uapi headers, with -Werror.
 drm_out="$build/b2l-drm"
@@ -139,4 +144,10 @@ if "$cc" -target arm64e-apple-ios26.0 -isysroot "$sdk" -fno-ptrauth-returns -fno
   echo "b2l-drm: built $drm_out/libb2l-drm.a" | tee -a "$build/b2l-drm.log"
 else
   echo "b2l-drm: FAILED" | tee -a "$build/b2l-drm.log"
+fi
+# A run without the library must fail: the kernel build would otherwise embed
+# the last good one without saying so (2026-11-16). The logs upload anyway.
+if [[ -n "${mesa_missing:-}" ]]; then
+  echo "b2l-mesa: build failed, see build.log" >&2
+  exit 1
 fi
