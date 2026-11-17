@@ -19,5 +19,13 @@ HakiOS's `docs/air.md`, section 3.1.
 of it is `scripts/mesa/b2l-target/b2l_mtl_sweep.c` (docs/metal-on-panfrost.md,
 milestone M0).
 
-Changes made here to these files: none. Fixes go in as separate, marked
-commits so the difference from upstream stays readable.
+Changes made here to these files, each marked "S10 port" in the source and
+made in a commit of its own so the difference from upstream stays readable:
+
+- `air_intrinsics.c`: iOS 26.6's AIR (`air64_v28`) reads a texture with
+  `air.read_texture_2d(tex, air.get_read_sampler(), coord, offset, level, 0)`.
+  `air.get_read_sampler` gives a sampler pointer bound to nothing, and the read
+  branch consumes it and the offset (adding a non-zero one to the coordinate).
+  QuartzCore's `sdf_gen_field`, `sdf_gen_gradients`, `rim_outline`,
+  `brim_jump`, `brim_outline`, `read_surf_frag`, `compute_apl` and
+  `compute_average_luma` were refused for it in boot 64.

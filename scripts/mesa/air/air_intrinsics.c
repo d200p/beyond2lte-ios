@@ -2280,6 +2280,25 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
          return false;
       arg++;
    }
+   bool read_handle = false;   /* S10 port: the iOS 26 form of read, below */
+   if (!have_sampler && !strcmp(t.op, "read") && in->num_operands > arg &&
+       in->operands[arg]->type != NULL && in->operands[arg]->type->kind == AIR_TYPE_POINTER) {
+      /* S10 port (iOS 26.6 AIR, air64_v28): texture.read() passes the handle
+       * air.get_read_sampler() returns straight after the texture --
+       *    air.read_texture_2d.v4f16(ptr as(1) tex, ptr as(2) samp, <2 x i32> coord,
+       *                              <2 x i32> offset, i32, i32)
+       * in QuartzCore's sdf_gen_field, rim_outline, read_surf_frag and nine more.
+       * It names no binding (see get_read_sampler in air_translate_call) and a
+       * texel fetch takes no sampler, so it is consumed and nothing else. */
+      struct air_val *v = air_get(c, in->operands[arg]);
+      if (!v)
+         return false;
+      if (v->kind != AIR_VAL_PTR || v->ptr.class != AIR_PTR_SAMPLER)
+         return air_error(c, "intrinsic: air.%s with a pointer after the texture that is "
+                             "not a sampler", n->part[0]);
+      arg++;
+      read_handle = true;
+   }
 
    /* A depth texture takes a plane or aspect selector before the coordinate,
     * and every call in the corpus passes 1. What else it can be is not known
@@ -2373,6 +2392,24 @@ texture_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *
    nir_def *coord = tex_coord_and_layer(c, in, &t, n, &arg, ncoord);
    if (!coord)
       return false;
+
+   /* S10 port (iOS 26.6 AIR): in the form with a read handle an integer offset
+    * follows the coordinate, and the level (or sample) comes after it, which is
+    * where the branches below read it. Every call in QuartzCore passes
+    * zeroinitializer; a non-zero one is added to the texel coordinate. */
+   if (read_handle) {
+      if (in->num_operands <= arg)
+         return air_error(c, "intrinsic: air.%s without the offset its iOS 26 form has",
+                          n->part[0]);
+      nir_def *offset = air_get_ssa(c, in->operands[arg++]);
+      if (!offset)
+         return false;
+      if (!all_zero(offset)) {
+         offset = nir_pad_vector_imm_int(&c->b, nir_u2uN(&c->b, offset, coord->bit_size), 0,
+                                         coord->num_components);
+         coord = nir_iadd(&c->b, coord, offset);
+      }
+   }
 
    if (!strcmp(t.op, "read") && tex.is_image) {
       uint64_t extra;
@@ -2634,6 +2671,14 @@ air_translate_call(struct air_ctx *c, const struct air_inst *in, const char *nam
       return atomic_op(c, in, &n);
    if (!strcmp(n.part[0], "discard_fragment"))
       return discard_op(c, in);
+   /* S10 port (iOS 26.6 AIR): `ptr addrspace(2) air.get_read_sampler()`, the
+    * handle texture.read() passes after the texture (texture_op consumes it).
+    * A sampler pointer bound to nothing: a texel fetch has no sampler state. */
+   if (!strcmp(n.part[0], "get_read_sampler") && n.num == 1) {
+      struct air_ptr p = { .class = AIR_PTR_SAMPLER, .binding = ~0u };
+      air_set(c, &in->base, air_val_ptr(c, p));
+      return true;
+   }
 
    bool handled = false;
    /* before math_op, which resolves every argument as a number: these take a
