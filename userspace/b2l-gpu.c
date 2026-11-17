@@ -2050,7 +2050,7 @@ mesa_probe(void)
  */
 #define MTL_SWEEP_MARKER   "/private/var/tmp/b2l-mtl-sweep.running"
 #define MTL_SWEEP_PROGRESS "/private/var/tmp/b2l-mtl-sweep.next"
-#define MTL_SWEEP_DELAY_S  45u    /* after backboardd starts: the UI first */
+#define MTL_SWEEP_DELAY_S  120u   /* after backboardd starts: the UI and the first apps first */
 #define MTL_SWEEP_STALL_S  600u   /* one phase this long is taken as hung (boot 64: 120 s cut the uber shader) */
 #define MTL_SWEEP_RESTARTS 40u
 #define MTL_SWEEP_FINISHED 4294967295L /* the progress file once b2l_mtl_sweep returns */
@@ -2060,12 +2060,13 @@ extern char **environ;
 static void
 mtl_sweep_child(const char *start)
 {
-	/* Utility, not background: M0.1 measures how long the compiler takes, and
-	 * background confines it to the slowest cores. The CPU-usage monitor is
-	 * turned off for this process: in boot 64 the busy "backboardd" kept
-	 * spindump on one or two cores for minutes. */
-	setpriority(PRIO_PROCESS, 0, 10);
-	pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+	/* Background: in boot 65 (utility QoS) backboardd crashed in a texture
+	 * upload while this compiled the uber shader beside it, and M0.2 times
+	 * only the uber shaders; the times are the little cores' then, an upper
+	 * bound. The CPU-usage monitor is turned off for this process: in boot 64
+	 * the busy "backboardd" kept spindump on one or two cores for minutes. */
+	setpriority(PRIO_PROCESS, 0, 20);
+	pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
 	int (*disable_cpumon)(pid_t) = (int (*)(pid_t))dlsym(RTLD_DEFAULT, "proc_disable_cpumon");
 	if (disable_cpumon != NULL) {
 		disable_cpumon(getpid());

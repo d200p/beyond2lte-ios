@@ -8,10 +8,12 @@
  * nothing is submitted, the GPU and its runtime are not touched, and the
  * library is read where it lies (nothing of Apple's leaves the phone).
  *
- * The window server's uber shader (fixed_frag_lph_cph / _cpf) is compiled
- * once per texture function in texture_functions[] (52 = vcm, 59 = dff, ...),
- * that function constant (index 28) supplied and every other one left
- * unsupplied, with each phase timed and logged as it ends.
+ * M0.2: only the window server's uber shaders (fixed_frag_lph_cph / _cpf),
+ * each once per texture function in texture_functions[] (52 = vcm, 59 = dff,
+ * ...), that function constant (index 28) supplied and every other one left
+ * unsupplied, and once as the generic shader (fc_generic, index 0, = 1), with
+ * each phase timed and logged as it ends; the NIR is cleaned up (tidy) after
+ * the frontend so its size shows what field folding left.
  *
  * Before the driver: the frontend's system-value variables lowered, the
  * fragment position moved to the half pixel, driver locations assigned, as a
@@ -63,6 +65,7 @@ bool panfrost_nir_lower_sysvals(nir_shader *s, unsigned arch, struct panfrost_sy
 #define MTL_LIBRARY     "/System/Library/Frameworks/QuartzCore.framework/default.metallib"
 #define MTL_AIR64_CPU   0x01000017u  /* the AIR64 slice of a fat metallib */
 #define MTL_FC_TEXTURE  28u          /* fc_texture_function: the CA function code */
+#define MTL_FC_GENERIC  0u           /* fc_generic: the configuration from a buffer (has_config) */
 
 /* Texture functions the uber shader is compiled with: clr, img, vcm (the
  * labels' vibrancy), dff (SDF fill), kfh (key fill highlight), ghn (glass).
@@ -211,8 +214,27 @@ category(const char *error)
    return 5;
 }
 
+/* NIR's usual clean-up, to a fixed point (at most 16 rounds): what the
+ * field-folded constants leave of the uber shader, before the driver. */
+static void
+tidy(nir_shader *nir)
+{
+   bool progress = true;
+   for (unsigned i = 0; progress && i < 16; i++) {
+      progress = false;
+      progress |= nir_copy_prop(nir);
+      progress |= nir_opt_constant_folding(nir);
+      progress |= nir_opt_dce(nir);
+      progress |= nir_opt_dead_cf(nir);
+      progress |= nir_opt_cse(nir);
+   }
+}
+
 /* One job: one function, with the texture function constant supplied
- * (texture_function >= 0) or nothing supplied. */
+ * (texture_function >= 0), as the generic shader (MTL_GENERIC: fc_generic
+ * supplied as 1, the configuration read from its buffer at run time), or
+ * nothing supplied (-1). */
+#define MTL_GENERIC (-2)
 static void
 run_job(unsigned job, const struct air_metallib_function *f, int texture_function, struct tally *t)
 {
@@ -220,10 +242,11 @@ run_job(unsigned job, const struct air_metallib_function *f, int texture_functio
    struct air_constant_value *constants = NULL;
    unsigned num_constants = air_module_function_constants(mem, f->bitcode, f->bitcode_size, &constants);
    bool supplied = false;
-   if (texture_function >= 0) {
+   const unsigned want = texture_function == MTL_GENERIC ? MTL_FC_GENERIC : MTL_FC_TEXTURE;
+   if (texture_function >= 0 || texture_function == MTL_GENERIC) {
       for (unsigned i = 0; i < num_constants; i++) {
-         if (constants[i].index == MTL_FC_TEXTURE) {
-            constants[i].bits = (uint64_t)texture_function;
+         if (constants[i].index == want) {
+            constants[i].bits = texture_function == MTL_GENERIC ? 1 : (uint64_t)texture_function;
             constants[i].supplied = true;
             supplied = true;
          }
@@ -235,7 +258,9 @@ run_job(unsigned job, const struct air_metallib_function *f, int texture_functio
    memset(&info, 0, sizeof(info));
    const char *error = NULL;
    char label[96];
-   if (texture_function >= 0)
+   if (texture_function == MTL_GENERIC)
+      snprintf(label, sizeof(label), "%s generic%s", f->name, supplied ? "" : "(no fc0)");
+   else if (texture_function >= 0)
       snprintf(label, sizeof(label), "%s tf=%d%s", f->name, texture_function, supplied ? "" : "(no fc28)");
    else
       snprintf(label, sizeof(label), "%s", f->name);
@@ -263,9 +288,13 @@ run_job(unsigned job, const struct air_metallib_function *f, int texture_functio
       return;
    }
    unsigned air_instrs = count_instrs(nir);
+   uint64_t tt = now_us();
+   tidy(nir);
+   unsigned tidy_instrs = count_instrs(nir);
    if (slow || t1 - t0 > 5000000)
-      note("mtl M0: [%u] %s: AIR done in %llu ms, %u NIR instructions", job, label,
-           (unsigned long long)((t1 - t0) / 1000), air_instrs);
+      note("mtl M0: [%u] %s: AIR done in %llu ms, %u NIR instructions, %u after clean-up (%llu ms)", job,
+           label, (unsigned long long)((t1 - t0) / 1000), air_instrs, tidy_instrs,
+           (unsigned long long)((now_us() - tt) / 1000));
 
    /* What a Gallium frontend does before the driver sees the NIR: the
     * frontend's system-value variables become intrinsics (boot 64: the nine
@@ -353,14 +382,15 @@ b2l_mtl_sweep(unsigned start, const char *progress_path)
       return 3;
    }
 
-   /* The jobs: every function once, then the uber shaders once per texture
-    * function. Their numbering is fixed by the library, so a restart after a
-    * crash names the same job. */
+   /* The jobs (M0.2): the uber shaders only -- every other function compiled
+    * in boot 65 -- each once per texture function and once as the generic
+    * shader, which is the last of its jobs. The numbering is fixed by the
+    * library, so a restart after a crash names the same job. */
    unsigned uber = 0;
    for (unsigned i = 0; i < lib.num_functions; i++)
       uber += is_uber(lib.functions[i].name);
-   unsigned per_uber = sizeof(texture_functions) / sizeof(texture_functions[0]);
-   unsigned total = lib.num_functions + uber * per_uber;
+   unsigned per_uber = sizeof(texture_functions) / sizeof(texture_functions[0]) + 1;
+   unsigned total = uber * per_uber;
    if (start == 0)
       note("mtl M0: QuartzCore library %zu bytes (AIR64 slice %zu), version %u.%u, %u functions, %u uber; "
            "%u jobs for gpu 0x%x",
@@ -372,25 +402,13 @@ b2l_mtl_sweep(unsigned start, const char *progress_path)
    memset(&t, 0, sizeof(t));
    uint64_t began = now_us();
    unsigned job = 0;
-   for (unsigned i = 0; i < lib.num_functions; i++, job++) {
-      if (job < start)
-         continue;
-      if (is_uber(lib.functions[i].name)) {
-         /* Never asked for without its constants: CoreAnimation supplies
-          * them, and boot 64 spent its 120 s on it. Compiled below. */
-         note("mtl M0: [%u] %s: unsupplied form skipped, see the texture-function jobs", job,
-              lib.functions[i].name);
-         continue;
-      }
-      run_job(job, &lib.functions[i], -1, &t);
-   }
    for (unsigned i = 0; i < lib.num_functions; i++) {
       if (!is_uber(lib.functions[i].name))
          continue;
       for (unsigned k = 0; k < per_uber; k++, job++) {
          if (job < start)
             continue;
-         run_job(job, &lib.functions[i], texture_functions[k], &t);
+         run_job(job, &lib.functions[i], k + 1 < per_uber ? texture_functions[k] : MTL_GENERIC, &t);
       }
    }
    /* UINT32_MAX: finished (b2l-gpu.c MTL_SWEEP_FINISHED), whatever the

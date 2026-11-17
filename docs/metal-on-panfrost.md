@@ -63,6 +63,34 @@ QuartzCore's library: AIR64 slice 1,552,128 bytes, MTLB 1.2, 189 functions.
   limit 600 s per phase; the child at utility QoS with the CPU monitor off;
   the parent logs the phase a child died in.
 
+## M0.1 result (boot 65, build 64)
+
+- 173 of 189 functions compile; the 16 left are the tile shaders. The read
+  form and the position fix work (dynamic_system_ootf_decimate, the radial and
+  conic gradients, variable_blur_frag, path_rect/path_cubic all compile).
+- Ordinary functions: AIR 5 to 200 ms, Bifrost 2 to 150 ms at utility QoS.
+- The uber shader did not specialise: 72 618 NIR instructions for texture
+  functions 0, 1 and 52 alike, 56 475 after preprocessing, 47.4 s in Bifrost,
+  296 160 bytes of code, 64 registers, 220 bytes of thread storage. Its
+  configuration is a struct the frontend did not fold.
+- QuartzCore's `default.pipelinelib` is an empty directory on iOS 26: there
+  are no prebuilt variants to take, the specialisation is ours.
+- backboardd (the real one) crashed at 196 s opening Weather, in the GLES
+  path: `gli_tex_image2D` → `_mesa_TexImage2D` → `st_TexSubImage` →
+  `util_copy_box` → `memcpy` reading the pixels Core Animation passed. Not in
+  the Metal code (another process), while the child compiled the uber shader
+  at utility QoS; no jetsam.
+
+## M0.2
+
+- Field folding in the frontend (scripts/mesa/air/README.md).
+- The sweep compiles only the two uber shaders: six texture functions each,
+  and the generic shader (fc_generic = 1, the configuration from its buffer at
+  run time) once, which is the one that could be compiled once and kept as the
+  fallback while specialised variants compile. A NIR clean-up after the
+  frontend shows what folding left; 120 s after backboardd starts, background
+  QoS.
+
 ## What iOS 26 does (read from the 23G90 cache)
 
 - **Discovery.** `-[MTLIOAccelServiceGlobalContext init]` (Metal) matches
