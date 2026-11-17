@@ -221,7 +221,23 @@ struct air_ctx {
       bool known;
       uint64_t bits;
       unsigned bit_size;
+
+      /* S10 port: the same for the BYTES of a program-scope variable of any
+       * type -- iOS 26's QuartzCore keeps its uber shader's configuration in a
+       * FragmentShaderConfig struct the constructor fills field by field, and
+       * the body reads fields through a select between it and a bound buffer
+       * (plan_field_folding, air_to_nir.c). field_fold: every store that can
+       * reach it is in the first block of an air.static_init function; kbytes
+       * holds what those stores wrote as constants, kmask which bytes that is.
+       */
+      bool field_fold;
+      unsigned size;
+      uint8_t *kbytes, *kmask;
    } *global_plan;
+
+   /* S10 port: set while an air.static_init function is being translated:
+    * field folding records its constant stores then. */
+   bool in_static_init;
 
    /* The translation-time slots: locals and read-only globals that hold a
     * POINTER. Grown as allocas are met; the read-only globals reserve theirs

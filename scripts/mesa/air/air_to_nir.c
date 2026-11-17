@@ -18,6 +18,7 @@
 
 #include "nir_constant_expressions.h"
 #include "util/hash_table.h"
+#include "util/set.h"
 #include "util/u_math.h"
 
 bool
@@ -919,6 +920,60 @@ ptr_offset(struct air_ctx *c, struct air_ptr ptr)
    return ptr.offset ? ptr.offset : nir_imm_int(&c->b, 0);
 }
 
+/* S10 port: the field-folded program-scope variable (plan_field_folding) that
+ * holds the `bytes` at a scratch pointer whose offset is a constant, and where
+ * in it they start; NULL for anything else. */
+static struct air_global_plan *
+field_fold_plan(struct air_ctx *c, struct air_ptr ptr, unsigned bytes, unsigned *at)
+{
+   if (!c->global_plan || ptr.class != AIR_PTR_SCRATCH || bytes == 0)
+      return NULL;
+   uint64_t off = 0;
+   if (ptr.offset) {
+      nir_const_value cv[NIR_MAX_VEC_COMPONENTS];
+      if (ptr.offset->num_components != 1 ||
+          !def_const(ptr.offset, cv, 16, c->nir->info.float_controls_execution_mode))
+         return NULL;
+      off = nir_const_value_as_uint(cv[0], ptr.offset->bit_size);
+   }
+   for (unsigned i = 0; i < c->m->num_globals; i++) {
+      struct air_global_plan *pl = &c->global_plan[i];
+      if (pl->field_fold && off >= pl->offset && off + bytes <= (uint64_t)pl->offset + pl->size) {
+         *at = (unsigned)(off - pl->offset);
+         return pl;
+      }
+   }
+   return NULL;
+}
+
+/* S10 port: a store translated inside air.static_init, into the bytes of a
+ * field-folded variable: its constant value is kept, a value that is not
+ * constant forgets those bytes. A store whose offset is not a constant cannot
+ * be into such a variable: plan_field_folding refused every variable a
+ * getelementptr with a variable index reaches. */
+static void
+field_fold_store(struct air_ctx *c, struct air_ptr ptr, nir_def *value)
+{
+   if (!c->in_static_init || !c->global_plan || ptr.class != AIR_PTR_SCRATCH)
+      return;
+   const unsigned per = value->bit_size / 8;
+   const unsigned bytes = per * value->num_components;
+   unsigned at;
+   struct air_global_plan *pl = field_fold_plan(c, ptr, bytes, &at);
+   if (!pl)
+      return;
+   nir_const_value cv[NIR_MAX_VEC_COMPONENTS];
+   const bool known = per >= 1 && per <= 8 &&
+                      def_const(value, cv, 16, c->nir->info.float_controls_execution_mode);
+   for (unsigned i = 0; i < value->num_components; i++) {
+      uint64_t u = known ? nir_const_value_as_uint(cv[i], value->bit_size) : 0;
+      for (unsigned j = 0; j < per; j++) {
+         pl->kbytes[at + i * per + j] = (uint8_t)(u >> (8 * j));   /* little-endian */
+         pl->kmask[at + i * per + j] = known;
+      }
+   }
+}
+
 nir_def *
 air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type, unsigned align)
 {
@@ -933,6 +988,28 @@ air_load_ptr(struct air_ctx *c, struct air_ptr ptr, const struct air_type *type,
    bool as_bool = bits == 1;
    if (as_bool)
       bits = 8;
+
+   /* S10 port: bytes a static initializer wrote as constants into a
+    * field-folded variable are the load's answer (plan_field_folding). */
+   if (ptr.class == AIR_PTR_SCRATCH && comps <= NIR_MAX_VEC_COMPONENTS &&
+       (bits == 8 || bits == 16 || bits == 32 || bits == 64)) {
+      unsigned at, per = bits / 8;
+      struct air_global_plan *pl = field_fold_plan(c, ptr, comps * per, &at);
+      bool all = pl != NULL;
+      for (unsigned i = 0; all && i < comps * per; i++)
+         all = pl->kmask[at + i];
+      if (all) {
+         nir_const_value cv[NIR_MAX_VEC_COMPONENTS];
+         for (unsigned i = 0; i < comps; i++) {
+            uint64_t u = 0;
+            for (unsigned j = 0; j < per; j++)
+               u |= (uint64_t)pl->kbytes[at + i * per + j] << (8 * j);
+            cv[i] = nir_const_value_for_raw_uint(u, bits);
+         }
+         nir_def *res = nir_build_imm(&c->b, comps, bits, cv);
+         return as_bool ? nir_ine_imm(&c->b, res, 0) : res;
+      }
+   }
 
    nir_def *off = ptr_offset(c, ptr);
    nir_def *res;
@@ -1092,6 +1169,8 @@ air_store_ptr(struct air_ctx *c, struct air_ptr ptr, nir_def *value, unsigned al
    }
    if (!align)
       align = MAX2(value->bit_size / 8, 1);
+
+   field_fold_store(c, ptr, value);   /* S10 port: plan_field_folding */
 
    nir_def *off = ptr_offset(c, ptr);
    switch (ptr.class) {
@@ -6023,6 +6102,146 @@ foldable_global_plan(struct air_ctx *c, const struct air_value *v)
    return NULL;
 }
 
+/*
+ * S10 port: FIELD FOLDING. plan_global_folding above answers a scalar program-
+ * scope variable; iOS 26's QuartzCore keeps the uber shader's configuration in
+ * a FragmentShaderConfig struct instead. Its constructor fills it field by
+ * field, from function constants, in the constructor's first block, and the
+ * body reads the fields through
+ *    select (has_config == 0), @fc_fragment_shader_config, %runtime_config
+ * -- a select AIR_OP_SELECT already resolves when has_config folds. With the
+ * struct in scratch every field load stayed a load_scratch, nothing in the
+ * body folded, and fixed_frag_lph_cph came out at 72 618 NIR instructions and
+ * 47 s of Bifrost whatever texture function it was given (boot 65).
+ *
+ * A variable is field-folded when every store that can reach it is in the
+ * FIRST block of an air.static_init function (which runs once, always, before
+ * the body: run_static_initializers), through the variable itself or a chain
+ * of getelementptrs with constant indices and casts -- never through a select
+ * or a phi, which might not be it -- and nothing else holds its address: no
+ * call takes it, no store stores it, no other global's initialiser mentions
+ * it, no pointer cast turns it into a number. Loads may reach it any way.
+ * Then the bytes those stores wrote as constants are the answer of any load
+ * that reads only such bytes (air_load_ptr); the stores still happen.
+ */
+static bool
+field_related(const struct air_value *v, const struct air_value *g, struct set *derived)
+{
+   return v && (v == g || _mesa_set_search(derived, v) || const_mentions(v, g, 8));
+}
+
+static bool
+field_fold_scan(struct air_ctx *c, const struct air_global *g)
+{
+   for (unsigned k = 0; k < c->m->num_globals; k++) {
+      if (c->m->globals[k] != g && const_mentions(c->m->globals[k]->init, &g->base, 8))
+         return false;
+   }
+   /* derived: pointers made from it in the function being scanned; chosen:
+    * the subset made through a select or a phi somewhere on the way */
+   struct set *derived = _mesa_pointer_set_create(NULL);
+   struct set *chosen = _mesa_pointer_set_create(NULL);
+   bool ok = true;
+   for (unsigned fi = 0; ok && fi < c->m->num_functions; fi++) {
+      const struct air_function *f = c->m->functions[fi];
+      if (f->is_declaration)
+         continue;
+      const bool is_init = f->section && !strcmp(f->section, "air.static_init");
+      _mesa_set_clear(derived, NULL);
+      _mesa_set_clear(chosen, NULL);
+      for (bool grew = true; ok && grew;) {
+         grew = false;
+         for (unsigned bi = 0; ok && bi < f->num_blocks; bi++) {
+            const struct air_block *blk = &f->blocks[bi];
+            for (unsigned ii = 0; ok && ii < blk->num_insts; ii++) {
+               const struct air_inst *in = blk->insts[ii];
+               if (in->op != AIR_OP_GEP && in->op != AIR_OP_CAST && in->op != AIR_OP_SELECT &&
+                   in->op != AIR_OP_PHI)
+                  continue;
+               bool related = false, through_choice = in->op == AIR_OP_SELECT || in->op == AIR_OP_PHI;
+               for (unsigned oi = 0; oi < in->num_operands; oi++) {
+                  if (field_related(in->operands[oi], &g->base, derived)) {
+                     related = true;
+                     if (_mesa_set_search(chosen, in->operands[oi]))
+                        through_choice = true;
+                  }
+               }
+               if (!related)
+                  continue;
+               /* a number made of its address, or an index that is not a constant */
+               if (!in->base.type || in->base.type->kind != AIR_TYPE_POINTER) {
+                  ok = false;
+                  break;
+               }
+               if (in->op == AIR_OP_GEP) {
+                  for (unsigned oi = 1; oi < in->num_operands; oi++) {
+                     if (!air_value_as_constant(in->operands[oi]))
+                        ok = false;
+                  }
+               }
+               if (!_mesa_set_search(derived, &in->base)) {
+                  _mesa_set_add(derived, &in->base);
+                  grew = true;
+               }
+               if (through_choice && !_mesa_set_search(chosen, &in->base)) {
+                  _mesa_set_add(chosen, &in->base);
+                  grew = true;
+               }
+            }
+         }
+      }
+      for (unsigned bi = 0; ok && bi < f->num_blocks; bi++) {
+         const struct air_block *blk = &f->blocks[bi];
+         for (unsigned ii = 0; ok && ii < blk->num_insts; ii++) {
+            const struct air_inst *in = blk->insts[ii];
+            for (unsigned oi = 0; ok && oi < in->num_operands; oi++) {
+               const struct air_value *v = in->operands[oi];
+               if (!field_related(v, &g->base, derived))
+                  continue;
+               switch (in->op) {
+               case AIR_OP_LOAD:
+                  ok = oi == 0;
+                  break;
+               case AIR_OP_STORE:
+                  ok = oi == 1 && is_init && bi == 0 && !_mesa_set_search(chosen, v);
+                  break;
+               case AIR_OP_GEP:
+               case AIR_OP_CAST:
+               case AIR_OP_SELECT:
+               case AIR_OP_PHI:
+               case AIR_OP_CMP:
+                  break;
+               default:
+                  ok = false;   /* a call, an insertvalue, an atomic: it escapes */
+                  break;
+               }
+            }
+         }
+      }
+   }
+   _mesa_set_destroy(derived, NULL);
+   _mesa_set_destroy(chosen, NULL);
+   return ok;
+}
+
+static void
+plan_field_folding(struct air_ctx *c)
+{
+   for (unsigned i = 0; i < c->m->num_globals; i++) {
+      struct air_global_plan *pl = &c->global_plan[i];
+      const struct air_global *g = c->m->globals[i];
+      if (pl->skip || pl->fold || pl->class != AIR_PTR_SCRATCH || !pl->has_offset || !g->value_type)
+         continue;
+      const uint64_t size = air_type_alloc_size(c->m, g->value_type);
+      if (size == 0 || size > 4096 || !field_fold_scan(c, g))
+         continue;
+      pl->field_fold = true;
+      pl->size = (unsigned)size;
+      pl->kbytes = rzalloc_size(c->mem_ctx, size);
+      pl->kmask = rzalloc_size(c->mem_ctx, size);
+   }
+}
+
 /* A constant's bytes as the module lays the type out (air_type_alloc_size, member
  * offsets): what a read-only global holds, for nir->constant_data. False for what
  * is not bytes -- a constant expression (a pointer's value), a type with no size.
@@ -6224,6 +6443,7 @@ plan_globals(struct air_ctx *c)
 
    /* after the loop, because it reads the class every global ended up with */
    plan_global_folding(c);
+   plan_field_folding(c);   /* S10 port: after it, it takes what it left */
 }
 
 /* Build the globals as values of the function being translated now. Called for
@@ -6278,8 +6498,20 @@ materialise_globals(struct air_ctx *c)
  * this is where a function constant turns into the program-scope variable the
  * body reads (AV1SW computes kPixelShift from kBitDepth that way).
  */
+static void run_static_initializers_now(struct air_ctx *c);
+
+/* S10 port: with c->in_static_init set, for field folding (field_fold_store). */
 static void
 run_static_initializers(struct air_ctx *c)
+{
+   const bool was = c->in_static_init;
+   c->in_static_init = true;
+   run_static_initializers_now(c);
+   c->in_static_init = was;
+}
+
+static void
+run_static_initializers_now(struct air_ctx *c)
 {
    for (unsigned i = 0; i < c->m->num_functions; i++) {
       const struct air_function *f = c->m->functions[i];

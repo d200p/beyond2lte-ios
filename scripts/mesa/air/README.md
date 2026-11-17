@@ -29,3 +29,12 @@ made in a commit of its own so the difference from upstream stays readable:
   QuartzCore's `sdf_gen_field`, `sdf_gen_gradients`, `rim_outline`,
   `brim_jump`, `brim_outline`, `read_surf_frag`, `compute_apl` and
   `compute_average_luma` were refused for it in boot 64.
+- `air_to_nir.c`, `air_private.h`: field folding (`plan_field_folding`,
+  `field_fold_store`, the head of `air_load_ptr`). iOS 26's uber shader keeps
+  its configuration in a `FragmentShaderConfig` struct filled by the
+  constructor and read through `select(has_config == 0, @config, runtime)`;
+  only scalar globals were folded, so the shader stayed whole whatever the
+  constants (72 618 NIR instructions, 47 s in Bifrost, boot 65). A variable
+  whose every store is in the first block of an `air.static_init` function,
+  through constant getelementptrs and casts only, and whose address escapes
+  nowhere, now answers loads of bytes those stores wrote as constants.
