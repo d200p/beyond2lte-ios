@@ -9,9 +9,13 @@
  * library is read where it lies (nothing of Apple's leaves the phone).
  *
  * The window server's uber shader (fixed_frag_lph_cph / _cpf) is compiled
- * again once per texture function the OpenGL ES census saw (52 = vcm, 59 =
- * dff, ...), that function constant (index 28) supplied and every other one
- * left unsupplied, as a pipeline that names only it would.
+ * once per texture function in texture_functions[] (52 = vcm, 59 = dff, ...),
+ * that function constant (index 28) supplied and every other one left
+ * unsupplied, with each phase timed and logged as it ends.
+ *
+ * Before the driver: the frontend's system-value variables lowered, the
+ * fragment position moved to the half pixel, driver locations assigned, as a
+ * Gallium frontend would (boot 64 crashed Bifrost on [[position]] without it).
  *
  * One kernel log line per job ("B2L GPU UI: mtl M0: ..."), through a B2LMali
  * user client of its own that only ever logs. Before each job its number is
@@ -34,6 +38,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_builder.h"
 #include "util/ralloc.h"
 #include "util/u_dynarray.h"
 #include "panfrost/util/pan_ir.h"
@@ -59,11 +64,11 @@ bool panfrost_nir_lower_sysvals(nir_shader *s, unsigned arch, struct panfrost_sy
 #define MTL_AIR64_CPU   0x01000017u  /* the AIR64 slice of a fat metallib */
 #define MTL_FC_TEXTURE  28u          /* fc_texture_function: the CA function code */
 
-/* The CA function codes the OpenGL ES census drew without a program, and a
- * few of the plain ones next to them (clr, img, colour matrices). */
-static const uint8_t texture_functions[] = {
-   0, 1, 13, 18, 21, 22, 29, 39, 51, 52, 53, 54, 59, 60, 61, 62, 63, 64, 65, 66, 67, 74, 77, 85,
-};
+/* Texture functions the uber shader is compiled with: clr, img, vcm (the
+ * labels' vibrancy), dff (SDF fill), kfh (key fill highlight), ghn (glass).
+ * Boot 64 (M0): with every function constant unsupplied, or with only this
+ * one, a job ran past 120 s; M0.1 times its phases instead of the whole. */
+static const uint8_t texture_functions[] = { 0, 1, 52, 59, 66, 70 };
 
 typedef mach_port_t io_object_t, io_service_t, io_connect_t;
 extern const mach_port_t kIOMainPortDefault;
@@ -115,16 +120,20 @@ now_us(void)
    return mach_absolute_time() * tb.numer / tb.denom / 1000;
 }
 
+/* "<job> <phase>": the parent reads the number to start after it, and logs the
+ * phase a child died in (a AIR, p preprocess, b Bifrost, - between jobs). */
+static const char *progress_file;
+
 static void
-progress(const char *path, unsigned job)
+progress(unsigned job, char phase)
 {
-   if (path == NULL)
+   if (progress_file == NULL)
       return;
-   int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+   int fd = open(progress_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
    if (fd < 0)
       return;
-   char text[16];
-   int n = snprintf(text, sizeof(text), "%u\n", job);
+   char text[24];
+   int n = snprintf(text, sizeof(text), "%u %c\n", job, phase);
    if (n > 0)
       (void)!write(fd, text, (size_t)n);
    close(fd);
@@ -157,6 +166,34 @@ static bool
 is_uber(const char *name)
 {
    return strncmp(name, "fixed_frag_", 11) == 0;
+}
+
+/* Metal's [[position]] has its origin at the top left, as the Mali's pixel
+ * coordinate does, and its centre at the half pixel; Bifrost lowers
+ * load_frag_coord to the integer pixel coordinate (nir_lower_frag_coord_to_
+ * pixel_coord), so the half is added here. */
+static bool
+frag_coord_center(nir_builder *b, nir_intrinsic_instr *intr, UNUSED void *data)
+{
+   if (intr->intrinsic != nir_intrinsic_load_frag_coord)
+      return false;
+   b->cursor = nir_after_instr(&intr->instr);
+   nir_def *wpos = nir_fadd(b, &intr->def, nir_imm_vec4(b, 0.5f, 0.5f, 0.0f, 0.0f));
+   nir_def_rewrite_uses_after(&intr->def, wpos, wpos->parent_instr);
+   return true;
+}
+
+static unsigned
+count_instrs(nir_shader *nir)
+{
+   unsigned n = 0;
+   nir_foreach_function_impl(impl, nir) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block)
+            n++;
+      }
+   }
+   return n;
 }
 
 struct tally {
@@ -203,6 +240,8 @@ run_job(unsigned job, const struct air_metallib_function *f, int texture_functio
    else
       snprintf(label, sizeof(label), "%s", f->name);
 
+   bool slow = is_uber(f->name);   /* phases logged as they end, not only at the end */
+   progress(job, 'a');
    uint64_t t0 = now_us();
    nir_shader *nir = air_to_nir(mem, f->bitcode, f->bitcode_size, NULL, &options,
                                 pan_shader_get_compiler_options_v7(), &info, &error);
@@ -217,21 +256,39 @@ run_job(unsigned job, const struct air_metallib_function *f, int texture_functio
    }
 
    gl_shader_stage stage = nir->info.stage;
-   if (stage == MESA_SHADER_VERTEX || stage == MESA_SHADER_FRAGMENT || stage == MESA_SHADER_COMPUTE) {
-      nir_assign_io_var_locations(nir, nir_var_shader_in, &nir->num_inputs, stage);
-      nir_assign_io_var_locations(nir, nir_var_shader_out, &nir->num_outputs, stage);
-   } else {
+   if (stage != MESA_SHADER_VERTEX && stage != MESA_SHADER_FRAGMENT && stage != MESA_SHADER_COMPUTE) {
       t->failed++;
       note("mtl M0: [%u] %s: stage %s not compiled", job, label, gl_shader_stage_name(stage));
       ralloc_free(mem);
       return;
    }
+   unsigned air_instrs = count_instrs(nir);
+   if (slow || t1 - t0 > 5000000)
+      note("mtl M0: [%u] %s: AIR done in %llu ms, %u NIR instructions", job, label,
+           (unsigned long long)((t1 - t0) / 1000), air_instrs);
 
+   /* What a Gallium frontend does before the driver sees the NIR: the
+    * frontend's system-value variables become intrinsics (boot 64: the nine
+    * functions that read [[position]] crashed Bifrost without this), and the
+    * inputs and outputs get driver locations. */
+   progress(job, 'p');
+   uint64_t t2 = now_us();
+   nir_lower_system_values(nir);
+   if (stage == MESA_SHADER_COMPUTE)
+      nir_lower_compute_system_values(nir, NULL);
+   if (stage == MESA_SHADER_FRAGMENT)
+      nir_shader_intrinsics_pass(nir, frag_coord_center, nir_metadata_control_flow, NULL);
+   nir_assign_io_var_locations(nir, nir_var_shader_in, &nir->num_inputs, stage);
+   nir_assign_io_var_locations(nir, nir_var_shader_out, &nir->num_outputs, stage);
    bifrost_preprocess_nir(nir, MTL_GPU_ID);
    /* struct panfrost_sysvals is an array and a count; this is far larger. */
    static uint64_t sysvals[1024];
    memset(sysvals, 0, sizeof(sysvals));
    panfrost_nir_lower_sysvals(nir, 7, (struct panfrost_sysvals *)sysvals);
+   uint64_t t3 = now_us();
+   if (slow || t3 - t2 > 5000000)
+      note("mtl M0: [%u] %s: preprocessed in %llu ms, %u NIR instructions", job, label,
+           (unsigned long long)((t3 - t2) / 1000), count_instrs(nir));
 
    struct panfrost_compile_inputs inputs;
    memset(&inputs, 0, sizeof(inputs));
@@ -240,9 +297,10 @@ run_job(unsigned job, const struct air_metallib_function *f, int texture_functio
    util_dynarray_init(&binary, NULL);
    struct pan_shader_info pinfo;
    memset(&pinfo, 0, sizeof(pinfo));
-   uint64_t t2 = now_us();
+   progress(job, 'b');
+   uint64_t t4 = now_us();
    pan_shader_compile_v7(nir, &inputs, &binary, &pinfo);
-   uint64_t t3 = now_us();
+   uint64_t t5 = now_us();
 
    if (binary.size == 0) {
       t->failed++;
@@ -250,19 +308,22 @@ run_job(unsigned job, const struct air_metallib_function *f, int texture_functio
            (unsigned long long)((t1 - t0) / 1000));
    } else {
       t->ok++;
-      note("mtl M0: [%u] %s %s: ok %u bytes, %u regs, tls %u, wls %u, res %u, fbfetch 0x%x; AIR %llu ms, "
-           "Bifrost %llu ms",
+      note("mtl M0: [%u] %s %s: ok %u bytes, %u regs, tls %u, wls %u, res %u, fbfetch 0x%x; %u instr; "
+           "AIR %llu ms, pre %llu ms, Bifrost %llu ms",
            job, label, gl_shader_stage_name(stage), binary.size, pinfo.work_reg_count, pinfo.tls_size,
-           pinfo.wls_size, info.num_resources, info.fbfetch_targets, (unsigned long long)((t1 - t0) / 1000),
-           (unsigned long long)((t3 - t2) / 1000));
+           pinfo.wls_size, info.num_resources, info.fbfetch_targets, air_instrs,
+           (unsigned long long)((t1 - t0) / 1000), (unsigned long long)((t3 - t2) / 1000),
+           (unsigned long long)((t5 - t4) / 1000));
    }
    util_dynarray_fini(&binary);
    ralloc_free(mem);
+   progress(job, '-');
 }
 
 int
 b2l_mtl_sweep(unsigned start, const char *progress_path)
 {
+   progress_file = progress_path;
    log_open();
    int fd = open(MTL_LIBRARY, O_RDONLY);
    struct stat st;
@@ -314,7 +375,13 @@ b2l_mtl_sweep(unsigned start, const char *progress_path)
    for (unsigned i = 0; i < lib.num_functions; i++, job++) {
       if (job < start)
          continue;
-      progress(progress_path, job);
+      if (is_uber(lib.functions[i].name)) {
+         /* Never asked for without its constants: CoreAnimation supplies
+          * them, and boot 64 spent its 120 s on it. Compiled below. */
+         note("mtl M0: [%u] %s: unsupplied form skipped, see the texture-function jobs", job,
+              lib.functions[i].name);
+         continue;
+      }
       run_job(job, &lib.functions[i], -1, &t);
    }
    for (unsigned i = 0; i < lib.num_functions; i++) {
@@ -323,13 +390,12 @@ b2l_mtl_sweep(unsigned start, const char *progress_path)
       for (unsigned k = 0; k < per_uber; k++, job++) {
          if (job < start)
             continue;
-         progress(progress_path, job);
          run_job(job, &lib.functions[i], texture_functions[k], &t);
       }
    }
    /* UINT32_MAX: finished (b2l-gpu.c MTL_SWEEP_FINISHED), whatever the
     * parent learns of the exit status. */
-   progress(progress_path, UINT32_MAX);
+   progress(UINT32_MAX, '-');
    note("mtl M0: done jobs %u..%u in %llu s: compiled %u, AIR refused %u (reader %u stage %u interface %u "
         "instruction %u intrinsic %u other %u), not compiled %u",
         start, total, (unsigned long long)((now_us() - began) / 1000000), t.ok, t.refused, t.by_category[0],

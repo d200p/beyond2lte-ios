@@ -2051,7 +2051,7 @@ mesa_probe(void)
 #define MTL_SWEEP_MARKER   "/private/var/tmp/b2l-mtl-sweep.running"
 #define MTL_SWEEP_PROGRESS "/private/var/tmp/b2l-mtl-sweep.next"
 #define MTL_SWEEP_DELAY_S  45u    /* after backboardd starts: the UI first */
-#define MTL_SWEEP_STALL_S  120u   /* one job this long is taken as hung */
+#define MTL_SWEEP_STALL_S  600u   /* one phase this long is taken as hung (boot 64: 120 s cut the uber shader) */
 #define MTL_SWEEP_RESTARTS 40u
 #define MTL_SWEEP_FINISHED 4294967295L /* the progress file once b2l_mtl_sweep returns */
 
@@ -2060,8 +2060,16 @@ extern char **environ;
 static void
 mtl_sweep_child(const char *start)
 {
-	setpriority(PRIO_PROCESS, 0, 20);
-	pthread_set_qos_class_self_np(QOS_CLASS_BACKGROUND, 0);
+	/* Utility, not background: M0.1 measures how long the compiler takes, and
+	 * background confines it to the slowest cores. The CPU-usage monitor is
+	 * turned off for this process: in boot 64 the busy "backboardd" kept
+	 * spindump on one or two cores for minutes. */
+	setpriority(PRIO_PROCESS, 0, 10);
+	pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+	int (*disable_cpumon)(pid_t) = (int (*)(pid_t))dlsym(RTLD_DEFAULT, "proc_disable_cpumon");
+	if (disable_cpumon != NULL) {
+		disable_cpumon(getpid());
+	}
 	void *mesa = dlopen(B2L_MESA_LIBRARY, RTLD_NOW | RTLD_LOCAL);
 	int (*sweep)(unsigned, const char *) =
 	    mesa != NULL ? (int (*)(unsigned, const char *))dlsym(mesa, "b2l_mtl_sweep") : NULL;
@@ -2094,17 +2102,30 @@ boot_arg_present(const char *token)
 	return 0;
 }
 
+/* "<job> <phase>" (b2l_mtl_sweep.c): the job, and the phase in *phase when
+ * asked for (a AIR, p preprocess, b Bifrost, - between jobs). */
 static long
-mtl_sweep_progress(void)
+mtl_sweep_progress(char *phase)
 {
-	char text[16] = { 0 };
+	char text[24] = { 0 };
 	int fd = open(MTL_SWEEP_PROGRESS, O_RDONLY);
+	if (phase != NULL) {
+		*phase = '?';
+	}
 	if (fd < 0) {
 		return -1;
 	}
 	ssize_t n = read(fd, text, sizeof(text) - 1);
 	close(fd);
-	return n > 0 ? strtol(text, NULL, 10) : -1;
+	if (n <= 0) {
+		return -1;
+	}
+	char *end = NULL;
+	long job = strtol(text, &end, 10);
+	if (phase != NULL && end != NULL && end[0] == ' ' && end[1] != 0) {
+		*phase = end[1];
+	}
+	return job;
 }
 
 static void *
@@ -2160,18 +2181,22 @@ mtl_sweep_thread(__unused void *argument)
 				break;
 			}
 			sleep(1);
-			long now = mtl_sweep_progress();
-			still = now == last ? still + 1 : 0;
-			last = now;
+			char phase = '?';
+			long now = mtl_sweep_progress(&phase);
+			long key = now * 256 + (unsigned char)phase;   /* a new phase is progress too */
+			still = key == last ? still + 1 : 0;
+			last = key;
 			if (still >= MTL_SWEEP_STALL_S) {
-				log_line("mtl M0: job %ld still running after %u s, child %d killed", now, still, pid);
+				log_line("mtl M0: job %ld phase %c still running after %u s, child %d killed", now, phase,
+				    still, pid);
 				kill(pid, SIGKILL);
 				known = waitpid(pid, &status, 0) == pid;
 				killed = 1;
 				break;
 			}
 		}
-		long at = mtl_sweep_progress();
+		char phase = '?';
+		long at = mtl_sweep_progress(&phase);
 		if (at == MTL_SWEEP_FINISHED) {
 			log_line("mtl M0: child %d finished the sweep", pid);
 			break;
@@ -2180,8 +2205,8 @@ mtl_sweep_thread(__unused void *argument)
 			log_line("mtl M0: child %d exited %d (last job %ld)", pid, WEXITSTATUS(status), at);
 			break;
 		}
-		log_line("mtl M0: child %d %s (signal %d) at job %ld", pid, killed ? "killed" : "died",
-		    killed ? SIGKILL : ((known && WIFSIGNALED(status)) ? WTERMSIG(status) : -1), at);
+		log_line("mtl M0: child %d %s (signal %d) at job %ld phase %c", pid, killed ? "killed" : "died",
+		    killed ? SIGKILL : ((known && WIFSIGNALED(status)) ? WTERMSIG(status) : -1), at, phase);
 		if (at < 0 || ++restarts > MTL_SWEEP_RESTARTS) {
 			break;
 		}

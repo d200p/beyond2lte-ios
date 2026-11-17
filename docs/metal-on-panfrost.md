@@ -34,6 +34,35 @@ What its log is to answer: which of QuartzCore's functions the frontend takes
 on iOS 26's AIR (HakiOS measured iOS 16.5's), where Bifrost's compiler stops,
 and how long the uber shader takes to compile on the phone's CPU.
 
+## M0 result (boot 64, build 63)
+
+QuartzCore's library: AIR64 slice 1,552,128 bytes, MTLB 1.2, 189 functions.
+
+- 137 compiled to Bifrost code: every vertex function (the fixed_vert uber
+  shaders in 1 to 4 s), the downsample, narrow and variable blurs, all six
+  glass functions (glass_background[_sdf][_no_bleed], glass_foreground[_sdf],
+  5 to 14 KB of code), the framebuffer-fetch ones (p3_clamp, edr_clamp,
+  path_blit).
+- 16 refused as tile shaders / imageblocks: expected, CA asks for them only
+  when the device supports tile shaders.
+- 16 refused for `air.get_read_sampler` (iOS 26's form of texture.read()).
+- 9 functions (x2) crashed Bifrost in `bi_alu_src_index` (stack from the
+  kernel's B2L BT lines with the Mesa symbol map): all and only the fragment
+  functions that read `[[position]]`. The frontend emits it as a system-value
+  variable for the consumer to lower; nothing lowered it.
+- `fixed_frag_lph_cph`/`_cpf` ran past the 120 s limit, unsupplied and with only
+  the texture function supplied; which phase was not known.
+
+## M0.1
+
+- The AIR frontend takes the iOS 26 read form (scripts/mesa/air/README.md).
+- `nir_lower_system_values` (and the compute one), the half-pixel centre and
+  then the driver locations before Bifrost.
+- The uber shader only with constants, six texture functions, each phase
+  (AIR, preprocessing, Bifrost) logged with its time and NIR size; the stall
+  limit 600 s per phase; the child at utility QoS with the CPU monitor off;
+  the parent logs the phase a child died in.
+
 ## What iOS 26 does (read from the 23G90 cache)
 
 - **Discovery.** `-[MTLIOAccelServiceGlobalContext init]` (Metal) matches
