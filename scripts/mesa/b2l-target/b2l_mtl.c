@@ -491,7 +491,28 @@ struct b2l_mtl_texture {
 	struct b2l_mtl_texture_desc desc;
 	IOSurfaceRef surface;           /* retained, for an imported surface */
 	struct pipe_sampler_view *view; /* made when a draw first samples it */
+	/* M2b: a view (texture_view_new) shares its parent's resource from these
+	 * level and layer offsets; a texture of its own has them at 0. */
+	unsigned first_level, levels, first_layer, layers;
+	enum pipe_texture_target target;
 };
+
+static void
+texture_whole(struct b2l_mtl_texture *t)
+{
+	t->first_level = 0;
+	t->levels = t->res->last_level + 1;
+	t->first_layer = 0;
+	t->layers = t->res->target == PIPE_TEXTURE_3D ? 1 : t->res->array_size;
+	t->target = t->res->target;
+}
+
+/* A level a command names, in the resource. */
+static unsigned
+texture_level(const struct b2l_mtl_texture *t, uint32_t level)
+{
+	return t->first_level + level;
+}
 
 static void
 texture_destroy(void *self)
@@ -591,6 +612,7 @@ texture_new(struct b2l_mtl_device *dev, const struct b2l_mtl_texture_desc *desc,
 		free(t);
 		return NULL;
 	}
+	texture_whole(t);
 	return t;
 }
 
@@ -664,6 +686,77 @@ texture_from_iosurface(struct b2l_mtl_device *dev, const struct b2l_mtl_texture_
 		return NULL;
 	}
 	t->surface = (IOSurfaceRef)CFRetain(surface);
+	texture_whole(t);
+	return t;
+}
+
+static enum pipe_texture_target
+target_of(uint32_t type, enum pipe_texture_target fallback)
+{
+	switch (type) {
+	case 0: return PIPE_TEXTURE_1D;
+	case 1: return PIPE_TEXTURE_1D_ARRAY;
+	case 2: case 4: return PIPE_TEXTURE_2D;
+	case 3: case 8: return PIPE_TEXTURE_2D_ARRAY;
+	case 5: return PIPE_TEXTURE_CUBE;
+	case 6: return PIPE_TEXTURE_CUBE_ARRAY;
+	case 7: return PIPE_TEXTURE_3D;
+	default: return fallback;
+	}
+}
+
+/* newTextureViewWithPixelFormat:textureType:levels:slices: the parent's
+ * resource, another format of the same size per pixel, a sub-range. */
+static struct b2l_mtl_texture *
+texture_view_new(struct b2l_mtl_texture *base, uint32_t mtl_format, uint32_t type, uint32_t first_level,
+    uint32_t levels, uint32_t first_slice, uint32_t slices, char *why, size_t why_size)
+{
+	if (base == NULL) {
+		say(why, why_size, "no texture");
+		return NULL;
+	}
+	enum pipe_format format = pixel_format(mtl_format);
+	if (format == PIPE_FORMAT_NONE) {
+		say(why, why_size, "pixel format %u not handled", mtl_format);
+		return NULL;
+	}
+	if (util_format_get_blocksize(format) != util_format_get_blocksize(base->format)) {
+		say(why, why_size, "a view of %s as %s, another size per pixel", util_format_short_name(base->format),
+		    util_format_short_name(format));
+		return NULL;
+	}
+	levels = MAX2(levels, 1);
+	slices = MAX2(slices, 1);
+	bool is3d = base->res->target == PIPE_TEXTURE_3D;
+	if (first_level + levels > base->levels || (!is3d && first_slice + slices > base->layers)) {
+		say(why, why_size, "levels %u+%u, slices %u+%u outside the texture (%u levels, %u slices)", first_level,
+		    levels, first_slice, slices, base->levels, base->layers);
+		return NULL;
+	}
+	struct b2l_mtl_texture *t = calloc(1, sizeof(*t));
+	if (t == NULL) {
+		say(why, why_size, "out of memory");
+		return NULL;
+	}
+	obj_init(&t->base, texture_destroy);
+	t->dev = base->dev;
+	t->format = format;
+	t->desc = base->desc;
+	t->desc.pixel_format = mtl_format;
+	t->desc.type = type;
+	t->desc.mip_levels = levels;
+	t->desc.array_length = is3d ? 1 : slices;
+	pthread_mutex_lock(&base->dev->lock);
+	pipe_resource_reference(&t->res, base->res);
+	pthread_mutex_unlock(&base->dev->lock);
+	if (base->surface != NULL) {
+		t->surface = (IOSurfaceRef)CFRetain(base->surface);
+	}
+	t->first_level = base->first_level + first_level;
+	t->levels = levels;
+	t->first_layer = is3d ? 0 : base->first_layer + first_slice;
+	t->layers = is3d ? 1 : slices;
+	t->target = target_of(type, base->target);
 	return t;
 }
 
@@ -671,29 +764,29 @@ texture_from_iosurface(struct b2l_mtl_device *dev, const struct b2l_mtl_texture_
 static unsigned
 texture_layer(const struct b2l_mtl_texture *t, uint32_t slice, uint32_t depth_plane)
 {
-	return t->res->target == PIPE_TEXTURE_3D ? depth_plane : slice;
+	return t->res->target == PIPE_TEXTURE_3D ? depth_plane : t->first_layer + slice;
 }
 
 static void
 texture_box(const struct b2l_mtl_texture *t, const struct b2l_mtl_region *r, uint32_t slice, struct pipe_box *box)
 {
 	bool is3d = t->res->target == PIPE_TEXTURE_3D;
-	u_box_3d(r->x, r->y, is3d ? r->z : slice, MAX2(r->width, 1), MAX2(r->height, 1), is3d ? MAX2(r->depth, 1) : 1,
-	    box);
+	u_box_3d(r->x, r->y, is3d ? r->z : t->first_layer + slice, MAX2(r->width, 1), MAX2(r->height, 1),
+	    is3d ? MAX2(r->depth, 1) : 1, box);
 }
 
 static void
 texture_replace(struct b2l_mtl_texture *t, const struct b2l_mtl_region *region, uint32_t level, uint32_t slice,
     const void *bytes, uint64_t bytes_per_row, uint64_t bytes_per_image)
 {
-	if (t == NULL || bytes == NULL || level > t->res->last_level) {
+	if (t == NULL || bytes == NULL || texture_level(t, level) > t->res->last_level) {
 		return;
 	}
 	struct pipe_box box;
 	texture_box(t, region, slice, &box);
 	uint64_t image = bytes_per_image != 0 ? bytes_per_image : bytes_per_row * (uint64_t)box.height;
 	pthread_mutex_lock(&t->dev->lock);
-	t->dev->pipe->texture_subdata(t->dev->pipe, t->res, level, PIPE_MAP_WRITE, &box, bytes,
+	t->dev->pipe->texture_subdata(t->dev->pipe, t->res, texture_level(t, level), PIPE_MAP_WRITE, &box, bytes,
 	    (unsigned)bytes_per_row, (uintptr_t)image);
 	pthread_mutex_unlock(&t->dev->lock);
 }
@@ -725,13 +818,13 @@ static void
 texture_get(struct b2l_mtl_texture *t, const struct b2l_mtl_region *region, uint32_t level, uint32_t slice,
     void *bytes, uint64_t bytes_per_row, uint64_t bytes_per_image)
 {
-	if (t == NULL || bytes == NULL || level > t->res->last_level) {
+	if (t == NULL || bytes == NULL || texture_level(t, level) > t->res->last_level) {
 		return;
 	}
 	struct pipe_box box;
 	texture_box(t, region, slice, &box);
 	pthread_mutex_lock(&t->dev->lock);
-	texture_read_locked(t, &box, level, bytes, bytes_per_row, bytes_per_image);
+	texture_read_locked(t, &box, texture_level(t, level), bytes, bytes_per_row, bytes_per_image);
 	pthread_mutex_unlock(&t->dev->lock);
 }
 
@@ -1212,8 +1305,9 @@ struct stage_bindings {
 	uint32_t ssbo_mask, ssbo_written;
 	uint32_t texture_mask, null_texture_mask;
 	uint32_t sampler_mask;
+	uint32_t image_mask, image_written;     /* textures written (storage images) */
 	void *inline_samplers[B2L_MTL_MAX_SAMPLERS];    /* constexpr samplers, made here */
-	unsigned images, argument_members;      /* not bound yet: logged when made */
+	unsigned argument_members;              /* not bound yet: logged when made */
 };
 
 struct b2l_mtl_render_pipeline {
@@ -1432,7 +1526,12 @@ collect_bindings(const struct air_shader_info *info, unsigned ubos, struct stage
 			}
 			break;
 		case AIR_RESOURCE_IMAGE:
-			b->images++;
+			if (r->index < B2L_MTL_MAX_TEXTURES) {
+				b->image_mask |= 1u << r->index;
+				if (r->write || r->ir_write) {
+					b->image_written |= 1u << r->index;
+				}
+			}
 			break;
 		default:
 			break;
@@ -1654,16 +1753,130 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 	    report->varyings_linked, report->varyings_unmatched, report->attributes);
 	const struct stage_bindings *bv = &p->bind[B2L_MTL_VERTEX], *bf = &p->bind[B2L_MTL_FRAGMENT];
 	b2l_drm_note("mtl M2: pipeline %s binds: UBOs %u + %u, SSBOs 0x%x + 0x%x, textures 0x%x + 0x%x (null 0x%x), "
-	    "samplers 0x%x + 0x%x (%u inline), vertex buffers 0x%x%s%s",
+	    "images 0x%x + 0x%x, samplers 0x%x + 0x%x (%u inline), vertex buffers 0x%x%s",
 	    function_name(desc->vertex), bv->ubos, bf->ubos, bv->ssbo_mask, bf->ssbo_mask, bv->texture_mask,
-	    bf->texture_mask, bv->null_texture_mask | bf->null_texture_mask, bv->sampler_mask, bf->sampler_mask,
-	    inline_count, p->vb_mask, bv->images + bf->images != 0 ? "; storage images NOT bound" : "",
+	    bf->texture_mask, bv->null_texture_mask | bf->null_texture_mask, bv->image_mask, bf->image_mask,
+	    bv->sampler_mask, bf->sampler_mask, inline_count, p->vb_mask,
 	    bv->argument_members + bf->argument_members != 0 ? "; argument buffers NOT bound" : "");
 	return p;
 }
 
 static void
 render_pipeline_release(struct b2l_mtl_render_pipeline *p)
+{
+	obj_unref(p);
+}
+
+/* ---- compute pipelines (M2b) ---- */
+
+struct b2l_mtl_compute_pipeline {
+	struct obj base;
+	struct b2l_mtl_device *dev;
+	struct b2l_mtl_function *function;      /* held */
+	void *cso;
+	struct stage_bindings bind;
+	unsigned threadgroup_bytes, max_threads;
+};
+
+static void
+compute_pipeline_destroy(void *self)
+{
+	struct b2l_mtl_compute_pipeline *p = self;
+	struct pipe_context *pipe = p->dev->pipe;
+	pthread_mutex_lock(&p->dev->lock);
+	for (unsigned i = 0; i < B2L_MTL_MAX_SAMPLERS; i++) {
+		if (p->bind.inline_samplers[i] != NULL) {
+			pipe->delete_sampler_state(pipe, p->bind.inline_samplers[i]);
+		}
+	}
+	if (p->cso != NULL) {
+		pipe->delete_compute_state(pipe, p->cso);
+	}
+	pthread_mutex_unlock(&p->dev->lock);
+	obj_unref(p->function);
+	free(p);
+}
+
+static struct b2l_mtl_compute_pipeline *
+compute_pipeline_new(struct b2l_mtl_device *dev, struct b2l_mtl_function *function,
+    struct b2l_mtl_compute_report *report, char *why, size_t why_size)
+{
+	struct b2l_mtl_compute_report scratch;
+	if (report == NULL) {
+		report = &scratch;
+	}
+	memset(report, 0, sizeof(*report));
+	if (function == NULL || function->stage != MESA_SHADER_COMPUTE) {
+		say(why, why_size, "stage %d is not a kernel", function != NULL ? function->stage : -1);
+		return NULL;
+	}
+	uint64_t t0 = now_us();
+	bool translated = function_translate(dev, function);
+	report->translate_ms = (uint32_t)((now_us() - t0) / 1000);
+	if (!translated) {
+		say(why, why_size, "%s", function->error);
+		return NULL;
+	}
+	report->instructions = function->instructions;
+	struct b2l_mtl_compute_pipeline *p = calloc(1, sizeof(*p));
+	if (p == NULL) {
+		say(why, why_size, "out of memory");
+		return NULL;
+	}
+	obj_init(&p->base, compute_pipeline_destroy);
+	p->dev = dev;
+	p->function = obj_ref(function);
+	nir_shader *nir = nir_shader_clone(NULL, function->nir);
+	prepare_for_gallium(nir);
+	collect_bindings(&function->info, nir->info.num_ubos, &p->bind);
+	p->threadgroup_bytes = nir->info.shared_size;
+	report->threadgroup_bytes = p->threadgroup_bytes;
+	struct pipe_context *pipe = dev->pipe;
+	pthread_mutex_lock(&dev->lock);
+	for (unsigned i = 0; i < function->info.num_resources; i++) {
+		const struct air_resource *r = &function->info.resources[i];
+		if (r->kind == AIR_RESOURCE_SAMPLER && r->inline_sampler && r->index < B2L_MTL_MAX_SAMPLERS &&
+		    p->bind.inline_samplers[r->index] == NULL) {
+			p->bind.inline_samplers[r->index] = inline_sampler(dev, &r->sampler);
+			p->bind.sampler_mask |= 1u << r->index;
+		}
+	}
+	uint64_t t1 = now_us();
+	struct pipe_compute_state cs;
+	memset(&cs, 0, sizeof(cs));
+	cs.ir_type = PIPE_SHADER_IR_NIR;
+	cs.prog = nir;                          /* Panfrost compiles and frees it */
+	cs.static_shared_mem = p->threadgroup_bytes;
+	p->cso = pipe->create_compute_state(pipe, &cs);
+	report->compile_ms = (uint32_t)((now_us() - t1) / 1000);
+	if (p->cso != NULL && pipe->get_compute_state_info != NULL) {
+		struct pipe_compute_state_object_info info;
+		memset(&info, 0, sizeof(info));
+		pipe->get_compute_state_info(pipe, p->cso, &info);
+		report->max_threads = info.max_threads;
+		report->simd_width = info.preferred_simd_size;
+	}
+	pthread_mutex_unlock(&dev->lock);
+	if (p->cso == NULL) {
+		say(why, why_size, "Panfrost refused the kernel");
+		obj_unref(p);
+		return NULL;
+	}
+	if (report->max_threads == 0) {
+		report->max_threads = 256;
+	}
+	p->max_threads = report->max_threads;
+	b2l_drm_note("mtl M2: compute %s: AIR %u ms, Panfrost %u ms; %u NIR instructions, %u threads at most, "
+	    "SIMD %u, %u threadgroup bytes; UBOs %u, SSBOs 0x%x, textures 0x%x, images 0x%x, samplers 0x%x%s",
+	    function_name(function), report->translate_ms, report->compile_ms, report->instructions,
+	    report->max_threads, report->simd_width, report->threadgroup_bytes, p->bind.ubos, p->bind.ssbo_mask,
+	    p->bind.texture_mask, p->bind.image_mask, p->bind.sampler_mask,
+	    p->bind.argument_members != 0 ? "; argument buffers NOT bound" : "");
+	return p;
+}
+
+static void
+compute_pipeline_release(struct b2l_mtl_compute_pipeline *p)
 {
 	obj_unref(p);
 }
@@ -1693,6 +1906,12 @@ enum op_kind {
 	OP_SET_STENCIL_REF,
 	OP_SET_BLEND_COLOR,
 	OP_DRAW,
+	/* compute */
+	OP_COMPUTE_BEGIN,
+	OP_COMPUTE_END,
+	OP_SET_COMPUTE_PIPELINE,
+	OP_SET_THREADGROUP_MEMORY,
+	OP_DISPATCH,
 };
 
 struct op {
@@ -1747,6 +1966,13 @@ struct op {
 		} stencil_ref;
 		float blend_color[4];
 		struct b2l_mtl_draw draw;
+		struct b2l_mtl_compute_pipeline *compute;
+		struct {
+			uint32_t index, length;
+		} threadgroup;
+		struct {
+			uint32_t groups[3], threads[3];
+		} dispatch;
 	} u;
 };
 
@@ -1805,6 +2031,9 @@ op_unref(struct op *op)
 		break;
 	case OP_DRAW:
 		obj_unref(op->u.draw.index_buffer);
+		break;
+	case OP_SET_COMPUTE_PIPELINE:
+		obj_unref(op->u.compute);
 		break;
 	default:
 		break;
@@ -2119,7 +2348,48 @@ cmdbuf_draw(struct b2l_mtl_cmdbuf *cb, const struct b2l_mtl_draw *draw)
 	}
 }
 
-/* ---- executing a render encoder ---- */
+static void
+cmdbuf_compute_begin(struct b2l_mtl_cmdbuf *cb)
+{
+	cmdbuf_push(cb, OP_COMPUTE_BEGIN);
+}
+
+static void
+cmdbuf_compute_end(struct b2l_mtl_cmdbuf *cb)
+{
+	cmdbuf_push(cb, OP_COMPUTE_END);
+}
+
+static void
+cmdbuf_set_compute_pipeline(struct b2l_mtl_cmdbuf *cb, struct b2l_mtl_compute_pipeline *pipeline)
+{
+	struct op *op = cmdbuf_push(cb, OP_SET_COMPUTE_PIPELINE);
+	if (op != NULL) {
+		op->u.compute = obj_ref(pipeline);
+	}
+}
+
+static void
+cmdbuf_set_threadgroup_memory(struct b2l_mtl_cmdbuf *cb, uint32_t index, uint32_t length)
+{
+	struct op *op = cmdbuf_push(cb, OP_SET_THREADGROUP_MEMORY);
+	if (op != NULL) {
+		op->u.threadgroup.index = index;
+		op->u.threadgroup.length = length;
+	}
+}
+
+static void
+cmdbuf_dispatch(struct b2l_mtl_cmdbuf *cb, const uint32_t threadgroups[3], const uint32_t threads_per_threadgroup[3])
+{
+	struct op *op = cmdbuf_push(cb, OP_DISPATCH);
+	if (op != NULL) {
+		memcpy(op->u.dispatch.groups, threadgroups, sizeof(op->u.dispatch.groups));
+		memcpy(op->u.dispatch.threads, threads_per_threadgroup, sizeof(op->u.dispatch.threads));
+	}
+}
+
+/* ---- executing an encoder ---- */
 
 struct bound {
 	struct b2l_mtl_buffer *buffer;          /* or ... */
@@ -2134,9 +2404,12 @@ struct encoder_state {
 	bool in_pass;
 	unsigned width, height, samples;
 	struct b2l_mtl_render_pipeline *pipeline;
-	struct bound buffers[2][B2L_MTL_MAX_BUFFERS];
-	struct b2l_mtl_texture *textures[2][B2L_MTL_MAX_TEXTURES];
-	struct b2l_mtl_sampler *samplers[2][B2L_MTL_MAX_SAMPLERS];
+	struct bound buffers[B2L_MTL_STAGES][B2L_MTL_MAX_BUFFERS];
+	struct b2l_mtl_texture *textures[B2L_MTL_STAGES][B2L_MTL_MAX_TEXTURES];
+	struct b2l_mtl_sampler *samplers[B2L_MTL_STAGES][B2L_MTL_MAX_SAMPLERS];
+	bool in_compute;
+	struct b2l_mtl_compute_pipeline *compute;
+	uint32_t threadgroup[B2L_MTL_MAX_BUFFERS];      /* setThreadgroupMemoryLength */
 	struct b2l_mtl_viewport viewport;
 	struct pipe_scissor_state scissor;
 	uint32_t cull, winding, fill, depth_clip;
@@ -2170,6 +2443,13 @@ texture_view(struct b2l_mtl_device *dev, struct b2l_mtl_texture *t)
 	if (t->view == NULL) {
 		struct pipe_sampler_view templ;
 		u_sampler_view_default_template(&templ, t->res, t->format);
+		templ.target = t->target;
+		templ.u.tex.first_level = t->first_level;
+		templ.u.tex.last_level = t->first_level + t->levels - 1;
+		if (t->res->target != PIPE_TEXTURE_3D) {
+			templ.u.tex.first_layer = t->first_layer;
+			templ.u.tex.last_layer = t->first_layer + t->layers - 1;
+		}
 		t->view = dev->pipe->create_sampler_view(dev->pipe, t->res, &templ);
 	}
 	return t->view;
@@ -2309,6 +2589,30 @@ bind_stage(struct b2l_mtl_device *dev, const struct encoder_state *st, enum pipe
 		}
 		pipe->set_sampler_views(pipe, shader, 0, n, 0, false, views);
 	}
+	n = util_last_bit(b->image_mask);
+	if (n != 0) {
+		struct pipe_image_view images[B2L_MTL_MAX_TEXTURES];
+		memset(images, 0, sizeof(images));
+		for (unsigned i = 0; i < n; i++) {
+			struct b2l_mtl_texture *t = st->textures[s][i];
+			if ((b->image_mask & (1u << i)) == 0 || t == NULL) {
+				continue;                       /* unbound: Panfrost writes nowhere */
+			}
+			struct pipe_image_view *v = &images[i];
+			v->resource = t->res;
+			v->format = t->format;
+			v->access = v->shader_access = (b->image_written & (1u << i)) != 0 ?
+			    PIPE_IMAGE_ACCESS_READ_WRITE : PIPE_IMAGE_ACCESS_READ;
+			v->u.tex.level = t->first_level;
+			if (t->res->target != PIPE_TEXTURE_3D) {
+				v->u.tex.first_layer = t->first_layer;
+				v->u.tex.last_layer = t->first_layer + t->layers - 1;
+			} else {
+				v->u.tex.last_layer = u_minify(t->res->depth0, t->first_level) - 1;
+			}
+		}
+		pipe->set_shader_images(pipe, shader, 0, n, 0, images);
+	}
 	n = util_last_bit(b->sampler_mask);
 	if (n != 0) {
 		void *states[B2L_MTL_MAX_SAMPLERS];
@@ -2432,19 +2736,22 @@ static void
 unbind_all(struct b2l_mtl_device *dev)
 {
 	struct pipe_context *pipe = dev->pipe;
-	static const enum pipe_shader_type stages[2] = { PIPE_SHADER_VERTEX, PIPE_SHADER_FRAGMENT };
+	static const enum pipe_shader_type stages[B2L_MTL_STAGES] = { PIPE_SHADER_VERTEX, PIPE_SHADER_FRAGMENT,
+	    PIPE_SHADER_COMPUTE };
 	void *no_samplers[B2L_MTL_MAX_SAMPLERS];
 	memset(no_samplers, 0, sizeof(no_samplers));
 	pipe->bind_fs_state(pipe, NULL);
 	pipe->bind_vs_state(pipe, NULL);
+	pipe->bind_compute_state(pipe, NULL);
 	pipe->bind_blend_state(pipe, dev->default_blend);
 	pipe->bind_depth_stencil_alpha_state(pipe, dev->default_dsa);
 	pipe->bind_vertex_elements_state(pipe, dev->default_velems);
 	pipe->set_vertex_buffers(pipe, 0, NULL);
-	for (unsigned s = 0; s < 2; s++) {
+	for (unsigned s = 0; s < B2L_MTL_STAGES; s++) {
 		for (unsigned i = 0; i < B2L_MTL_MAX_BUFFERS; i++) {
 			pipe->set_constant_buffer(pipe, stages[s], i, false, NULL);
 		}
+		pipe->set_shader_images(pipe, stages[s], 0, 0, B2L_MTL_MAX_TEXTURES, NULL);
 		pipe->set_shader_buffers(pipe, stages[s], 0, B2L_MTL_MAX_BUFFERS, NULL, 0);
 		pipe->set_sampler_views(pipe, stages[s], 0, 0, B2L_MTL_MAX_TEXTURES, false, NULL);
 		pipe->bind_sampler_states(pipe, stages[s], 0, B2L_MTL_MAX_SAMPLERS, no_samplers);
@@ -2462,7 +2769,7 @@ exec_state(struct encoder_state *st, const struct op *op)
 	case OP_SET_BUFFER:
 	case OP_SET_BUFFER_OFFSET:
 	case OP_SET_BYTES:
-		if (op->u.bind.stage < 2 && op->u.bind.index < B2L_MTL_MAX_BUFFERS) {
+		if (op->u.bind.stage < B2L_MTL_STAGES && op->u.bind.index < B2L_MTL_MAX_BUFFERS) {
 			struct bound *b = &st->buffers[op->u.bind.stage][op->u.bind.index];
 			if (op->kind == OP_SET_BUFFER_OFFSET) {
 				b->offset = op->u.bind.offset;
@@ -2475,12 +2782,12 @@ exec_state(struct encoder_state *st, const struct op *op)
 		}
 		break;
 	case OP_SET_TEXTURE:
-		if (op->u.resource.stage < 2 && op->u.resource.index < B2L_MTL_MAX_TEXTURES) {
+		if (op->u.resource.stage < B2L_MTL_STAGES && op->u.resource.index < B2L_MTL_MAX_TEXTURES) {
 			st->textures[op->u.resource.stage][op->u.resource.index] = op->u.resource.texture;
 		}
 		break;
 	case OP_SET_SAMPLER:
-		if (op->u.resource.stage < 2 && op->u.resource.index < B2L_MTL_MAX_SAMPLERS) {
+		if (op->u.resource.stage < B2L_MTL_STAGES && op->u.resource.index < B2L_MTL_MAX_SAMPLERS) {
 			st->samplers[op->u.resource.stage][op->u.resource.index] = op->u.resource.sampler;
 		}
 		break;
@@ -2514,22 +2821,86 @@ exec_state(struct encoder_state *st, const struct op *op)
 	case OP_SET_BLEND_COLOR:
 		memcpy(st->blend_color.color, op->u.blend_color, sizeof(st->blend_color.color));
 		break;
+	case OP_COMPUTE_BEGIN:
+		/* a compute encoder's own state starts afresh */
+		memset(st->buffers[B2L_MTL_COMPUTE], 0, sizeof(st->buffers[B2L_MTL_COMPUTE]));
+		memset(st->textures[B2L_MTL_COMPUTE], 0, sizeof(st->textures[B2L_MTL_COMPUTE]));
+		memset(st->samplers[B2L_MTL_COMPUTE], 0, sizeof(st->samplers[B2L_MTL_COMPUTE]));
+		memset(st->threadgroup, 0, sizeof(st->threadgroup));
+		st->compute = NULL;
+		st->in_compute = true;
+		break;
+	case OP_COMPUTE_END:
+		st->in_compute = false;
+		break;
+	case OP_SET_COMPUTE_PIPELINE:
+		st->compute = op->u.compute;
+		break;
+	case OP_SET_THREADGROUP_MEMORY:
+		if (op->u.threadgroup.index < B2L_MTL_MAX_BUFFERS) {
+			st->threadgroup[op->u.threadgroup.index] = op->u.threadgroup.length;
+		}
+		break;
 	default:
 		break;
 	}
+}
+
+/* dispatchThreadgroups:threadsPerThreadgroup: one grid, then a barrier:
+ * Metal's dispatches in one encoder see each other's writes (serial
+ * dispatch, tracked resources). */
+static void
+exec_dispatch(struct b2l_mtl_device *dev, struct encoder_state *st, const struct op *op, char *first,
+    size_t first_size)
+{
+	struct pipe_context *pipe = dev->pipe;
+	const struct b2l_mtl_compute_pipeline *p = st->compute;
+	const uint32_t *threads = op->u.dispatch.threads, *groups = op->u.dispatch.groups;
+	uint64_t per_group = (uint64_t)threads[0] * threads[1] * threads[2];
+	const char *problem = !st->in_compute ? "a dispatch outside a compute encoder" :
+	    p == NULL ? "a dispatch with no compute pipeline state" :
+	    per_group == 0 || per_group > p->max_threads ? "a threadgroup larger than the kernel allows" : NULL;
+	if (problem != NULL) {
+		if (first[0] == 0) {
+			say(first, first_size, "%s (%u x %u x %u threads)", problem, threads[0], threads[1], threads[2]);
+		}
+		return;
+	}
+	if ((uint64_t)groups[0] * groups[1] * groups[2] == 0) {
+		return;
+	}
+	pipe->bind_compute_state(pipe, p->cso);
+	bind_stage(dev, st, PIPE_SHADER_COMPUTE, B2L_MTL_COMPUTE, &p->bind);
+	struct pipe_grid_info grid;
+	memset(&grid, 0, sizeof(grid));
+	grid.work_dim = 3;
+	unsigned shared = 0;
+	for (unsigned i = 0; i < B2L_MTL_MAX_BUFFERS; i++) {
+		shared += align(st->threadgroup[i], 16);
+	}
+	grid.variable_shared_mem = shared;
+	for (unsigned i = 0; i < 3; i++) {
+		grid.block[i] = threads[i];
+		grid.grid[i] = groups[i];
+	}
+	u_upload_unmap(pipe->stream_uploader);
+	pipe->launch_grid(pipe, &grid);
+	pipe->memory_barrier(pipe, PIPE_BARRIER_ALL);
+	st->draws++;
+	dev->pending = true;
 }
 
 static struct pipe_surface *
 pass_surface(struct b2l_mtl_cmdbuf *cb, const struct b2l_mtl_attachment *a)
 {
 	struct b2l_mtl_texture *t = a->texture;
-	if (t == NULL || a->level > t->res->last_level) {
+	if (t == NULL || texture_level(t, a->level) > t->res->last_level) {
 		return NULL;
 	}
 	struct pipe_surface templ;
 	memset(&templ, 0, sizeof(templ));
 	templ.format = t->format;
-	templ.u.tex.level = a->level;
+	templ.u.tex.level = texture_level(t, a->level);
 	templ.u.tex.first_layer = templ.u.tex.last_layer = texture_layer(t, a->slice, a->depth_plane);
 	struct pipe_surface *s = cb->dev->pipe->create_surface(cb->dev->pipe, t->res, &templ);
 	if (s != NULL) {
@@ -2557,7 +2928,8 @@ exec_pass_begin(struct b2l_mtl_cmdbuf *cb, struct encoder_state *st, const struc
 			continue;
 		}
 		fb.nr_cbufs = i + 1;
-		unsigned w = u_minify(a->texture->res->width0, a->level), h = u_minify(a->texture->res->height0, a->level);
+		unsigned l = texture_level(a->texture, a->level);
+		unsigned w = u_minify(a->texture->res->width0, l), h = u_minify(a->texture->res->height0, l);
 		width = width != 0 ? MIN2(width, w) : w;
 		height = height != 0 ? MIN2(height, h) : h;
 		samples = MAX2(samples, a->texture->res->nr_samples);
@@ -2565,7 +2937,8 @@ exec_pass_begin(struct b2l_mtl_cmdbuf *cb, struct encoder_state *st, const struc
 	const struct b2l_mtl_attachment *zs = pass->depth.texture != NULL ? &pass->depth : &pass->stencil;
 	if (zs->texture != NULL) {
 		fb.zsbuf = pass_surface(cb, zs);
-		unsigned w = u_minify(zs->texture->res->width0, zs->level), h = u_minify(zs->texture->res->height0, zs->level);
+		unsigned l = texture_level(zs->texture, zs->level);
+		unsigned w = u_minify(zs->texture->res->width0, l), h = u_minify(zs->texture->res->height0, l);
 		width = width != 0 ? MIN2(width, w) : w;
 		height = height != 0 ? MIN2(height, h) : h;
 	}
@@ -2619,10 +2992,10 @@ exec_buffer_texture(struct b2l_mtl_cmdbuf *cb, const struct op *op)
 {
 	struct b2l_mtl_texture *t = op->u.buffer_texture.texture;
 	struct b2l_mtl_buffer *b = op->u.buffer_texture.buffer;
-	uint32_t level = op->u.buffer_texture.level;
-	if (t == NULL || b == NULL || level > t->res->last_level) {
+	if (t == NULL || b == NULL || texture_level(t, op->u.buffer_texture.level) > t->res->last_level) {
 		return;
 	}
+	uint32_t level = texture_level(t, op->u.buffer_texture.level);
 	struct pipe_box box;
 	texture_box(t, &op->u.buffer_texture.region, op->u.buffer_texture.slice, &box);
 	uint64_t row = op->u.buffer_texture.bytes_per_row;
@@ -2687,6 +3060,15 @@ cmdbuf_execute(struct b2l_mtl_cmdbuf *cb, uint64_t *gpu_us, char *why, size_t wh
 		case OP_DRAW:
 			exec_draw(dev, st, &op->u.draw, first, sizeof(first));
 			break;
+		case OP_COMPUTE_BEGIN:
+		case OP_COMPUTE_END:
+		case OP_SET_COMPUTE_PIPELINE:
+		case OP_SET_THREADGROUP_MEMORY:
+			exec_state(st, op);
+			break;
+		case OP_DISPATCH:
+			exec_dispatch(dev, st, op, first, sizeof(first));
+			break;
 		case OP_COPY_BUFFER:
 			if (op->u.copy_buffer.from_offset + op->u.copy_buffer.size > op->u.copy_buffer.from->length ||
 			    op->u.copy_buffer.to_offset + op->u.copy_buffer.size > op->u.copy_buffer.to->length) {
@@ -2713,8 +3095,12 @@ cmdbuf_execute(struct b2l_mtl_cmdbuf *cb, uint64_t *gpu_us, char *why, size_t wh
 			struct b2l_mtl_texture *from = op->u.copy_texture.from, *to = op->u.copy_texture.to;
 			texture_box(from, &op->u.copy_texture.region, op->u.copy_texture.from_slice, &box);
 			unsigned z = to->res->target == PIPE_TEXTURE_3D ? op->u.copy_texture.to_z : op->u.copy_texture.to_slice;
-			pipe->resource_copy_region(pipe, to->res, op->u.copy_texture.to_level, op->u.copy_texture.to_x,
-			    op->u.copy_texture.to_y, z, from->res, op->u.copy_texture.from_level, &box);
+			if (to->res->target != PIPE_TEXTURE_3D) {
+				z += to->first_layer;
+			}
+			pipe->resource_copy_region(pipe, to->res, texture_level(to, op->u.copy_texture.to_level),
+			    op->u.copy_texture.to_x, op->u.copy_texture.to_y, z, from->res,
+			    texture_level(from, op->u.copy_texture.from_level), &box);
 			break;
 		}
 		case OP_BUFFER_TO_TEXTURE:
@@ -2816,6 +3202,14 @@ static const struct b2l_mtl_api api = {
 	.cmdbuf_set_stencil_ref = cmdbuf_set_stencil_ref,
 	.cmdbuf_set_blend_color = cmdbuf_set_blend_color,
 	.cmdbuf_draw = cmdbuf_draw,
+	.compute_pipeline_new = compute_pipeline_new,
+	.compute_pipeline_release = compute_pipeline_release,
+	.cmdbuf_compute_begin = cmdbuf_compute_begin,
+	.cmdbuf_compute_end = cmdbuf_compute_end,
+	.cmdbuf_set_compute_pipeline = cmdbuf_set_compute_pipeline,
+	.cmdbuf_set_threadgroup_memory = cmdbuf_set_threadgroup_memory,
+	.cmdbuf_dispatch = cmdbuf_dispatch,
+	.texture_view_new = texture_view_new,
 };
 
 B2L_EXPORT const struct b2l_mtl_api *

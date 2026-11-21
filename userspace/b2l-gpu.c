@@ -2268,7 +2268,7 @@ mtl_sweep_start(void)
  */
 #define MTL_TEST_MARKER  "/private/var/tmp/b2l-mtl-test.running"
 #define MTL_TEST_DELAY_S 60u
-#define MTL_TEST_LIMIT_S 120u   /* the uber shader's translation takes seconds */
+#define MTL_TEST_LIMIT_S 180u   /* shader translations, then Core Animation's own renderer */
 
 extern char **environ;
 

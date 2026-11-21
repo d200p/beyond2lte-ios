@@ -31,9 +31,11 @@
 #define B2L_MTL_MAX_TEXTURES   32
 #define B2L_MTL_MAX_SAMPLERS   16
 
-/* Shader stages of the encoder's set* calls. */
+/* Shader stages of the encoders' set* calls. */
 #define B2L_MTL_VERTEX   0
 #define B2L_MTL_FRAGMENT 1
+#define B2L_MTL_COMPUTE  2
+#define B2L_MTL_STAGES   3
 
 /* cmdbuf_set_raster's `which`: MTLCullMode, MTLWinding, MTLTriangleFillMode,
  * MTLDepthClipMode. */
@@ -50,6 +52,7 @@ struct b2l_mtl_depth_stencil;
 struct b2l_mtl_library;
 struct b2l_mtl_function;
 struct b2l_mtl_render_pipeline;
+struct b2l_mtl_compute_pipeline;
 struct b2l_mtl_cmdbuf;
 
 struct b2l_mtl_texture_desc {
@@ -130,6 +133,13 @@ struct b2l_mtl_pipeline_report {
 	uint32_t vs_instructions, fs_instructions;      /* NIR after the frontend's clean-up */
 	uint32_t varyings_linked, varyings_unmatched;   /* fragment inputs matched by name */
 	uint32_t attributes;                            /* vertex elements made */
+};
+
+struct b2l_mtl_compute_report {
+	uint32_t translate_ms, compile_ms, instructions;
+	uint32_t max_threads;                   /* Panfrost's limit for one threadgroup */
+	uint32_t simd_width;                    /* its preferred SIMD size */
+	uint32_t threadgroup_bytes;             /* static threadgroup memory */
 };
 
 struct b2l_mtl_attachment {
@@ -272,6 +282,25 @@ struct b2l_mtl_api {
 	void (*cmdbuf_set_stencil_ref)(struct b2l_mtl_cmdbuf *cmdbuf, uint32_t front, uint32_t back);
 	void (*cmdbuf_set_blend_color)(struct b2l_mtl_cmdbuf *cmdbuf, const float rgba[4]);
 	void (*cmdbuf_draw)(struct b2l_mtl_cmdbuf *cmdbuf, const struct b2l_mtl_draw *draw);
+
+	/* Compute: a pipeline of one kernel; an encoder between compute_begin and
+	 * _end, whose buffers, bytes, textures (read, or written as images) and
+	 * samplers are set with the calls above and stage B2L_MTL_COMPUTE. */
+	struct b2l_mtl_compute_pipeline *(*compute_pipeline_new)(struct b2l_mtl_device *device,
+	    struct b2l_mtl_function *function, struct b2l_mtl_compute_report *report, char *why, size_t why_size);
+	void (*compute_pipeline_release)(struct b2l_mtl_compute_pipeline *pipeline);
+	void (*cmdbuf_compute_begin)(struct b2l_mtl_cmdbuf *cmdbuf);
+	void (*cmdbuf_compute_end)(struct b2l_mtl_cmdbuf *cmdbuf);
+	void (*cmdbuf_set_compute_pipeline)(struct b2l_mtl_cmdbuf *cmdbuf, struct b2l_mtl_compute_pipeline *pipeline);
+	void (*cmdbuf_set_threadgroup_memory)(struct b2l_mtl_cmdbuf *cmdbuf, uint32_t index, uint32_t length);
+	void (*cmdbuf_dispatch)(struct b2l_mtl_cmdbuf *cmdbuf, const uint32_t threadgroups[3],
+	    const uint32_t threads_per_threadgroup[3]);
+
+	/* A view of a texture: the same memory, another format of the same size
+	 * per pixel, a type, a range of levels and of slices. */
+	struct b2l_mtl_texture *(*texture_view_new)(struct b2l_mtl_texture *texture, uint32_t pixel_format,
+	    uint32_t type, uint32_t first_level, uint32_t levels, uint32_t first_slice, uint32_t slices, char *why,
+	    size_t why_size);
 };
 
 /* The table, or NULL if this library does not have that version. */

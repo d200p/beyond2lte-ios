@@ -10,7 +10,9 @@
  * render passes (load actions, clears) and blits. M2b adds the render
  * encoder's state and its draws (vertex buffers and bytes, constant buffers,
  * textures and samplers per stage, viewport, scissor, cull, winding, fill,
- * depth-stencil state, blend colour).
+ * depth-stencil state, blend colour), compute pipelines and encoders,
+ * texture views, events and shared events, fences, heaps, residency sets and
+ * an empty binary archive: what Core Animation's Metal renderer asks for.
  *
  * What Metal does on iOS 26 (read from the 23G90 cache): it matches the
  * IOAcceleratorES services, reads MetalPluginName ("B2LMetal-<hash>", this
@@ -260,9 +262,11 @@ set_error(id *error, long code, const char *text)
 
 /* ---- classes ---- */
 
-static Class gDeviceBase, gDeviceClass, gQueueClass;
+static Class gDeviceBase, gQueueClass;
 static Class gBufferClass, gTextureClass, gSamplerClass, gDepthStencilClass, gLibraryClass, gFunctionClass;
 static Class gRenderPipelineClass, gCommandBufferClass, gRenderEncoderClass, gBlitEncoderClass, gComputeEncoderClass;
+static Class gComputePipelineClass, gEventClass, gSharedEventClass, gFenceClass, gHeapClass, gResidencySetClass;
+static Class gBinaryArchiveClass;
 static id gDevice;
 static unsigned gPort;
 static Protocol *gProtocols[96];
@@ -486,6 +490,24 @@ object_nil(id self, SEL _cmd)
 	(void)self;
 	(void)_cmd;
 	return nil;
+}
+
+static id
+object_nil_id(id self, SEL _cmd, id value)
+{
+	(void)self;
+	(void)_cmd;
+	(void)value;
+	return nil;
+}
+
+static bool
+object_no_id(id self, SEL _cmd, id value)
+{
+	(void)self;
+	(void)_cmd;
+	(void)value;
+	return false;
 }
 
 static unsigned long
@@ -785,6 +807,11 @@ struct texture_state {
 	IOSurfaceRef surface;
 	uint32_t plane;
 	unsigned long options;
+	id parent;                      /* a view's texture, retained */
+	unsigned long parent_level, parent_slice;
+	void (^deallocator)(void *, unsigned long);     /* newTextureWithBytesNoCopy */
+	void *nocopy;
+	unsigned long nocopy_length;
 };
 
 static void
@@ -796,6 +823,13 @@ texture_free(void *p)
 	}
 	if (s->surface != NULL) {
 		CFRelease(s->surface);
+	}
+	if (s->parent != nil) {
+		objc_release(s->parent);
+	}
+	if (s->deallocator != NULL) {
+		s->deallocator(s->nocopy, s->nocopy_length);
+		Block_release(s->deallocator);
 	}
 }
 
@@ -986,6 +1020,123 @@ mesa_texture(id texture)
 {
 	return texture != nil && object_getClass(texture) == gTextureClass ?
 	    ((struct texture_state *)state_of(texture))->mt : NULL;
+}
+
+
+/* newTextureViewWithPixelFormat:[textureType:levels:slices:[swizzle:]]: the
+ * same memory read as another format of the same size per pixel, over a
+ * range of levels and slices. A swizzle other than the identity is not
+ * applied yet (logged once). */
+static id
+texture_view_make(id self, SEL _cmd, unsigned long format, unsigned long type, CFRange levels, CFRange slices)
+{
+	struct texture_state *s = state_of(self);
+	if (s == NULL) {
+		return nil;
+	}
+	char why[160] = "";
+	struct b2l_mtl_texture *mt = mtl->texture_view_new(s->mt, (uint32_t)format, (uint32_t)type,
+	    (uint32_t)levels.location, (uint32_t)levels.length, (uint32_t)slices.location, (uint32_t)slices.length, why,
+	    sizeof(why));
+	if (mt == NULL) {
+		say("-%s: %s", sel_getName(_cmd), why);
+		return nil;
+	}
+	struct b2l_mtl_texture_desc desc = s->desc;
+	desc.pixel_format = (uint32_t)format;
+	desc.type = (uint32_t)type;
+	desc.mip_levels = (uint32_t)levels.length;
+	desc.array_length = (uint32_t)slices.length;
+	id view = texture_wrap(mt, &desc, s->surface, s->plane, s->options);
+	struct texture_state *v = state_of(view);
+	if (v != NULL) {
+		v->parent = objc_retain(self);
+		v->parent_level = (unsigned long)levels.location;
+		v->parent_slice = (unsigned long)slices.location;
+	}
+	return view;
+}
+
+static id
+texture_view_format(id self, SEL _cmd, unsigned long format)
+{
+	struct texture_state *s = state_of(self);
+	if (s == NULL) {
+		return nil;
+	}
+	CFRange levels = { 0, (CFIndex)ONE(s->desc.mip_levels) };
+	CFRange slices = { 0, (CFIndex)(s->desc.type == 5 ? 6 : s->desc.type == 6 ? 6 * ONE(s->desc.array_length) :
+	    ONE(s->desc.array_length)) };
+	return texture_view_make(self, _cmd, format, s->desc.type, levels, slices);
+}
+
+static id
+texture_view_range(id self, SEL _cmd, unsigned long format, unsigned long type, CFRange levels, CFRange slices)
+{
+	return texture_view_make(self, _cmd, format, type, levels, slices);
+}
+
+static id
+texture_view_swizzle(id self, SEL _cmd, unsigned long format, unsigned long type, CFRange levels, CFRange slices,
+    uint32_t swizzle)
+{
+	if (swizzle != 0x05040302u && first_time(_cmd)) {
+		say("-%s: swizzle 0x%08x not applied yet", sel_getName(_cmd), swizzle);
+	}
+	return texture_view_make(self, _cmd, format, type, levels, slices);
+}
+
+static id
+texture_parent(id self, SEL _cmd)
+{
+	(void)_cmd;
+	struct texture_state *s = state_of(self);
+	return s != NULL ? s->parent : nil;
+}
+
+static unsigned long
+texture_parent_level(id self, SEL _cmd)
+{
+	(void)_cmd;
+	struct texture_state *s = state_of(self);
+	return s != NULL ? s->parent_level : 0;
+}
+
+static unsigned long
+texture_parent_slice(id self, SEL _cmd)
+{
+	(void)_cmd;
+	struct texture_state *s = state_of(self);
+	return s != NULL ? s->parent_slice : 0;
+}
+
+/* Core Animation's newTextureWithBytesNoCopy:length:descriptor:deallocator:
+ * The GPU cannot use the caller's memory here: level 0 is copied (rows of
+ * length / height bytes) and the deallocator is called when the texture
+ * goes; later CPU writes to that memory do not reach it (logged once). */
+static id
+device_new_texture_nocopy(id self, SEL _cmd, void *bytes, unsigned long length, id descriptor,
+    void (^deallocator)(void *, unsigned long))
+{
+	if (first_time(_cmd)) {
+		say("newTextureWithBytesNoCopy: copied, not shared");
+	}
+	id t = device_new_texture(self, _cmd, descriptor);
+	struct texture_state *s = state_of(t);
+	if (s == NULL) {
+		return nil;
+	}
+	unsigned long height = ONE(s->desc.height);
+	if (bytes != NULL && length >= height) {
+		struct b2l_mtl_region r = { 0, 0, 0, s->desc.width, (uint32_t)height, 1 };
+		mtl->texture_replace(s->mt, &r, 0, 0, bytes, length / height, 0);
+	}
+	if (deallocator != NULL) {
+		s->deallocator = Block_copy(deallocator);
+		s->nocopy = bytes;
+		s->nocopy_length = length;
+	}
+	return t;
 }
 
 /* ---- samplers and depth-stencil states ---- */
@@ -1590,6 +1741,594 @@ device_new_render_pipeline(id self, SEL _cmd, id d, id *error)
 	return device_new_render_pipeline_options(self, _cmd, d, 0, NULL, error);
 }
 
+/* The serial queue completion handlers and event listeners run on. */
+static dispatch_queue_t handler_queue;
+static pthread_once_t handler_once = PTHREAD_ONCE_INIT;
+
+static void
+handler_queue_make(void)
+{
+	handler_queue = dispatch_queue_create("dev.b2l.metal.completion", NULL);
+}
+
+/* ---- events, fences, heaps, residency sets, binary archives (M2b) ---- */
+
+/*
+ * MTLEvent / MTLSharedEvent: a value. A command buffer's encodeSignalEvent
+ * sets it when the buffer has run (commit, which returns with the GPU's work
+ * done); encodeWaitForEvent needs nothing (one queue, run in order).
+ * Listeners are called on their own dispatch queue once the value reaches
+ * theirs.
+ */
+#define MAX_LISTENERS 32
+
+typedef void (^listener_block_t)(id, uint64_t);
+
+struct event_state {
+	struct base b;
+	pthread_mutex_t lock;
+	uint64_t value;
+	struct {
+		uint64_t value;
+		id queue;                       /* retained dispatch queue */
+		listener_block_t block;
+	} listeners[MAX_LISTENERS];
+	unsigned num_listeners;
+};
+
+struct listener_call {
+	listener_block_t block;
+	id event;
+	uint64_t value;
+};
+
+static void
+listener_run(void *context)
+{
+	struct listener_call *c = context;
+	void *pool = objc_autoreleasePoolPush();
+	c->block(c->event, c->value);
+	objc_autoreleasePoolPop(pool);
+	Block_release(c->block);
+	objc_release(c->event);
+	free(c);
+}
+
+static void
+listener_fire(id event, id queue, listener_block_t block, uint64_t value)
+{
+	struct listener_call *c = calloc(1, sizeof(*c));
+	if (c == NULL) {
+		return;
+	}
+	c->block = Block_copy(block);
+	c->event = objc_retain(event);
+	c->value = value;
+	if (queue != nil) {
+		dispatch_async_f((dispatch_queue_t)queue, c, listener_run);
+	} else {
+		pthread_once(&handler_once, handler_queue_make);
+		dispatch_async_f(handler_queue, c, listener_run);
+	}
+}
+
+static void
+event_free(void *p)
+{
+	struct event_state *s = p;
+	for (unsigned i = 0; i < s->num_listeners; i++) {
+		Block_release(s->listeners[i].block);
+		if (s->listeners[i].queue != nil) {
+			objc_release(s->listeners[i].queue);
+		}
+	}
+	pthread_mutex_destroy(&s->lock);
+}
+
+static void
+event_dealloc(id self, SEL _cmd)
+{
+	(void)_cmd;
+	dealloc_with(self, event_free);
+}
+
+static id
+event_make(Class cls)
+{
+	struct event_state *s = calloc(1, sizeof(*s));
+	if (s == NULL) {
+		return nil;
+	}
+	pthread_mutex_init(&s->lock, NULL);
+	id o = make_object(cls, s);
+	if (o == nil) {
+		event_free(s);
+		free(s);
+	}
+	return o;
+}
+
+static id
+device_new_event(id self, SEL _cmd)
+{
+	(void)self;
+	(void)_cmd;
+	return event_make(gEventClass);
+}
+
+static id
+device_new_shared_event(id self, SEL _cmd)
+{
+	(void)self;
+	(void)_cmd;
+	return event_make(gSharedEventClass);
+}
+
+/* The value set, and the listeners it reaches called. */
+static void
+event_signal(id event, uint64_t value)
+{
+	struct event_state *s = state_of(event);
+	if (s == NULL) {
+		return;
+	}
+	pthread_mutex_lock(&s->lock);
+	s->value = value;
+	for (unsigned i = 0; i < s->num_listeners;) {
+		if (s->listeners[i].value <= value) {
+			listener_fire(event, s->listeners[i].queue, s->listeners[i].block, value);
+			Block_release(s->listeners[i].block);
+			if (s->listeners[i].queue != nil) {
+				objc_release(s->listeners[i].queue);
+			}
+			s->listeners[i] = s->listeners[--s->num_listeners];
+		} else {
+			i++;
+		}
+	}
+	pthread_mutex_unlock(&s->lock);
+}
+
+static uint64_t
+event_value(id self, SEL _cmd)
+{
+	(void)_cmd;
+	struct event_state *s = state_of(self);
+	if (s == NULL) {
+		return 0;
+	}
+	pthread_mutex_lock(&s->lock);
+	uint64_t v = s->value;
+	pthread_mutex_unlock(&s->lock);
+	return v;
+}
+
+static void
+event_set_value(id self, SEL _cmd, uint64_t value)
+{
+	(void)_cmd;
+	event_signal(self, value);
+}
+
+static void
+event_notify(id self, SEL _cmd, id listener, uint64_t value, listener_block_t block)
+{
+	(void)_cmd;
+	struct event_state *s = state_of(self);
+	if (s == NULL || block == NULL) {
+		return;
+	}
+	id queue = listener != nil ? msg(listener, "dispatchQueue") : nil;
+	pthread_mutex_lock(&s->lock);
+	if (value <= s->value) {
+		uint64_t now = s->value;
+		pthread_mutex_unlock(&s->lock);
+		listener_fire(self, queue, block, now);
+		return;
+	}
+	if (s->num_listeners < MAX_LISTENERS) {
+		s->listeners[s->num_listeners].value = value;
+		s->listeners[s->num_listeners].queue = queue != nil ? objc_retain(queue) : nil;
+		s->listeners[s->num_listeners].block = Block_copy(block);
+		s->num_listeners++;
+	}
+	pthread_mutex_unlock(&s->lock);
+}
+
+/* waitUntilSignaledValue:timeoutMS: polled; YES once it is reached. */
+static bool
+event_wait(id self, SEL _cmd, uint64_t value, uint64_t timeout_ms)
+{
+	for (uint64_t waited = 0;; waited++) {
+		if (event_value(self, _cmd) >= value) {
+			return true;
+		}
+		if (waited >= timeout_ms) {
+			return false;
+		}
+		usleep(1000);
+	}
+}
+
+static id
+fence_make(id self, SEL _cmd)
+{
+	(void)self;
+	(void)_cmd;
+	struct base *s = calloc(1, sizeof(*s));
+	id o = s != NULL ? make_object(gFenceClass, s) : nil;
+	if (o == nil) {
+		free(s);
+	}
+	return o;
+}
+
+/* MTLHeap: Metal's sub-allocation; here each resource is a GPU allocation of
+ * its own and the heap counts what it has handed out against its size. */
+struct heap_state {
+	struct base b;
+	unsigned long size, used, options, type;
+};
+
+static void
+heap_dealloc(id self, SEL _cmd)
+{
+	(void)_cmd;
+	dealloc_with(self, NULL);
+}
+
+static id
+device_new_heap(id self, SEL _cmd, id d)
+{
+	(void)self;
+	(void)_cmd;
+	struct heap_state *s = calloc(1, sizeof(*s));
+	if (s == NULL) {
+		return nil;
+	}
+	s->size = msg_u(d, "size");
+	s->type = msg_u(d, "type");
+	s->options = msg_u(d, "storageMode") << 4 | msg_u(d, "cpuCacheMode") | msg_u(d, "hazardTrackingMode") << 8;
+	id o = make_object(gHeapClass, s);
+	if (o == nil) {
+		free(s);
+	}
+	return o;
+}
+
+#define HEAP_FIELD(fn, expr)                                      \
+	static unsigned long fn(id self, SEL _cmd)                \
+	{                                                         \
+		(void)_cmd;                                       \
+		struct heap_state *s = state_of(self);            \
+		return s != NULL ? (unsigned long)(expr) : 0;     \
+	}
+HEAP_FIELD(heap_size, s->size)
+HEAP_FIELD(heap_used, s->used)
+HEAP_FIELD(heap_type, s->type)
+HEAP_FIELD(heap_options, s->options)
+HEAP_FIELD(heap_storage_mode, (s->options >> 4) & 0xf)
+HEAP_FIELD(heap_cache_mode, s->options & 0xf)
+HEAP_FIELD(heap_hazard_mode, (s->options >> 8) & 0x3)
+
+static unsigned long
+heap_available(id self, SEL _cmd, unsigned long alignment)
+{
+	(void)alignment;
+	struct heap_state *s = state_of(self);
+	(void)_cmd;
+	return s != NULL && s->size > s->used ? s->size - s->used : 0;
+}
+
+static id
+heap_new_buffer(id self, SEL _cmd, unsigned long length, unsigned long options)
+{
+	struct heap_state *s = state_of(self);
+	if (s == NULL || s->used + length > s->size) {
+		if (first_time(_cmd)) {
+			say("heap of %lu bytes: no room for a buffer of %lu", s != NULL ? s->size : 0, length);
+		}
+		return nil;
+	}
+	id b = buffer_make(length, NULL, options, "-[MTLHeap newBufferWithLength:options:]");
+	if (b != nil) {
+		s->used += (length + 255) & ~255ul;
+	}
+	return b;
+}
+
+static id
+heap_new_buffer_offset(id self, SEL _cmd, unsigned long length, unsigned long options, unsigned long offset)
+{
+	(void)offset;
+	return heap_new_buffer(self, _cmd, length, options);
+}
+
+static id
+heap_new_texture(id self, SEL _cmd, id descriptor)
+{
+	struct heap_state *s = state_of(self);
+	id t = device_new_texture(gDevice, _cmd, descriptor);
+	struct texture_state *ts = state_of(t);
+	if (s != NULL && ts != NULL) {
+		s->used += (mtl->texture_allocated_size(ts->mt) + 4095) & ~4095ul;
+	}
+	return t;
+}
+
+static id
+heap_new_texture_offset(id self, SEL _cmd, id descriptor, unsigned long offset)
+{
+	(void)offset;
+	return heap_new_texture(self, _cmd, descriptor);
+}
+
+typedef struct {
+	unsigned long size, align;
+} mtl_size_align;
+
+static mtl_size_align
+device_heap_buffer_size(id self, SEL _cmd, unsigned long length, unsigned long options)
+{
+	(void)self;
+	(void)_cmd;
+	(void)options;
+	mtl_size_align r = { (length + 255) & ~255ul, 256 };
+	return r;
+}
+
+/* An upper bound: 16 bytes a pixel over every level and slice. */
+static mtl_size_align
+device_heap_texture_size(id self, SEL _cmd, id d)
+{
+	(void)self;
+	(void)_cmd;
+	unsigned long pixels = ONE(msg_u(d, "width")) * ONE(msg_u(d, "height")) * ONE(msg_u(d, "depth")) *
+	    ONE(msg_u(d, "arrayLength")) * ONE(msg_u(d, "sampleCount"));
+	unsigned long bytes = pixels * 16 * (msg_u(d, "mipmapLevelCount") > 1 ? 2 : 1);
+	mtl_size_align r = { (bytes + 4095) & ~4095ul, 4096 };
+	return r;
+}
+
+/* MTLResidencySet: every allocation here is resident; nothing to track. */
+static id
+device_new_residency_set(id self, SEL _cmd, id descriptor, id *error)
+{
+	(void)self;
+	(void)_cmd;
+	(void)descriptor;
+	(void)error;
+	struct base *s = calloc(1, sizeof(*s));
+	id o = s != NULL ? make_object(gResidencySetClass, s) : nil;
+	if (o == nil) {
+		free(s);
+	}
+	return o;
+}
+
+static void
+object_ignore_pointer_count(id self, SEL _cmd, const void *objects, unsigned long count)
+{
+	(void)self;
+	(void)_cmd;
+	(void)objects;
+	(void)count;
+}
+
+/* MTLBinaryArchive: nothing is kept (Panfrost compiles each pipeline), and
+ * adding to it succeeds so that the caller goes on to make its pipeline. */
+static id
+device_new_binary_archive(id self, SEL _cmd, id descriptor, id *error)
+{
+	(void)self;
+	(void)_cmd;
+	(void)descriptor;
+	(void)error;
+	struct base *s = calloc(1, sizeof(*s));
+	id o = s != NULL ? make_object(gBinaryArchiveClass, s) : nil;
+	if (o == nil) {
+		free(s);
+	}
+	return o;
+}
+
+static bool
+archive_add(id self, SEL _cmd, id descriptor, id *error)
+{
+	(void)self;
+	(void)_cmd;
+	(void)descriptor;
+	if (error != NULL) {
+		*error = nil;
+	}
+	return true;
+}
+
+static bool
+archive_add_function(id self, SEL _cmd, id descriptor, id library, id *error)
+{
+	(void)library;
+	return archive_add(self, _cmd, descriptor, error);
+}
+
+static bool
+archive_serialize(id self, SEL _cmd, id url, id *error)
+{
+	(void)self;
+	(void)_cmd;
+	(void)url;
+	set_error(error, 1, "this device keeps no binary archives");
+	return false;
+}
+
+/* ---- compute pipelines (M2b) ---- */
+
+struct compute_state {
+	struct base b;
+	struct b2l_mtl_compute_pipeline *mp;
+	struct b2l_mtl_compute_report report;
+};
+
+static void
+compute_free(void *p)
+{
+	struct compute_state *s = p;
+	if (s->mp != NULL) {
+		mtl->compute_pipeline_release(s->mp);
+	}
+}
+
+static void
+compute_dealloc(id self, SEL _cmd)
+{
+	(void)_cmd;
+	dealloc_with(self, compute_free);
+}
+
+static id
+compute_make(id function, id *error)
+{
+	if (!gpu_ready("newComputePipelineStateWithFunction:error:")) {
+		set_error(error, 1, "no Panfrost device");
+		return nil;
+	}
+	struct b2l_mtl_function *mf = mesa_function(function);
+	char name[128];
+	cstring(msg(function, "name"), name, sizeof(name));
+	if (mf == NULL) {
+		say("compute pipeline %s: the function is not one of ours", name);
+		set_error(error, 1, "no kernel function of this device");
+		return nil;
+	}
+	struct compute_state *s = calloc(1, sizeof(*s));
+	char why[192] = "";
+	if (s == NULL || (s->mp = mtl->compute_pipeline_new(mdev, mf, &s->report, why, sizeof(why))) == NULL) {
+		say("compute pipeline %s refused: %s", name, why);
+		set_error(error, 1, why[0] != 0 ? why : "out of memory");
+		free(s);
+		return nil;
+	}
+	id o = make_object(gComputePipelineClass, s);
+	if (o == nil) {
+		compute_free(s);
+		free(s);
+	}
+	return o;
+}
+
+static id
+device_new_compute(id self, SEL _cmd, id function, id *error)
+{
+	(void)self;
+	(void)_cmd;
+	return compute_make(function, error);
+}
+
+static id
+device_new_compute_options(id self, SEL _cmd, id function, unsigned long options, id *reflection, id *error)
+{
+	(void)self;
+	(void)_cmd;
+	(void)options;
+	if (reflection != NULL) {
+		*reflection = nil;
+	}
+	return compute_make(function, error);
+}
+
+static id
+device_new_compute_descriptor(id self, SEL _cmd, id descriptor, id *error)
+{
+	(void)self;
+	(void)_cmd;
+	return compute_make(msg(descriptor, "computeFunction"), error);
+}
+
+static id
+device_new_compute_descriptor_options(id self, SEL _cmd, id descriptor, unsigned long options, id *reflection,
+    id *error)
+{
+	(void)self;
+	(void)_cmd;
+	(void)options;
+	if (reflection != NULL) {
+		*reflection = nil;
+	}
+	return compute_make(msg(descriptor, "computeFunction"), error);
+}
+
+/* The completion-handler forms: made at once, the handler called before
+ * returning (Metal allows either). */
+static void
+device_new_compute_async(id self, SEL _cmd, id function, void (^handler)(id, id))
+{
+	(void)self;
+	(void)_cmd;
+	id error = nil;
+	id p = compute_make(function, &error);
+	if (handler != NULL) {
+		handler(p, error);
+	}
+	if (p != nil) {
+		objc_release(p);
+	}
+}
+
+static void
+device_new_render_async(id self, SEL _cmd, id descriptor, void (^handler)(id, id))
+{
+	id error = nil;
+	id p = device_new_render_pipeline_options(self, _cmd, descriptor, 0, NULL, &error);
+	if (handler != NULL) {
+		handler(p, error);
+	}
+	if (p != nil) {
+		objc_release(p);
+	}
+}
+
+static void
+device_new_render_options_async(id self, SEL _cmd, id descriptor, unsigned long options,
+    void (^handler)(id, id, id))
+{
+	id error = nil;
+	id p = device_new_render_pipeline_options(self, _cmd, descriptor, options, NULL, &error);
+	if (handler != NULL) {
+		handler(p, nil, error);
+	}
+	if (p != nil) {
+		objc_release(p);
+	}
+}
+
+#define COMPUTE_FIELD(fn, expr)                                   \
+	static unsigned long fn(id self, SEL _cmd)                \
+	{                                                         \
+		(void)_cmd;                                       \
+		struct compute_state *s = state_of(self);         \
+		return s != NULL ? (unsigned long)(expr) : 0;     \
+	}
+COMPUTE_FIELD(compute_max_threads, s->report.max_threads)
+COMPUTE_FIELD(compute_simd_width, s->report.simd_width != 0 ? s->report.simd_width : 8)
+COMPUTE_FIELD(compute_threadgroup_bytes, s->report.threadgroup_bytes)
+
+static unsigned long
+compute_imageblock_length(id self, SEL _cmd, mtl_size dimensions)
+{
+	(void)self;
+	(void)_cmd;
+	(void)dimensions;
+	return 0;
+}
+
+static struct b2l_mtl_compute_pipeline *
+mesa_compute(id state)
+{
+	return state != nil && object_getClass(state) == gComputePipelineClass ?
+	    ((struct compute_state *)state_of(state))->mp : NULL;
+}
+
+
 /* ---- command buffers ---- */
 
 enum {
@@ -1610,16 +2349,10 @@ struct cmdbuf_state {
 	id error;                       /* retained NSError */
 	bool committed;
 	double gpu_start, gpu_end;
+	id signal_events[MAX_HANDLERS];         /* encodeSignalEvent:value:, retained */
+	uint64_t signal_values[MAX_HANDLERS];
+	unsigned num_signals;
 };
-
-static dispatch_queue_t handler_queue;
-static pthread_once_t handler_once = PTHREAD_ONCE_INIT;
-
-static void
-handler_queue_make(void)
-{
-	handler_queue = dispatch_queue_create("dev.b2l.metal.completion", NULL);
-}
 
 static void
 cmdbuf_free(void *p)
@@ -1639,6 +2372,9 @@ cmdbuf_free(void *p)
 	}
 	if (s->error != nil) {
 		objc_release(s->error);
+	}
+	for (unsigned i = 0; i < s->num_signals; i++) {
+		objc_release(s->signal_events[i]);
 	}
 }
 
@@ -1727,8 +2463,53 @@ cmdbuf_commit(id self, SEL _cmd)
 			say("command buffer %lu: done in %llu us", n, (unsigned long long)gpu_us);
 		}
 	}
+	/* the GPU's work is done: the events this buffer signals take their values */
+	for (unsigned i = 0; i < s->num_signals; i++) {
+		event_signal(s->signal_events[i], s->signal_values[i]);
+	}
 	pthread_once(&handler_once, handler_queue_make);
 	dispatch_async_f(handler_queue, objc_retain(self), cmdbuf_handlers);
+}
+
+static void
+cmdbuf_encode_signal(id self, SEL _cmd, id event, uint64_t value)
+{
+	struct cmdbuf_state *s = state_of(self);
+	if (s == NULL || s->committed || event == nil) {
+		return;
+	}
+	if (state_of(event) == NULL || (object_getClass(event) != gEventClass &&
+	    object_getClass(event) != gSharedEventClass)) {
+		if (first_time(_cmd)) {
+			say("-%s: %s is not this device's", sel_getName(_cmd), class_getName(object_getClass(event)));
+		}
+		return;
+	}
+	if (s->num_signals < MAX_HANDLERS) {
+		s->signal_events[s->num_signals] = objc_retain(event);
+		s->signal_values[s->num_signals] = value;
+		s->num_signals++;
+	}
+}
+
+static void
+cmdbuf_encode_signal_agents(id self, SEL _cmd, id event, uint64_t value, uint64_t agents)
+{
+	(void)agents;
+	cmdbuf_encode_signal(self, _cmd, event, value);
+}
+
+/* One queue whose buffers run in order at commit: a wait for a value an
+ * earlier buffer signals needs nothing; one for a value nothing has
+ * signalled yet cannot be honoured (logged once). */
+static void
+cmdbuf_encode_wait(id self, SEL _cmd, id event, uint64_t value)
+{
+	(void)self;
+	if (event != nil && state_of(event) != NULL && (object_getClass(event) == gEventClass ||
+	    object_getClass(event) == gSharedEventClass) && event_value(event, _cmd) < value && first_time(_cmd)) {
+		say("-%s: value %llu not signalled yet, not waited for", sel_getName(_cmd), (unsigned long long)value);
+	}
 }
 
 static void
@@ -1943,7 +2724,7 @@ cmdbuf_compute_encoder(id self, SEL _cmd)
 	if (c == NULL || c->committed) {
 		return nil;
 	}
-	mtl->cmdbuf_unsupported(c->mc, "compute encoders (M4)");
+	mtl->cmdbuf_compute_begin(c->mc);
 	return encoder_make(gComputeEncoderClass, self);
 }
 
@@ -1951,6 +2732,13 @@ static id
 cmdbuf_compute_encoder_type(id self, SEL _cmd, unsigned long type)
 {
 	(void)type;
+	return cmdbuf_compute_encoder(self, _cmd);
+}
+
+static id
+cmdbuf_blit_like_compute(id self, SEL _cmd, id descriptor)
+{
+	(void)descriptor;
 	return cmdbuf_compute_encoder(self, _cmd);
 }
 
@@ -2588,6 +3376,169 @@ blit_synchronize_texture(id self, SEL _cmd, id texture, unsigned long slice, uns
 	(void)level;
 }
 
+/* ---- the compute encoder (M2b) ---- */
+
+static void
+compute_set_pipeline(id self, SEL _cmd, id state)
+{
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	struct b2l_mtl_compute_pipeline *mp = mesa_compute(state);
+	if (mc == NULL) {
+		return;
+	}
+	if (mp == NULL && state != nil) {
+		foreign(mc, _cmd, state);
+		return;
+	}
+	mtl->cmdbuf_set_compute_pipeline(mc, mp);
+}
+
+static void
+compute_buffer(id self, SEL _cmd, id buffer, unsigned long offset, unsigned long index)
+{
+	set_buffer(self, _cmd, B2L_MTL_COMPUTE, buffer, offset, index);
+}
+
+static void
+compute_buffers(id self, SEL _cmd, const id *buffers, const unsigned long *offsets, CFRange range)
+{
+	set_buffers(self, _cmd, B2L_MTL_COMPUTE, buffers, offsets, range);
+}
+
+static void
+compute_buffer_offset(id self, SEL _cmd, unsigned long offset, unsigned long index)
+{
+	(void)_cmd;
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	if (mc != NULL) {
+		mtl->cmdbuf_set_buffer_offset(mc, B2L_MTL_COMPUTE, (uint32_t)index, offset);
+	}
+}
+
+static void
+compute_bytes(id self, SEL _cmd, const void *bytes, unsigned long length, unsigned long index)
+{
+	(void)_cmd;
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	if (mc != NULL) {
+		mtl->cmdbuf_set_bytes(mc, B2L_MTL_COMPUTE, (uint32_t)index, bytes, length);
+	}
+}
+
+static void
+compute_texture(id self, SEL _cmd, id texture, unsigned long index)
+{
+	set_texture(self, _cmd, B2L_MTL_COMPUTE, texture, index);
+}
+
+static void
+compute_textures(id self, SEL _cmd, const id *textures, CFRange range)
+{
+	for (CFIndex i = 0; textures != NULL && i < range.length; i++) {
+		set_texture(self, _cmd, B2L_MTL_COMPUTE, textures[i], (unsigned long)(range.location + i));
+	}
+}
+
+static void
+compute_sampler(id self, SEL _cmd, id sampler, unsigned long index)
+{
+	set_sampler(self, _cmd, B2L_MTL_COMPUTE, sampler, index);
+}
+
+static void
+compute_samplers(id self, SEL _cmd, const id *samplers, CFRange range)
+{
+	for (CFIndex i = 0; samplers != NULL && i < range.length; i++) {
+		set_sampler(self, _cmd, B2L_MTL_COMPUTE, samplers[i], (unsigned long)(range.location + i));
+	}
+}
+
+static void
+compute_threadgroup_memory(id self, SEL _cmd, unsigned long length, unsigned long index)
+{
+	(void)_cmd;
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	if (mc != NULL) {
+		mtl->cmdbuf_set_threadgroup_memory(mc, (uint32_t)index, (uint32_t)length);
+	}
+}
+
+static void
+compute_dispatch_groups(id self, SEL _cmd, mtl_size groups, mtl_size threads)
+{
+	(void)_cmd;
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	if (mc != NULL) {
+		const uint32_t g[3] = { (uint32_t)groups.width, (uint32_t)groups.height, (uint32_t)groups.depth };
+		const uint32_t t[3] = { (uint32_t)threads.width, (uint32_t)threads.height, (uint32_t)threads.depth };
+		mtl->cmdbuf_dispatch(mc, g, t);
+	}
+}
+
+/* dispatchThreads: the grid rounded up to whole threadgroups. Metal gives
+ * non-uniform threadgroups only to the GPU families that have them (Apple4
+ * and later), which this device does not claim, so a kernel run this way
+ * checks its own bounds. */
+static void
+compute_dispatch_threads(id self, SEL _cmd, mtl_size grid, mtl_size threads)
+{
+	mtl_size groups = {
+		threads.width != 0 ? (grid.width + threads.width - 1) / threads.width : 0,
+		threads.height != 0 ? (grid.height + threads.height - 1) / threads.height : 0,
+		threads.depth != 0 ? (grid.depth + threads.depth - 1) / threads.depth : 0,
+	};
+	compute_dispatch_groups(self, _cmd, groups, threads);
+}
+
+static void
+compute_end(id self, SEL _cmd)
+{
+	(void)_cmd;
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	if (mc != NULL) {
+		mtl->cmdbuf_compute_end(mc);
+	}
+	struct encoder_state *e = state_of(self);
+	if (e != NULL) {
+		e->ended = true;
+	}
+}
+
+static void
+compute_barrier_scope(id self, SEL _cmd, unsigned long scope)
+{
+	(void)self;
+	(void)_cmd;
+	(void)scope;                    /* every dispatch is followed by a barrier */
+}
+
+static unsigned long
+compute_dispatch_type(id self, SEL _cmd)
+{
+	(void)self;
+	(void)_cmd;
+	return 0;                       /* MTLDispatchTypeSerial */
+}
+
+/* updateFence:, waitForFence: (and the render encoder's stage forms): one
+ * queue whose commands run in order, so nothing to do. */
+static void
+encoder_fence(id self, SEL _cmd, id fence)
+{
+	(void)self;
+	(void)_cmd;
+	(void)fence;
+}
+
+static void
+encoder_fence_stages(id self, SEL _cmd, id fence, unsigned long stages)
+{
+	(void)self;
+	(void)_cmd;
+	(void)fence;
+	(void)stages;
+}
+
 /* ---- the device ---- */
 
 static id
@@ -2746,6 +3697,10 @@ register_queue_class(void)
 	class_addMethod(cls, S("commandBufferWithUnretainedReferences"), (IMP)queue_command_buffer, "@@:");
 	class_addMethod(cls, S("commandBufferWithDescriptor:"), (IMP)queue_command_buffer_descriptor, "@@:@");
 	class_addMethod(cls, S("insertDebugCaptureBoundary"), (IMP)object_nothing, "v@:");
+	class_addMethod(cls, S("addResidencySet:"), (IMP)object_nothing_id, "v@:@");
+	class_addMethod(cls, S("removeResidencySet:"), (IMP)object_nothing_id, "v@:@");
+	class_addMethod(cls, S("addResidencySets:count:"), (IMP)object_ignore_pointer_count, "v@:r^@Q");
+	class_addMethod(cls, S("removeResidencySets:count:"), (IMP)object_ignore_pointer_count, "v@:r^@Q");
 	class_addMethod(cls, S("dealloc"), (IMP)queue_dealloc, "v@:");
 	class_addMethod(cls, S("methodSignatureForSelector:"), (IMP)object_signature, "@@::");
 	class_addMethod(cls, S("forwardInvocation:"), (IMP)object_forward, "v@:@");
@@ -2773,6 +3728,13 @@ register_object_classes(Class device)
 	static const char *const render[] = { "MTLRenderCommandEncoder", "MTLCommandEncoder", NULL };
 	static const char *const blit[] = { "MTLBlitCommandEncoder", "MTLCommandEncoder", NULL };
 	static const char *const compute[] = { "MTLComputeCommandEncoder", "MTLCommandEncoder", NULL };
+	static const char *const compute_pipeline[] = { "MTLComputePipelineState", NULL };
+	static const char *const event[] = { "MTLEvent", NULL };
+	static const char *const shared_event[] = { "MTLSharedEvent", "MTLEvent", NULL };
+	static const char *const fence[] = { "MTLFence", NULL };
+	static const char *const heap[] = { "MTLHeap", NULL };
+	static const char *const residency[] = { "MTLResidencySet", NULL };
+	static const char *const archive[] = { "MTLBinaryArchive", NULL };
 	Class c;
 
 	if ((c = object_class("B2LMetalBuffer", buffer)) != Nil) {
@@ -2820,7 +3782,14 @@ register_object_classes(Class device)
 		class_addMethod(c, S("isShareable"), (IMP)object_no, "B@:");
 		class_addMethod(c, S("isAliasable"), (IMP)object_no, "B@:");
 		class_addMethod(c, S("makeAliasable"), (IMP)object_nothing, "v@:");
-		class_addMethod(c, S("parentTexture"), (IMP)object_nil, "@@:");
+		class_addMethod(c, S("parentTexture"), (IMP)texture_parent, "@@:");
+		class_addMethod(c, S("parentRelativeLevel"), (IMP)texture_parent_level, "Q@:");
+		class_addMethod(c, S("parentRelativeSlice"), (IMP)texture_parent_slice, "Q@:");
+		class_addMethod(c, S("newTextureViewWithPixelFormat:"), (IMP)texture_view_format, "@@:Q");
+		class_addMethod(c, S("newTextureViewWithPixelFormat:textureType:levels:slices:"), (IMP)texture_view_range,
+		    "@@:QQ{_NSRange=QQ}{_NSRange=QQ}");
+		class_addMethod(c, S("newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:"),
+		    (IMP)texture_view_swizzle, "@@:QQ{_NSRange=QQ}{_NSRange=QQ}{?=CCCC}");
 		class_addMethod(c, S("buffer"), (IMP)object_nil, "@@:");
 		class_addMethod(c, S("heap"), (IMP)object_nil, "@@:");
 		class_addMethod(c, S("compressionType"), (IMP)object_zero, "q@:");
@@ -2840,6 +3809,8 @@ register_object_classes(Class device)
 		class_addMethod(device, S("newTextureWithDescriptor:"), (IMP)device_new_texture, "@@:@");
 		class_addMethod(device, S("newTextureWithDescriptor:iosurface:plane:"), (IMP)device_new_texture_iosurface,
 		    "@@:@^{__IOSurface=}Q");
+		class_addMethod(device, S("newTextureWithBytesNoCopy:length:descriptor:deallocator:"),
+		    (IMP)device_new_texture_nocopy, "@@:^vQ@@?");
 	}
 	if ((c = object_class("B2LMetalSamplerState", sampler)) != Nil) {
 		class_addMethod(c, S("dealloc"), (IMP)sampler_dealloc, "v@:");
@@ -2947,6 +3918,8 @@ register_object_classes(Class device)
 		class_addMethod(c, S("useHeap:"), (IMP)object_nothing_id, "v@:@");
 		class_addMethod(c, S("useHeap:stages:"), (IMP)render_ignore_id_number, "v@:@Q");
 		class_addMethod(c, S("textureBarrier"), (IMP)object_nothing, "v@:");
+		class_addMethod(c, S("updateFence:afterStages:"), (IMP)encoder_fence_stages, "v@:@Q");
+		class_addMethod(c, S("waitForFence:beforeStages:"), (IMP)encoder_fence_stages, "v@:@Q");
 		class_addMethod(c, S("memoryBarrierWithScope:afterStages:beforeStages:"), (IMP)render_ignore_numbers3,
 		    "v@:QQQ");
 		class_addMethod(c, S("drawPrimitives:vertexStart:vertexCount:"), (IMP)render_draw3, "v@:QQQ");
@@ -2991,16 +3964,144 @@ register_object_classes(Class device)
 		class_addMethod(c, S("synchronizeResource:"), (IMP)object_nothing_id, "v@:@");
 		class_addMethod(c, S("synchronizeTexture:slice:level:"), (IMP)blit_synchronize_texture, "v@:@QQ");
 		class_addMethod(c, S("optimizeContentsForGPUAccess:"), (IMP)object_nothing_id, "v@:@");
+		class_addMethod(c, S("updateFence:"), (IMP)encoder_fence, "v@:@");
+		class_addMethod(c, S("waitForFence:"), (IMP)encoder_fence, "v@:@");
 		objc_registerClassPair(c);
 		gBlitEncoderClass = c;
 	}
 	if ((c = object_class("B2LMetalComputeEncoder", compute)) != Nil) {
 		class_addMethod(c, S("dealloc"), (IMP)encoder_dealloc, "v@:");
-		class_addMethod(c, S("endEncoding"), (IMP)encoder_end, "v@:");
+		class_addMethod(c, S("endEncoding"), (IMP)compute_end, "v@:");
 		class_addMethod(c, S("pushDebugGroup:"), (IMP)encoder_debug_group, "v@:@");
 		class_addMethod(c, S("popDebugGroup"), (IMP)object_nothing, "v@:");
+		class_addMethod(c, S("insertDebugSignpost:"), (IMP)encoder_debug_group, "v@:@");
+		class_addMethod(c, S("setComputePipelineState:"), (IMP)compute_set_pipeline, "v@:@");
+		class_addMethod(c, S("setBuffer:offset:atIndex:"), (IMP)compute_buffer, "v@:@QQ");
+		class_addMethod(c, S("setBuffers:offsets:withRange:"), (IMP)compute_buffers, "v@:r^@r^Q{_NSRange=QQ}");
+		class_addMethod(c, S("setBufferOffset:atIndex:"), (IMP)compute_buffer_offset, "v@:QQ");
+		class_addMethod(c, S("setBytes:length:atIndex:"), (IMP)compute_bytes, "v@:r^vQQ");
+		class_addMethod(c, S("setTexture:atIndex:"), (IMP)compute_texture, "v@:@Q");
+		class_addMethod(c, S("setTextures:withRange:"), (IMP)compute_textures, "v@:r^@{_NSRange=QQ}");
+		class_addMethod(c, S("setSamplerState:atIndex:"), (IMP)compute_sampler, "v@:@Q");
+		class_addMethod(c, S("setSamplerStates:withRange:"), (IMP)compute_samplers, "v@:r^@{_NSRange=QQ}");
+		class_addMethod(c, S("setThreadgroupMemoryLength:atIndex:"), (IMP)compute_threadgroup_memory, "v@:QQ");
+		class_addMethod(c, S("dispatchThreadgroups:threadsPerThreadgroup:"), (IMP)compute_dispatch_groups,
+		    "v@:" SIZE SIZE);
+		class_addMethod(c, S("dispatchThreads:threadsPerThreadgroup:"), (IMP)compute_dispatch_threads,
+		    "v@:" SIZE SIZE);
+		class_addMethod(c, S("memoryBarrierWithScope:"), (IMP)compute_barrier_scope, "v@:Q");
+		class_addMethod(c, S("memoryBarrierWithResources:count:"), (IMP)object_ignore_pointer_count, "v@:r^@Q");
+		class_addMethod(c, S("useResource:usage:"), (IMP)render_ignore_id_number, "v@:@Q");
+		class_addMethod(c, S("useResources:count:usage:"), (IMP)render_ignore_id_number2, "v@:r^@QQ");
+		class_addMethod(c, S("useHeap:"), (IMP)object_nothing_id, "v@:@");
+		class_addMethod(c, S("updateFence:"), (IMP)encoder_fence, "v@:@");
+		class_addMethod(c, S("waitForFence:"), (IMP)encoder_fence, "v@:@");
+		class_addMethod(c, S("dispatchType"), (IMP)compute_dispatch_type, "Q@:");
 		objc_registerClassPair(c);
 		gComputeEncoderClass = c;
+	}
+	if ((c = object_class("B2LMetalComputePipelineState", compute_pipeline)) != Nil) {
+		class_addMethod(c, S("dealloc"), (IMP)compute_dealloc, "v@:");
+		class_addMethod(c, S("maxTotalThreadsPerThreadgroup"), (IMP)compute_max_threads, "Q@:");
+		class_addMethod(c, S("threadExecutionWidth"), (IMP)compute_simd_width, "Q@:");
+		class_addMethod(c, S("staticThreadgroupMemoryLength"), (IMP)compute_threadgroup_bytes, "Q@:");
+		class_addMethod(c, S("imageblockMemoryLengthForDimensions:"), (IMP)compute_imageblock_length, "Q@:" SIZE);
+		class_addMethod(c, S("supportIndirectCommandBuffers"), (IMP)object_no, "B@:");
+		class_addMethod(c, S("gpuResourceID"), (IMP)object_resource_id, "{?=Q}@:");
+		objc_registerClassPair(c);
+		gComputePipelineClass = c;
+		class_addMethod(device, S("newComputePipelineStateWithFunction:error:"), (IMP)device_new_compute, "@@:@^@");
+		class_addMethod(device, S("newComputePipelineStateWithFunction:options:reflection:error:"),
+		    (IMP)device_new_compute_options, "@@:@Q^@^@");
+		class_addMethod(device, S("newComputePipelineStateWithDescriptor:error:"),
+		    (IMP)device_new_compute_descriptor, "@@:@^@");
+		class_addMethod(device, S("newComputePipelineStateWithDescriptor:options:reflection:error:"),
+		    (IMP)device_new_compute_descriptor_options, "@@:@Q^@^@");
+		class_addMethod(device, S("newComputePipelineStateWithFunction:completionHandler:"),
+		    (IMP)device_new_compute_async, "v@:@@?");
+		class_addMethod(device, S("newRenderPipelineStateWithDescriptor:completionHandler:"),
+		    (IMP)device_new_render_async, "v@:@@?");
+		class_addMethod(device, S("newRenderPipelineStateWithDescriptor:options:completionHandler:"),
+		    (IMP)device_new_render_options_async, "v@:@Q@?");
+	}
+	if ((c = object_class("B2LMetalEvent", event)) != Nil) {
+		class_addMethod(c, S("dealloc"), (IMP)event_dealloc, "v@:");
+		objc_registerClassPair(c);
+		gEventClass = c;
+		class_addMethod(device, S("newEvent"), (IMP)device_new_event, "@@:");
+	}
+	if ((c = object_class("B2LMetalSharedEvent", shared_event)) != Nil) {
+		class_addMethod(c, S("dealloc"), (IMP)event_dealloc, "v@:");
+		class_addMethod(c, S("signaledValue"), (IMP)event_value, "Q@:");
+		class_addMethod(c, S("setSignaledValue:"), (IMP)event_set_value, "v@:Q");
+		class_addMethod(c, S("notifyListener:atValue:block:"), (IMP)event_notify, "v@:@Q@?");
+		class_addMethod(c, S("waitUntilSignaledValue:timeoutMS:"), (IMP)event_wait, "B@:QQ");
+		class_addMethod(c, S("newSharedEventHandle"), (IMP)object_nil, "@@:");
+		objc_registerClassPair(c);
+		gSharedEventClass = c;
+		class_addMethod(device, S("newSharedEvent"), (IMP)device_new_shared_event, "@@:");
+		class_addMethod(device, S("newSharedEventWithHandle:"), (IMP)object_nil_id, "@@:@");
+	}
+	if ((c = object_class("B2LMetalFence", fence)) != Nil) {
+		class_addMethod(c, S("dealloc"), (IMP)heap_dealloc, "v@:");
+		objc_registerClassPair(c);
+		gFenceClass = c;
+		class_addMethod(device, S("newFence"), (IMP)fence_make, "@@:");
+	}
+	if ((c = object_class("B2LMetalHeap", heap)) != Nil) {
+		class_addMethod(c, S("dealloc"), (IMP)heap_dealloc, "v@:");
+		class_addMethod(c, S("size"), (IMP)heap_size, "Q@:");
+		class_addMethod(c, S("usedSize"), (IMP)heap_used, "Q@:");
+		class_addMethod(c, S("currentAllocatedSize"), (IMP)heap_size, "Q@:");
+		class_addMethod(c, S("type"), (IMP)heap_type, "q@:");
+		class_addMethod(c, S("resourceOptions"), (IMP)heap_options, "Q@:");
+		class_addMethod(c, S("storageMode"), (IMP)heap_storage_mode, "Q@:");
+		class_addMethod(c, S("cpuCacheMode"), (IMP)heap_cache_mode, "Q@:");
+		class_addMethod(c, S("hazardTrackingMode"), (IMP)heap_hazard_mode, "Q@:");
+		class_addMethod(c, S("maxAvailableSizeWithAlignment:"), (IMP)heap_available, "Q@:Q");
+		class_addMethod(c, S("setPurgeableState:"), (IMP)object_non_volatile, "Q@:Q");
+		class_addMethod(c, S("newBufferWithLength:options:"), (IMP)heap_new_buffer, "@@:QQ");
+		class_addMethod(c, S("newBufferWithLength:options:offset:"), (IMP)heap_new_buffer_offset, "@@:QQQ");
+		class_addMethod(c, S("newTextureWithDescriptor:"), (IMP)heap_new_texture, "@@:@");
+		class_addMethod(c, S("newTextureWithDescriptor:offset:"), (IMP)heap_new_texture_offset, "@@:@Q");
+		objc_registerClassPair(c);
+		gHeapClass = c;
+		class_addMethod(device, S("newHeapWithDescriptor:"), (IMP)device_new_heap, "@@:@");
+		class_addMethod(device, S("heapBufferSizeAndAlignWithLength:options:"), (IMP)device_heap_buffer_size,
+		    "{?=QQ}@:QQ");
+		class_addMethod(device, S("heapTextureSizeAndAlignWithDescriptor:"), (IMP)device_heap_texture_size,
+		    "{?=QQ}@:@");
+	}
+	if ((c = object_class("B2LMetalResidencySet", residency)) != Nil) {
+		class_addMethod(c, S("dealloc"), (IMP)heap_dealloc, "v@:");
+		class_addMethod(c, S("addAllocation:"), (IMP)object_nothing_id, "v@:@");
+		class_addMethod(c, S("removeAllocation:"), (IMP)object_nothing_id, "v@:@");
+		class_addMethod(c, S("addAllocations:count:"), (IMP)object_ignore_pointer_count, "v@:r^@Q");
+		class_addMethod(c, S("removeAllocations:count:"), (IMP)object_ignore_pointer_count, "v@:r^@Q");
+		class_addMethod(c, S("removeAllAllocations"), (IMP)object_nothing, "v@:");
+		class_addMethod(c, S("commit"), (IMP)object_nothing, "v@:");
+		class_addMethod(c, S("requestResidency"), (IMP)object_nothing, "v@:");
+		class_addMethod(c, S("endResidency"), (IMP)object_nothing, "v@:");
+		class_addMethod(c, S("containsAllocation:"), (IMP)object_no_id, "B@:@");
+		class_addMethod(c, S("allocationCount"), (IMP)object_zero, "Q@:");
+		class_addMethod(c, S("allocatedSize"), (IMP)object_zero, "Q@:");
+		class_addMethod(c, S("allAllocations"), (IMP)function_empty_array, "@@:");
+		objc_registerClassPair(c);
+		gResidencySetClass = c;
+		class_addMethod(device, S("newResidencySetWithDescriptor:error:"), (IMP)device_new_residency_set,
+		    "@@:@^@");
+	}
+	if ((c = object_class("B2LMetalBinaryArchive", archive)) != Nil) {
+		class_addMethod(c, S("dealloc"), (IMP)heap_dealloc, "v@:");
+		class_addMethod(c, S("addRenderPipelineFunctionsWithDescriptor:error:"), (IMP)archive_add, "B@:@^@");
+		class_addMethod(c, S("addComputePipelineFunctionsWithDescriptor:error:"), (IMP)archive_add, "B@:@^@");
+		class_addMethod(c, S("addTileRenderPipelineFunctionsWithDescriptor:error:"), (IMP)archive_add, "B@:@^@");
+		class_addMethod(c, S("addFunctionWithDescriptor:library:error:"), (IMP)archive_add_function, "B@:@@^@");
+		class_addMethod(c, S("serializeToURL:error:"), (IMP)archive_serialize, "B@:@^@");
+		objc_registerClassPair(c);
+		gBinaryArchiveClass = c;
+		class_addMethod(device, S("newBinaryArchiveWithDescriptor:error:"), (IMP)device_new_binary_archive,
+		    "@@:@^@");
 	}
 	if ((c = object_class("B2LMetalCommandBuffer", cmdbuf)) != Nil) {
 		class_addMethod(c, S("dealloc"), (IMP)cmdbuf_dealloc, "v@:");
@@ -3026,6 +4127,12 @@ register_object_classes(Class device)
 		class_addMethod(c, S("blitCommandEncoderWithDescriptor:"), (IMP)cmdbuf_blit_encoder_descriptor, "@@:@");
 		class_addMethod(c, S("computeCommandEncoder"), (IMP)cmdbuf_compute_encoder, "@@:");
 		class_addMethod(c, S("computeCommandEncoderWithDispatchType:"), (IMP)cmdbuf_compute_encoder_type, "@@:Q");
+		class_addMethod(c, S("computeCommandEncoderWithDescriptor:"), (IMP)cmdbuf_blit_like_compute, "@@:@");
+		class_addMethod(c, S("encodeSignalEvent:value:"), (IMP)cmdbuf_encode_signal, "v@:@Q");
+		class_addMethod(c, S("encodeSignalEvent:value:agentMask:"), (IMP)cmdbuf_encode_signal_agents, "v@:@QQ");
+		class_addMethod(c, S("encodeWaitForEvent:value:"), (IMP)cmdbuf_encode_wait, "v@:@Q");
+		class_addMethod(c, S("useResidencySet:"), (IMP)object_nothing_id, "v@:@");
+		class_addMethod(c, S("useResidencySets:count:"), (IMP)object_ignore_pointer_count, "v@:r^@Q");
 		objc_registerClassPair(c);
 		gCommandBufferClass = c;
 	}
@@ -3088,7 +4195,6 @@ b2l_metal_load(void)
 	 * device class is registered */
 	register_object_classes(cls);
 	objc_registerClassPair(cls);
-	gDeviceClass = cls;
 	register_queue_class();
 	say("B2LMetalDevice registered on _MTLDevice (b2l_metal=%d), %u protocols", level, gProtocolCount);
 }

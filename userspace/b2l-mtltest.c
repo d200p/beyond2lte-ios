@@ -18,7 +18,11 @@
  *
  * M2b draws: a triangle onto the IOSurface (vertex buffer, setVertexBytes,
  * viewport orientation) and a textured quad onto the texture (vertex_id strip,
- * a 2 x 2 texture and a sampler), both read back pixel by pixel. One kernel
+ * a 2 x 2 texture and a sampler), both read back pixel by pixel; an indexed
+ * draw, culling, a scissor, blending; a compute kernel copying a texture
+ * (QuartzCore's read_write_surf_compute); a shared event signalled by a
+ * command buffer, a heap, a fence, a texture view; and last, Core Animation's
+ * own Metal renderer (CARenderer) drawing two layers into a texture. One kernel
  * log line per step ("B2L GPU UI: mtl M2: test: ..."), with ok or FAILED,
  * through a B2LMali client of its own that only logs.
  */
@@ -34,6 +38,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 #include "b2l_mali_uapi.h"
 
 void b2l_mtl_test_run(void) __attribute__((visibility("hidden")));
@@ -455,6 +460,364 @@ draw_quad(id device, id queue, id pipeline, id target)
 }
 
 
+
+/* ---- more draws, compute, events, heaps, views (M2b) ---- */
+
+typedef struct {
+	unsigned long x, y, width, height;
+} mtl_scissor_rect;
+
+enum shape {
+	SHAPE_NONE,             /* nothing drawn: the clear colour everywhere */
+	SHAPE_TRIANGLE,         /* the top left half, as in draw_triangle */
+	SHAPE_LEFT_HALF,        /* x < 32 */
+	SHAPE_ALL,
+};
+
+/* attachment_clear (zero) over the IOSurface cleared blue, one way or
+ * another; `shape` is what must come out zero. */
+static void
+solid_draw(id device, id queue, id pipeline, id target, IOSurfaceRef surface, const char *label, enum shape shape,
+    unsigned long cull, bool indexed, bool full, bool scissor)
+{
+	struct vertex {
+		float position[4], st[2];
+		uint16_t colour[4];
+	} vertices[6] = {
+		{ { -1, 1, 0, 1 }, { 0, 0 }, { 0, 0, 0, 0 } },
+		{ { 1, 1, 0, 1 }, { 1, 0 }, { 0, 0, 0, 0 } },
+		{ { -1, -1, 0, 1 }, { 0, 1 }, { 0, 0, 0, 0 } },
+		{ { 1, 1, 0, 1 }, { 1, 0 }, { 0, 0, 0, 0 } },
+		{ { 1, -1, 0, 1 }, { 1, 1 }, { 0, 0, 0, 0 } },
+		{ { -1, -1, 0, 1 }, { 0, 1 }, { 0, 0, 0, 0 } },
+	};
+	static const uint16_t indices[6] = { 0, 1, 2, 3, 4, 5 };
+	char why[200], probes[160] = "";
+	uint64_t ms = 0;
+	unsigned count = full ? 6 : 3;
+	id vb = MSG(id, const void *, unsigned long, unsigned long)(device, S("newBufferWithBytes:length:options:"),
+	    vertices, sizeof(vertices), 0);
+	id ib = MSG(id, const void *, unsigned long, unsigned long)(device, S("newBufferWithBytes:length:options:"),
+	    indices, sizeof(indices), 0);
+	id cb = MSG(id)(queue, S("commandBuffer"));
+	id e = begin_pass(cb, target, (clear_color){ 0.25, 0.5, 0.75, 1.0 });
+	MSG(void, id)(e, S("setRenderPipelineState:"), pipeline);
+	MSG(void, unsigned long)(e, S("setCullMode:"), cull);
+	if (scissor) {
+		mtl_scissor_rect r = { 0, 0, SIDE / 2, SIDE };
+		MSG(void, mtl_scissor_rect)(e, S("setScissorRect:"), r);
+	}
+	MSG(void, id, unsigned long, unsigned long)(e, S("setVertexBuffer:offset:atIndex:"), vb, 0, 0);
+	MSG(void, const void *, unsigned long, unsigned long)(e, S("setVertexBytes:length:atIndex:"), identity4,
+	    sizeof(identity4), 2);
+	if (indexed) {
+		MSG(void, unsigned long, unsigned long, unsigned long, id, unsigned long)(e,
+		    S("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:"), 3, count,
+		    0 /* MTLIndexTypeUInt16 */, ib, 0);
+	} else {
+		MSG(void, unsigned long, unsigned long, unsigned long)(e, S("drawPrimitives:vertexStart:vertexCount:"), 3, 0,
+		    count);
+	}
+	MSG(void)(e, S("endEncoding"));
+	unsigned long status = run(cb, why, sizeof(why), &ms);
+	static const uint8_t blue[4] = { 191, 128, 64, 255 }, zero[4] = { 0, 0, 0, 0 };
+	unsigned wrong = 0, checked = 0;
+	IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+	const uint8_t *rows = IOSurfaceGetBaseAddress(surface);
+	size_t row_bytes = IOSurfaceGetBytesPerRow(surface);
+	for (unsigned y = 0; y < SIDE; y++) {
+		for (unsigned x = 0; x < SIDE; x++) {
+			bool in;
+			switch (shape) {
+			case SHAPE_TRIANGLE:
+				if (x + y == SIDE - 1) {
+					continue;
+				}
+				in = x + y < SIDE - 1;
+				break;
+			case SHAPE_LEFT_HALF:
+				in = x < SIDE / 2;
+				break;
+			case SHAPE_ALL:
+				in = true;
+				break;
+			default:
+				in = false;
+				break;
+			}
+			wrong += !near(rows + y * row_bytes + x * 4, in ? zero : blue, 1);
+			checked++;
+		}
+	}
+	pixel_text(rows, row_bytes, 4, 4, probes, sizeof(probes));
+	pixel_text(rows, row_bytes, 59, 4, probes, sizeof(probes));
+	pixel_text(rows, row_bytes, 4, 59, probes, sizeof(probes));
+	pixel_text(rows, row_bytes, 59, 59, probes, sizeof(probes));
+	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+	verdict(label, vb != nil && ib != nil && status == 4 && wrong == 0,
+	    "status %lu, %u of %u pixels wrong, %llu ms;%s %s", status, wrong, checked, (unsigned long long)ms, probes,
+	    why);
+}
+
+/* attachment_clear with blending source alpha / one minus source alpha:
+ * its zero alpha leaves the target as it was. */
+static id
+blend_pipeline(id device, id library)
+{
+	id v = MSG(id, id)(library, S("newFunctionWithName:"), nsstr("std_vert0_lph"));
+	id f = MSG(id, id)(library, S("newFunctionWithName:"), nsstr("attachment_clear_frag_lph"));
+	id d = make("MTLRenderPipelineDescriptor");
+	MSG(void, id)(d, S("setVertexFunction:"), v);
+	MSG(void, id)(d, S("setFragmentFunction:"), f);
+	id c = at(MSG(id)(d, S("colorAttachments")), 0);
+	MSG(void, unsigned long)(c, S("setPixelFormat:"), 80);
+	MSG(void, bool)(c, S("setBlendingEnabled:"), true);
+	MSG(void, unsigned long)(c, S("setSourceRGBBlendFactor:"), 4);         /* SourceAlpha */
+	MSG(void, unsigned long)(c, S("setDestinationRGBBlendFactor:"), 5);    /* OneMinusSourceAlpha */
+	MSG(void, unsigned long)(c, S("setSourceAlphaBlendFactor:"), 4);
+	MSG(void, unsigned long)(c, S("setDestinationAlphaBlendFactor:"), 5);
+	id vd = MSG(id)(cls("MTLVertexDescriptor"), S("vertexDescriptor"));
+	id attributes = MSG(id)(vd, S("attributes"));
+	static const unsigned long slot[] = { 0, 1, 3 }, format[] = { 31, 29, 27 }, offset[] = { 0, 16, 24 };
+	for (unsigned i = 0; i < 3; i++) {
+		id a = at(attributes, slot[i]);
+		MSG(void, unsigned long)(a, S("setFormat:"), format[i]);
+		MSG(void, unsigned long)(a, S("setOffset:"), offset[i]);
+		MSG(void, unsigned long)(a, S("setBufferIndex:"), 0);
+	}
+	MSG(void, unsigned long)(at(MSG(id)(vd, S("layouts")), 0), S("setStride:"), 32);
+	MSG(void, id)(d, S("setVertexDescriptor:"), vd);
+	id error = nil;
+	char why[200];
+	id p = MSG(id, id, id *)(device, S("newRenderPipelineStateWithDescriptor:error:"), d, &error);
+	verdict("pipeline std_vert0 + attachment_clear, blending", p != nil, "%s %s", name_of(p),
+	    error_text(error, why, sizeof(why)));
+	return p;
+}
+
+static id
+texture_rgba(id device, unsigned long usage)
+{
+	id td = MSG(id, unsigned long, unsigned long, unsigned long, bool)(cls("MTLTextureDescriptor"),
+	    S("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), 70 /* RGBA8Unorm */, SIDE, SIDE, false);
+	MSG(void, unsigned long)(td, S("setUsage:"), usage);
+	return MSG(id, id)(device, S("newTextureWithDescriptor:"), td);
+}
+
+/* read_write_surf_compute (QuartzCore): each thread copies the pixel at its
+ * grid position from texture(0) to texture(1), bounds checked. */
+static void
+compute_copy(id device, id queue, id library)
+{
+	char why[200], probes[120] = "";
+	uint64_t ms = 0;
+	id f = MSG(id, id)(library, S("newFunctionWithName:"), nsstr("read_write_surf_compute"));
+	id error = nil;
+	uint64_t t0 = now_ms();
+	id p = f != nil ? MSG(id, id, id *)(device, S("newComputePipelineStateWithFunction:error:"), f, &error) : nil;
+	unsigned long max_threads = p != nil ? MSG(unsigned long)(p, S("maxTotalThreadsPerThreadgroup")) : 0;
+	verdict("compute pipeline read_write_surf_compute", p != nil, "%s in %llu ms, %lu threads at most %s",
+	    name_of(p), (unsigned long long)(now_ms() - t0), max_threads, error_text(error, why, sizeof(why)));
+	if (p == nil) {
+		return;
+	}
+	id source = texture_rgba(device, 1);           /* ShaderRead */
+	id dest = texture_rgba(device, 1 | 2);         /* ShaderRead | ShaderWrite */
+	static uint8_t pixels[ROW * SIDE], back[ROW * SIDE];
+	for (unsigned i = 0; i < sizeof(pixels); i++) {
+		pixels[i] = (uint8_t)(i * 29 + 7);
+	}
+	region_t whole = { { 0, 0, 0 }, { SIDE, SIDE, 1 } };
+	if (source != nil) {
+		MSG(void, region_t, unsigned long, const void *, unsigned long)(source,
+		    S("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"), whole, 0, pixels, ROW);
+	}
+	id cb = MSG(id)(queue, S("commandBuffer"));
+	id e = MSG(id)(cb, S("computeCommandEncoder"));
+	MSG(void, id)(e, S("setComputePipelineState:"), p);
+	MSG(void, id, unsigned long)(e, S("setTexture:atIndex:"), source, 0);
+	MSG(void, id, unsigned long)(e, S("setTexture:atIndex:"), dest, 1);
+	extent_t groups = { SIDE / 8, SIDE / 8, 1 }, threads = { 8, 8, 1 };
+	MSG(void, extent_t, extent_t)(e, S("dispatchThreadgroups:threadsPerThreadgroup:"), groups, threads);
+	MSG(void)(e, S("endEncoding"));
+	unsigned long status = run(cb, why, sizeof(why), &ms);
+	memset(back, 0, sizeof(back));
+	if (dest != nil) {
+		MSG(void, void *, unsigned long, region_t, unsigned long)(dest, S("getBytes:bytesPerRow:fromRegion:mipmapLevel:"),
+		    back, ROW, whole, 0);
+	}
+	unsigned wrong = 0;
+	for (unsigned i = 0; i < SIDE * SIDE; i++) {
+		wrong += memcmp(back + i * 4, pixels + i * 4, 4) != 0;
+	}
+	pixel_text(back, ROW, 0, 0, probes, sizeof(probes));
+	pixel_text(back, ROW, 63, 63, probes, sizeof(probes));
+	verdict("compute: read_write_surf_compute copies a 64x64 texture", source != nil && dest != nil && status == 4 &&
+	    wrong == 0, "status %lu, %u of %u pixels wrong, %llu ms;%s %s", status, wrong, (unsigned)(SIDE * SIDE),
+	    (unsigned long long)ms, probes, why);
+}
+
+static volatile int listener_called;
+
+static void
+listener_block_body(id event, uint64_t value)
+{
+	(void)event;
+	listener_called = (int)value;
+}
+
+/* A shared event signalled by a command buffer, a listener, a heap. */
+static void
+events_and_heap(id device, id queue)
+{
+	char why[200];
+	uint64_t ms = 0;
+	id ev = MSG(id)(device, S("newSharedEvent"));
+	id listener = make("MTLSharedEventListener");
+	listener_called = 0;
+	if (ev != nil && listener != nil) {
+		MSG(void, id, uint64_t, void (^)(id, uint64_t))(ev, S("notifyListener:atValue:block:"), listener, 5,
+		    ^(id event, uint64_t value) {
+			    listener_block_body(event, value);
+		    });
+	}
+	id cb = MSG(id)(queue, S("commandBuffer"));
+	MSG(void, id, uint64_t)(cb, S("encodeSignalEvent:value:"), ev, 5);
+	unsigned long status = run(cb, why, sizeof(why), &ms);
+	for (unsigned i = 0; i < 200 && listener_called == 0; i++) {
+		usleep(5000);
+	}
+	uint64_t value = ev != nil ? MSG(uint64_t)(ev, S("signaledValue")) : 0;
+	verdict("shared event signalled by a command buffer, with a listener", ev != nil && status == 4 && value == 5 &&
+	    listener_called == 5, "%s value %llu, listener %d", name_of(ev), (unsigned long long)value, listener_called);
+
+	id hd = make("MTLHeapDescriptor");
+	MSG(void, unsigned long)(hd, S("setSize:"), 1u << 20);
+	id heap = MSG(id, id)(device, S("newHeapWithDescriptor:"), hd);
+	id hb = heap != nil ? MSG(id, unsigned long, unsigned long)(heap, S("newBufferWithLength:options:"), 4096, 0) : nil;
+	void *contents = hb != nil ? MSG(void *)(hb, S("contents")) : NULL;
+	unsigned long used = heap != nil ? MSG(unsigned long)(heap, S("usedSize")) : 0;
+	verdict("heap and a buffer from it", heap != nil && contents != NULL && used >= 4096, "%s, %s, used %lu",
+	    name_of(heap), name_of(hb), used);
+	id fence = MSG(id)(device, S("newFence"));
+	verdict("fence", fence != nil, "%s", name_of(fence));
+}
+
+/* A BGRA8 texture's sRGB view rendered to: its parent reads red. */
+static void
+texture_view_test(id queue, id texture)
+{
+	char why[200], probes[80] = "";
+	uint64_t ms = 0;
+	id view = MSG(id, unsigned long)(texture, S("newTextureViewWithPixelFormat:"), 81 /* BGRA8Unorm_sRGB */);
+	if (view == nil) {
+		verdict("texture view (sRGB) rendered to", false, "no view");
+		return;
+	}
+	id cb = MSG(id)(queue, S("commandBuffer"));
+	clear_pass(cb, view, (clear_color){ 1.0, 0.0, 0.0, 1.0 });
+	unsigned long status = run(cb, why, sizeof(why), &ms);
+	static uint8_t back[ROW * SIDE];
+	region_t whole = { { 0, 0, 0 }, { SIDE, SIDE, 1 } };
+	MSG(void, void *, unsigned long, region_t, unsigned long)(texture, S("getBytes:bytesPerRow:fromRegion:mipmapLevel:"),
+	    back, ROW, whole, 0);
+	static const uint8_t red[4] = { 0, 0, 255, 255 };
+	uint32_t first = 0;
+	unsigned wrong = wrong_pixels(back, ROW, red, &first);
+	pixel_text(back, ROW, 10, 10, probes, sizeof(probes));
+	verdict("texture view (sRGB) cleared, read through its parent", status == 4 && wrong == 0,
+	    "%s, status %lu, %u pixels wrong;%s %s", name_of(MSG(id)(view, S("parentTexture"))), status, wrong, probes,
+	    why);
+}
+
+typedef struct {
+	double x, y, width, height;
+} cg_rect;
+
+typedef struct {
+	double x, y;
+} cg_point;
+
+/*
+ * Core Animation's own Metal renderer, in this process only: CARenderer
+ * draws a layer tree -- a red layer whose right half is covered by a green
+ * one -- into a texture of this device. What it asks of the driver and does
+ * not get is logged by B2LMetal.bundle; this checks the two halves' colours.
+ * Last of the tests: the step it fails in is logged before it is taken.
+ */
+static void
+carenderer_test(id device, id queue)
+{
+	void *qc = dlopen("/System/Library/Frameworks/QuartzCore.framework/QuartzCore", RTLD_NOW | RTLD_GLOBAL);
+	double (*media_time)(void) = qc != NULL ? (double (*)(void))dlsym(qc, "CACurrentMediaTime") : NULL;
+	const void **queue_key = qc != NULL ? (const void **)dlsym(qc, "kCARendererMetalCommandQueue") : NULL;
+	const void *(*srgb)(double, double, double, double) =
+	    (const void *(*)(double, double, double, double))dlsym(RTLD_DEFAULT, "CGColorCreateSRGB");
+	if (media_time == NULL || srgb == NULL || cls("CARenderer") == nil) {
+		verdict("CARenderer", false, "QuartzCore or CoreGraphics not found");
+		return;
+	}
+	id texture = MSG(id, unsigned long, unsigned long, unsigned long, bool)(cls("MTLTextureDescriptor"),
+	    S("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), 80, SIDE, SIDE, false);
+	MSG(void, unsigned long)(texture, S("setUsage:"), 1 | 4);
+	id target = MSG(id, id)(device, S("newTextureWithDescriptor:"), texture);
+	if (target == nil) {
+		verdict("CARenderer", false, "no target texture");
+		return;
+	}
+	say("CARenderer: making the layers");
+	id transaction = cls("CATransaction");
+	MSG(void)(transaction, S("begin"));
+	MSG(void, bool)(transaction, S("setDisableActions:"), true);
+	cg_rect bounds = { 0, 0, SIDE, SIDE };
+	id root = MSG(id)(cls("CALayer"), S("layer"));
+	MSG(void, cg_rect)(root, S("setBounds:"), bounds);
+	MSG(void, cg_point)(root, S("setPosition:"), (cg_point){ SIDE / 2, SIDE / 2 });
+	MSG(void, const void *)(root, S("setBackgroundColor:"), srgb(1, 0, 0, 1));
+	id half = MSG(id)(cls("CALayer"), S("layer"));
+	MSG(void, cg_rect)(half, S("setFrame:"), (cg_rect){ SIDE / 2, 0, SIDE / 2, SIDE });
+	MSG(void, const void *)(half, S("setBackgroundColor:"), srgb(0, 1, 0, 1));
+	MSG(void, id)(root, S("addSublayer:"), half);
+	MSG(void)(transaction, S("commit"));
+	id options = nil;
+	if (queue_key != NULL && *queue_key != NULL) {
+		const void *values[1] = { queue };
+		options = (id)CFDictionaryCreate(NULL, queue_key, values, 1, &kCFTypeDictionaryKeyCallBacks,
+		    &kCFTypeDictionaryValueCallBacks);
+	}
+	say("CARenderer: rendererWithMTLTexture:options: (%s queue)", options != nil ? "our" : "its own");
+	uint64_t t0 = now_ms();
+	id renderer = MSG(id, id, id)(cls("CARenderer"), S("rendererWithMTLTexture:options:"), target, options);
+	say("CARenderer: %s in %llu ms", name_of(renderer), (unsigned long long)(now_ms() - t0));
+	if (renderer == nil) {
+		verdict("CARenderer", false, "rendererWithMTLTexture gave nil");
+		return;
+	}
+	MSG(void, id)(renderer, S("setLayer:"), root);
+	MSG(void, cg_rect)(renderer, S("setBounds:"), bounds);
+	say("CARenderer: beginFrame, render, endFrame");
+	t0 = now_ms();
+	MSG(void, double, void *)(renderer, S("beginFrameAtTime:timeStamp:"), media_time(), NULL);
+	MSG(void, cg_rect)(renderer, S("addUpdateRect:"), bounds);
+	MSG(void)(renderer, S("render"));
+	MSG(void)(renderer, S("endFrame"));
+	uint64_t render_ms = now_ms() - t0;
+	usleep(200000);                 /* a command buffer it committed and did not wait for */
+	static uint8_t back[ROW * SIDE];
+	region_t whole = { { 0, 0, 0 }, { SIDE, SIDE, 1 } };
+	MSG(void, void *, unsigned long, region_t, unsigned long)(target, S("getBytes:bytesPerRow:fromRegion:mipmapLevel:"),
+	    back, ROW, whole, 0);
+	char probes[160] = "";
+	pixel_text(back, ROW, 16, 32, probes, sizeof(probes));
+	pixel_text(back, ROW, 48, 32, probes, sizeof(probes));
+	pixel_text(back, ROW, 2, 2, probes, sizeof(probes));
+	pixel_text(back, ROW, 61, 61, probes, sizeof(probes));
+	const uint8_t *l = back + 32 * ROW + 16 * 4, *r = back + 32 * ROW + 48 * 4;
+	bool red_left = l[2] > 200 && l[1] < 60, green_right = r[1] > 200 && r[2] < 60;
+	verdict("CARenderer (Core Animation's Metal renderer) draws two layers", red_left && green_right,
+	    "render %llu ms;%s", (unsigned long long)render_ms, probes);
+}
+
 void
 b2l_mtl_test_run(void)
 {
@@ -602,6 +965,30 @@ b2l_mtl_test_run(void)
 		if (image != nil && t != nil) {
 			draw_quad(device, queue, image, t);
 		}
+		if (solid != nil && ts != nil) {
+			solid_draw(device, queue, solid, ts, surface, "draw: indexed triangle", SHAPE_TRIANGLE, 0, true, false,
+			    false);
+			solid_draw(device, queue, solid, ts, surface, "draw: two triangles cover the target", SHAPE_ALL, 0, false,
+			    true, false);
+			solid_draw(device, queue, solid, ts, surface, "draw: culling back faces keeps the clockwise triangle",
+			    SHAPE_TRIANGLE, 2 /* MTLCullModeBack */, false, false, false);
+			solid_draw(device, queue, solid, ts, surface, "draw: culling front faces drops it", SHAPE_NONE,
+			    1 /* MTLCullModeFront */, false, false, false);
+			solid_draw(device, queue, solid, ts, surface, "draw: scissor to the left half", SHAPE_LEFT_HALF, 0, false,
+			    true, true);
+			id blended = blend_pipeline(device, library);
+			if (blended != nil) {
+				solid_draw(device, queue, blended, ts, surface, "draw: blending a zero alpha keeps the target",
+				    SHAPE_NONE, 0, false, true, false);
+			}
+		}
+		compute_copy(device, queue, library);
 	}
+	events_and_heap(device, queue);
+	if (t != nil) {
+		texture_view_test(queue, t);
+	}
+	/* last: Core Animation's own Metal renderer */
+	carenderer_test(device, queue);
 	say("done: %u passed, %u failed", passed, failed);
 }

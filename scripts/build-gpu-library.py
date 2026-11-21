@@ -36,7 +36,7 @@ def main():
     subprocess.run(['xcrun', '--sdk', 'iphoneos', 'clang', '-target', 'arm64e-apple-ios26.0', '-isysroot', sdk,
                     *defines,
                     '-O2', '-Wall', '-Wextra', '-Werror', '-dynamiclib', '-fno-ptrauth-returns',
-                    '-fno-ptrauth-calls', '-fno-ptrauth-intrinsics',
+                    '-fno-ptrauth-calls', '-fno-ptrauth-intrinsics', '-fblocks',
                     '-I', str(ROOT / 'xnu-overlay/iokit/Kernel/arm'),
                     '-framework', 'CoreFoundation', '-framework', 'IOKit',
                     # S10 port: Metal M2a's test (userspace/b2l-mtltest.c) is a Metal client

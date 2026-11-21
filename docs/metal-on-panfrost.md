@@ -337,7 +337,7 @@ samplers bound per stage, viewport and scissor, rasterizer state, depth-
 stencil, blend colour, draw and indexed draw), checked by a triangle drawn
 with std_vert0 into an IOSurface and read back.
 
-## M2b as written (build 68)
+## M2b as written (build 67 + 1)
 
 - `b2l_mtl.h`: table version 2, the render encoder: pipeline, buffers (and
   offsets), bytes, textures and samplers per stage, viewport, scissor, cull,
@@ -375,6 +375,39 @@ with std_vert0 into an IOSurface and read back.
     `[[vertex_id]]`, the rectangle in buffer 1), a 2 x 2 texture at
     texture(3) with a nearest sampler: the left half of the target shows the
     four texels in quarters, the right half the clear colour.
+
+### Added to the same build (so that one boot answers more)
+
+- Compute: `compute_pipeline_new` (Panfrost's `create_compute_state`, which
+  compiles there and then; the kernel's resources as for a render stage, the
+  textures it writes as storage images), compute encoders (`dispatchThreadgroups`
+  and `dispatchThreads` rounded up to whole threadgroups, threadgroup memory
+  as Panfrost's variable shared memory, a barrier after each dispatch).
+- Storage images in every stage (`set_shader_images`) for textures a shader
+  writes.
+- Texture views (`newTextureViewWithPixelFormat:` and the ranged forms): the
+  parent's resource from a level and layer offset, another format of the same
+  size per pixel; sampled, rendered to, copied, read back.
+- What Core Animation's Metal renderer creates besides: events and shared
+  events (signalled when a command buffer has run, listeners called on their
+  queue, `waitUntilSignaledValue:timeoutMS:`), fences, heaps (each resource an
+  allocation of its own, counted against the heap), residency sets (no-ops),
+  an empty binary archive that accepts additions, the asynchronous pipeline
+  creations, `newTextureWithBytesNoCopy:` (copied, as buffers are).
+- The test child's further steps: an indexed draw; culling back faces keeps
+  the clockwise triangle, culling front faces drops it (the winding mapping);
+  a scissor; blending (a zero source alpha keeps the target); two triangles
+  covering the target; `read_write_surf_compute` copying a 64 x 64 RGBA8
+  texture; a shared event signalled by a command buffer with a listener; a
+  heap and a buffer from it; a fence; an sRGB view cleared and read through
+  its parent; and last, Core Animation's own Metal renderer: `CARenderer
+  rendererWithMTLTexture:` drawing a red layer half covered by a green one
+  into a texture of this device, in the test process only. The child may run
+  180 s; each step is logged before the risky ones.
+- Checked before the build: `userspace/b2l-metal.c` and `b2l-mtltest.c` pass
+  clang 23 `-fsyntax-only -Wall -Wextra -Werror` against stand-ins for the
+  SDK headers (two errors found and fixed); `b2l_mtl.c`'s Gallium calls and
+  structures were read against Mesa 25.0.7's own headers.
 
 QuartzCore's own selector references have no `drawPrimitives` or
 `setVertexBytes`: Core Animation's draws reach the encoder another way, which
