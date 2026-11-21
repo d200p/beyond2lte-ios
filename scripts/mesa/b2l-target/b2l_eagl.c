@@ -25,6 +25,7 @@
  * and every surface import are logged ("B2L GPU UI: eagl: ...").
  */
 #include <dlfcn.h>
+#include <mach/mach.h>
 #include <mach/mach_time.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -45,6 +46,8 @@
 #include "util/u_inlines.h"
 #include "glapi/glapi.h"
 #include "main/dispatch.h"
+#include "main/glformats.h"
+#include "main/image.h"
 #include "drm-uapi/drm_fourcc.h"
 #include <IOSurface/IOSurfaceRef.h>
 #include <objc/runtime.h>
@@ -1023,6 +1026,73 @@ gli_get_string(void *c, uint32_t name)
 	}
 }
 
+/*
+ * S10 port (boot 65): backboardd died in memcpy under _mesa_TexImage2D reading
+ * the pixels Core Animation handed over, from pages no longer mapped (opening
+ * Weather). Before an upload from the process's memory every page of the
+ * bytes Mesa will read -- the unpack state's own rows, as Mesa computes them
+ * -- is asked of the kernel (vm_region_64); an unmapped or unreadable one
+ * makes the upload of nothing: the texture keeps undefined contents instead
+ * of the process ending. The same check UniXNU's AdrenoMetal makes before it
+ * copies a client's buffer (its patch 0064, "copies leave unreachable pages
+ * alone"). Pages unmapped between the check and the copy still fault.
+ */
+static unsigned unreadable_uploads;
+
+static bool
+client_pixels_readable(const void *pixels, int32_t width, int32_t height, uint32_t format, uint32_t type)
+{
+	if (pixels == NULL || width <= 0 || height <= 0) {
+		return true;
+	}
+	struct gl_context *ctx = (struct gl_context *)_mesa_glapi_get_context();
+	if (ctx == NULL || ctx->Unpack.BufferObj != NULL) {
+		return true;    /* from a buffer object: an offset, not memory of the process */
+	}
+	GLint bpp = _mesa_bytes_per_pixel(format, type);
+	if (bpp <= 0) {
+		return true;    /* Mesa refuses the format itself */
+	}
+	const GLubyte *last = _mesa_image_address2d(&ctx->Unpack, pixels, width, height, format, type, height - 1,
+	    width - 1);
+	vm_address_t addr = (vm_address_t)(uintptr_t)pixels;
+	vm_address_t end = last != NULL ? (vm_address_t)(uintptr_t)last + (vm_address_t)bpp : 0;
+	if (end <= addr) {
+		return true;    /* an unpack state this does not follow: left to Mesa */
+	}
+	while (addr < end) {
+		vm_address_t region = addr;
+		vm_size_t size = 0;
+		vm_region_basic_info_data_64_t info;
+		mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+		mach_port_t object = MACH_PORT_NULL;
+		if (vm_region_64(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &count,
+		    &object) != KERN_SUCCESS) {
+			return false;
+		}
+		if (object != MACH_PORT_NULL) {
+			mach_port_deallocate(mach_task_self(), object);
+		}
+		if (region > addr || (info.protection & VM_PROT_READ) == 0) {
+			return false;
+		}
+		addr = region + size;
+	}
+	return true;
+}
+
+static bool
+upload_allowed(const char *what, const void *pixels, int32_t width, int32_t height, uint32_t format, uint32_t type)
+{
+	if (client_pixels_readable(pixels, width, height, format, type)) {
+		return true;
+	}
+	if (__atomic_fetch_add(&unreadable_uploads, 1, __ATOMIC_RELAXED) < 16) {
+		b2l_drm_note("eagl: %s %dx%d from %p: pages not readable, uploaded nothing", what, width, height, pixels);
+	}
+	return false;
+}
+
 /* Apple's BGRA upload: internal format GL_RGBA with format GL_BGRA, which ES
  * (EXT_texture_format_BGRA8888) spells internal format GL_BGRA. */
 static void
@@ -1031,6 +1101,9 @@ gli_tex_image2D(void *c, uint32_t target, int32_t level, uint32_t internal, int3
 {
 	if (!begin(c, (unsigned)idx_tex_image2D, target)) {
 		return;
+	}
+	if (!upload_allowed("texImage2D", pixels, width, height, format, type)) {
+		pixels = NULL;   /* storage without contents, not a read of unmapped pages */
 	}
 	if (format == E_BGRA && (internal == E_RGBA || internal == E_RGBA8)) {
 		internal = E_BGRA;
@@ -1057,6 +1130,10 @@ gli_tex_sub_image2D(void *c, uint32_t target, int32_t level, int32_t x, int32_t 
 	}
 	if (type == E_HALF_FLOAT_OES) {
 		type = E_HALF_FLOAT;
+	}
+	if (!upload_allowed("texSubImage2D", pixels, width, height, format, type)) {
+		b2l_gli_leave((unsigned)idx_tex_sub_image2D);
+		return;
 	}
 	CALL_TexSubImage2D(GET_DISPATCH(), (target, level, x, y, width, height, format, type, pixels));
 	b2l_gli_leave((unsigned)idx_tex_sub_image2D);
