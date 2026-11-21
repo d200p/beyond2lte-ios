@@ -38,3 +38,9 @@ made in a commit of its own so the difference from upstream stays readable:
   whose every store is in the first block of an `air.static_init` function,
   through constant getelementptrs and casts only, and whose address escapes
   nowhere, now answers loads of bytes those stores wrote as constants.
+- `air_to_nir.c`, `nir_air.h`: `air_module_function_constant_decls`, each
+  function constant's index with its name and type name, read from the same
+  `!air.function_constants` nodes as `air_module_function_constants`. Core
+  Animation gives 46 of its constants by name (`setConstantValue:type:withName:`)
+  and the Metal runtime (`scripts/mesa/b2l-target/b2l_mtl.c`, milestone M2)
+  matches those names to indices with it.

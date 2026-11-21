@@ -1367,6 +1367,49 @@ air_module_function_constants(void *mem_ctx, const void *bitcode, size_t size,
    return num;
 }
 
+/* S10 port: each function constant's index, name and type as the module
+ * declares them (an !air.function_constants node is the global, its type
+ * name, its name, its index and whether it is required), in the order of
+ * air_module_function_constants. Core Animation gives its constants by name
+ * (setConstantValue:type:withName:), and a runtime matches those names here. */
+unsigned
+air_module_function_constant_decls(void *mem_ctx, const void *bitcode, size_t size,
+                                   struct air_constant_decl **out)
+{
+   void *ctx = ralloc_context(mem_ctx);
+   const char *err;
+   struct air_module *m = air_module_read(ctx, bitcode, size, &err);
+   *out = NULL;
+   if (!m) {
+      ralloc_free(ctx);
+      return 0;
+   }
+   const struct air_named_md *n = named_md(m, "air.function_constants");
+   unsigned num = 0;
+   if (n && n->num_ops) {
+      *out = rzalloc_array(mem_ctx, struct air_constant_decl, n->num_ops);
+      for (unsigned i = 0; i < n->num_ops; i++) {
+         const struct air_md *node = n->ops[i];
+         for (unsigned k = 1; k < (node ? node->num_ops : 0); k++) {
+            uint64_t idx;
+            if (md_int(node, k, &idx)) {
+               struct air_constant_decl *d = &(*out)[num++];
+               const char *name = md_str(node, k - 1);
+               const char *type_name = k >= 2 ? md_str(node, k - 2) : NULL;
+               uint64_t required = 0;
+               d->index = idx;
+               d->name = name ? ralloc_strdup(mem_ctx, name) : NULL;
+               d->type_name = type_name ? ralloc_strdup(mem_ctx, type_name) : NULL;
+               d->required = md_int(node, k + 1, &required) && required != 0;
+               break;
+            }
+         }
+      }
+   }
+   ralloc_free(ctx);
+   return num;
+}
+
 /* -- the interface ------------------------------------------------------ */
 
 /* AIR's names for what NIR calls system values */

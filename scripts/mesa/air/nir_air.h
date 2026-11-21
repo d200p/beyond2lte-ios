@@ -587,6 +587,20 @@ nir_shader *air_to_nir(void *mem_ctx, const void *bitcode, size_t size,
 unsigned air_module_function_constants(void *mem_ctx, const void *bitcode, size_t size,
                                        struct air_constant_value **out);
 
+/* S10 port: the same constants with their names and type names (`uchar`,
+ * `bool`, ...), for a runtime given constants by name, as Metal's
+ * setConstantValue:type:withName: gives them. Strings are allocated on
+ * mem_ctx; a name the module does not carry is NULL. */
+struct air_constant_decl {
+   unsigned index;
+   const char *name;
+   const char *type_name;
+   bool required;
+};
+
+unsigned air_module_function_constant_decls(void *mem_ctx, const void *bitcode, size_t size,
+                                            struct air_constant_decl **out);
+
 /* What the module is, without translating it: the stage from its metadata
  * (MESA_SHADER_NONE for visible functions, -1 when unknown) and the air.*
  * functions it calls, NUL-separated in *calls.
