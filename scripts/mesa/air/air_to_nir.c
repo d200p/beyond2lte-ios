@@ -1613,8 +1613,16 @@ add_varying(struct air_ctx *c, const char *name, unsigned slot, unsigned comps,
    struct air_shader_info *info = c->info;
    info->varyings = reralloc(c->mem_ctx, info->varyings, struct air_varying,
                              info->num_varyings + 1);
+   /* S10 port: the string after air.vertex_output / air.fragment_input, which
+    * is what Metal links a vertex output and a fragment input by (a vertex
+    * output's name here already is that string; a fragment input's is its
+    * air.arg_name). */
+   int link_key = md_key(node, "air.fragment_input");
+   if (link_key < 0)
+      link_key = md_key(node, "air.vertex_output");
+   const char *link = link_key >= 0 ? md_str(node, link_key + 1) : NULL;
    info->varyings[info->num_varyings++] = (struct air_varying) {
-      .name = name, .slot = slot, .components = comps,
+      .name = name, .link = link ? link : name, .slot = slot, .components = comps,
       .flat = md_key(node, "air.flat") >= 0,
       .centroid = md_key(node, "air.centroid") >= 0,
       .sample = md_key(node, "air.sample") >= 0,
@@ -6710,8 +6718,10 @@ keep_info(void *mem_ctx, struct air_shader_info *info)
    if (info->num_varyings) {
       info->varyings = ralloc_memdup(mem_ctx, info->varyings,
                                      info->num_varyings * sizeof(*info->varyings));
-      for (unsigned i = 0; i < info->num_varyings; i++)
+      for (unsigned i = 0; i < info->num_varyings; i++) {
          info->varyings[i].name = ralloc_strdup(mem_ctx, info->varyings[i].name);
+         info->varyings[i].link = ralloc_strdup(mem_ctx, info->varyings[i].link);  /* S10 port */
+      }
    }
    if (info->num_vertex_attributes) {
       info->vertex_attributes =

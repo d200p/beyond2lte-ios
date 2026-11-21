@@ -248,6 +248,10 @@ struct air_resource {
 
 struct air_varying {
    const char *name;  /* the AIR name that links vertex to fragment */
+   /* S10 port: the string Metal links by on both stages, the one after
+    * air.vertex_output / air.fragment_input ("generated(5colorDv4_Dh)"); for
+    * a fragment input `name` is its air.arg_name, which is not that. */
+   const char *link;
    unsigned slot;     /* gl_varying_slot assigned by the translator */
    unsigned components;
    bool flat, centroid, sample, no_perspective;

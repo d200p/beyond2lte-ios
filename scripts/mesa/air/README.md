@@ -44,3 +44,8 @@ made in a commit of its own so the difference from upstream stays readable:
   Animation gives 46 of its constants by name (`setConstantValue:type:withName:`)
   and the Metal runtime (`scripts/mesa/b2l-target/b2l_mtl.c`, milestone M2)
   matches those names to indices with it.
+- `air_to_nir.c`, `nir_air.h`: `air_varying.link`, the string a varying is
+  linked by on both stages (after `air.vertex_output` / `air.fragment_input`,
+  `generated(5colorDv4_Dh)`); `name` stays as it was, which for a fragment
+  input is its `air.arg_name` and does not match the vertex output's. The Metal
+  runtime links a pipeline's fragment inputs to its vertex outputs with it.
