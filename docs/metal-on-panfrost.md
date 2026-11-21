@@ -305,3 +305,34 @@ passes that only clear; M2b the draws.
 Risk: the test's jobs share the GPU address space with backboardd's OpenGL ES
 work; a job that faults stops it until the GPU is reset, which would freeze
 the interface until a reboot.
+
+## M2a result (boot 68, build 67)
+
+All 14 steps passed (log `logs/2026-11-21-userspace-boot68-build67`). The test
+child ran at about 86 s, took 2 s and exited 0; the kernel freed its 16 buffer
+objects with its client.
+
+- `MTLCreateSystemDefaultDevice` gave `B2LMetalDevice` in 451 ms, opening
+  libb2l-mesa and its Panfrost context included (25 ms); the only message
+  without a method was again `-featureProfile`. `supportsMemorylessRenderTargets`
+  is now NO.
+- Buffers zeroed and from bytes; a blit copy and fill, 0 bytes wrong (0.9 ms).
+- A 64 x 64 BGRA8 texture written and read back unchanged; an IOSurface (id
+  19) imported as a texture.
+- Render passes clearing the IOSurface and the texture: 0 of 4096 pixels wrong
+  in each, read back through the IOSurface's own lock (1.1 ms for both, two
+  fragment jobs); `copyFromTexture:toTexture:` 0 pixels wrong.
+- A sampler; QuartzCore's library, 189 functions, in 2 ms.
+- std_vert0_lph + attachment_clear_frag_lph: AIR 7 ms, Panfrost 3 ms.
+- fixed_vert_lph_spc + fixed_frag_lph_cph with `fc_texture_function` = 0 given
+  by name: AIR 316 ms (utility QoS), Panfrost 15 ms; the fragment shader is
+  278 NIR instructions, the size boot 66 measured for that constant, so the
+  constant given by name was applied; 10 fragment inputs linked to vertex
+  outputs, none unmatched.
+- No GPU fault, no crash before the shutdown to TWRP; the interface stayed on
+  OpenGL ES throughout.
+
+Next, M2b: draws (vertex buffers and bytes, constant buffers, textures and
+samplers bound per stage, viewport and scissor, rasterizer state, depth-
+stencil, blend colour, draw and indexed draw), checked by a triangle drawn
+with std_vert0 into an IOSurface and read back.
