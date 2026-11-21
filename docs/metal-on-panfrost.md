@@ -181,3 +181,60 @@ Vulkan route measured half the speed on the Adreno.
 - hakios-metal `plugin/HakiosMetal.m`: MIT; read as reference.
 - HakiOS `userland/src/HakiosMetalCA.m`: origin unverified there; not copied.
 - Apple's `default.metallib` and the AIR disassembly stay off the repository.
+
+## M0.2 result (boot 66, build 65)
+
+Field folding works. fixed_frag_lph_cph and _cpf, background QoS (little
+cores), texture function supplied and nothing else:
+
+| texture function | NIR after the frontend | after clean-up | Bifrost | code |
+|---|---|---|---|---|
+| 0 clr | 677 | 278 | 34 ms | 1392 B |
+| 1 img | 665 | 268 | 21 ms | 1216 B |
+| 52 vcm | 963 | 349 | 36 ms | 1216 B |
+| 59 dff | 748 | 298 | 24 ms | 1216 B |
+| 66 kfh | 956 | 398 | 39 ms | 1216 B |
+| 70 ghn | 664 | 268 | 22 ms | 1264 B |
+| generic | 72 657 | 24 910 | 176 555 ms | 273 392 B |
+
+The frontend takes 0.9 to 1.9 s per variant (the whole module is read and
+translated each time); Bifrost tens of milliseconds. Every variant still has
+148 bytes of thread storage: the constructor's stores into the folded struct
+stay, and nothing removes stores to scratch nobody loads. No crash in the
+boot; spindump stayed quiet.
+
+What it decides for M2: compile the specialised variant a pipeline asks for,
+on demand, and keep a cache on disk; the generic shader is not worth its
+three minutes. To do later: read each module once per library, not once per
+variant; drop dead scratch stores.
+
+## M1 as written (build 66)
+
+- `xnu-overlay/iokit/Kernel/arm/B2LMali.cpp`: a class `IOAcceleratorES` and,
+  with boot argument `b2l_metal=N` (N >= 1), one such nub under B2LMali once
+  its self-test passed, with `MetalPluginName` = `B2LMetal-<hash>` and
+  `MetalPluginClassName` = `B2LMetalDevice` ("B2L METAL:" in the kernel log).
+- `xnu-overlay/bsd/kern/b2l_userspace_seed.h`: the bundle published with the
+  GPU library, `/System/Library/Extensions/B2LMetal-<hash>.bundle/{Info.plist,
+  B2LMetal}`, the hash over both so a new build is a new bundle.
+- `scripts/build-gpu-library.py`: builds `userspace/b2l-metal.c` (a dylib,
+  ad-hoc signed) and its Info.plist into the kernel's payload header.
+- `userspace/b2l-metal.c`: the plug-in. A `_MTLDevice` subclass made at run
+  time with `MTLDevice` and `MTLDeviceSPI` declared, `-initWithAcceleratorPort:`,
+  `-name`, `-registryID`, `-maxBufferLength`, `-newCommandQueue` (a
+  `_MTLCommandQueue` subclass with the `MTLCommandQueue*` protocols); every
+  other message answered with a zero of the protocol's return type and logged
+  once ("mtl M1:"). The approach is HakiOS's (hakios-metal plugin, MIT).
+  Level 1 shows the device only to a process with `B2L_MTL_TEST` set; level 2
+  (M3) to everyone.
+- `userspace/b2l-gpu.c`: 60 s after backboardd starts, once per boot, another
+  backboardd with `B2L_MTL_TEST=1`, whose constructor calls
+  `MTLCreateSystemDefaultDevice()`, logs the device, its name, a command queue
+  and a few capability answers, and exits.
+- `uefi/XnuLoader/XnuLoader.c`: `b2l_metal=1`; the M0 sweep off.
+
+Also in this build, for the OpenGL ES path: `gli_tex_image2D` and
+`gli_tex_sub_image2D` (b2l_eagl.c) check with `vm_region_64` that every page
+the upload reads is mapped and readable, and upload nothing otherwise -- boot
+65's backboardd crash (memcpy under `_mesa_TexImage2D`), the check UniXNU's
+AdrenoMetal added on 18 November for client buffers.

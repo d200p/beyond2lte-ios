@@ -431,12 +431,13 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * BOOT without the attachment (every CI image) skips all Wi-Fi
                  * MMIO; scripts/attach-wifi-firmware.py makes the private one. */
                 "b2l_wifi_diag=10 "
-                /* Metal M0.2 (docs/metal-on-panfrost.md): backboardd's library
-                 * compiles QuartzCore's uber shaders through the AIR frontend
-                 * and Panfrost in a child process, 120 s after start, at
-                 * background priority, and logs each job ("mtl M0:"). Nothing
-                 * is drawn. */
-                "b2l_mtl_sweep=1 "
+                /* Metal M1 (docs/metal-on-panfrost.md): B2LMali publishes an
+                 * IOAcceleratorES naming the B2LMetal plug-in, and backboardd's
+                 * library asks Metal for its device in a child process 60 s
+                 * after start ("mtl M1:"). Level 1 shows the device to that
+                 * child only: Core Animation stays on OpenGL ES. The M0 sweep
+                 * (b2l_mtl_sweep=1) is done and off. */
+                "b2l_metal=1 "
                 /* S10: the per-syscall/IPC boundary diagnostics are off in
                  * the working system. With b2l_diag=1 every system call of
                  * backboardd, SpringBoard and Settings went through them, and

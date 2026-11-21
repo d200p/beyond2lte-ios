@@ -349,6 +349,56 @@ public:
 };
 OSDefineMetaClassAndStructors(B2LMaliUserClient, IOUserClient);
 
+/*
+ * S10 port: Metal milestone M1 (docs/metal-on-panfrost.md). Metal finds a
+ * device by matching IOAcceleratorES services and reading two properties of
+ * one: MetalPluginName, the bundle /System/Library/Extensions/<name>.bundle,
+ * and MetalPluginClassName, its device class (-[MTLIOAccelServiceGlobalContext
+ * init] and getMetalPluginClassForService in the 23G90 cache). With boot
+ * argument b2l_metal=N (N >= 1) the GPU service gets such a nub once its self
+ * test has passed. The bundle is published by the kernel under a name that
+ * carries its hash (b2l_userspace_seed.h), and it decides itself which
+ * processes are shown a device (userspace/b2l-metal.c). Without the argument
+ * there is no IOAcceleratorES at all, as before.
+ */
+class IOAcceleratorES : public IOService {
+	OSDeclareDefaultStructors(IOAcceleratorES);
+};
+OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+
+extern "C" const char *b2l_metal_plugin_name(void);
+
+static void
+b2l_metal_publish(IOService *gpu)
+{
+	int level = 0;
+	PE_parse_boot_argn("b2l_metal", &level, sizeof(level));
+	if (level < 1) {
+		return;
+	}
+	const char *name = b2l_metal_plugin_name();
+	if (name == NULL || name[0] == 0) {
+		b2l_diag_record("B2L METAL: b2l_metal=%d, but this kernel carries no Metal plug-in\n", level);
+		return;
+	}
+	IOAcceleratorES *nub = OSTypeAlloc(IOAcceleratorES);
+	if (nub == NULL || !nub->init()) {
+		OSSafeReleaseNULL(nub);
+		b2l_diag_record("B2L METAL: no IOAcceleratorES (allocation)\n");
+		return;
+	}
+	nub->setProperty("MetalPluginName", name);
+	nub->setProperty("MetalPluginClassName", "B2LMetalDevice");
+	nub->setProperty("B2LMetalLevel", (unsigned long long)level, 32);
+	bool attached = nub->attach(gpu);
+	if (attached) {
+		nub->registerService();
+	}
+	b2l_diag_record("B2L METAL: IOAcceleratorES %s, MetalPluginName %s, level %d\n",
+	    attached ? "registered" : "not attached", name, level);
+	nub->release();
+}
+
 uint32_t
 B2LMali::ioRead(void *ctx, uint32_t offset)
 {
@@ -793,6 +843,7 @@ B2LMali::threadMain(void *owner, wait_result_t result __unused)
 		IOLockUnlock(self->runtimeLock);
 		self->setProperty(kIOUserClientClassKey, "B2LMaliUserClient");
 		self->registerService();
+		b2l_metal_publish(self);   /* S10 port: Metal M1, boot argument b2l_metal */
 	}
 	b2l_diag_record("B2L GPU: stage finished\n");
 	self->release();

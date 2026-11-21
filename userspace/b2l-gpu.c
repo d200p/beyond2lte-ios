@@ -2256,6 +2256,196 @@ mtl_sweep_start(void)
 #endif
 
 /*
+ * Metal milestone M1 (docs/metal-on-panfrost.md), with boot argument
+ * b2l_metal=N (N >= 1): B2LMali publishes an IOAcceleratorES that names the
+ * B2LMetal plug-in, and 60 s after backboardd starts, once per boot, another
+ * backboardd is started with B2L_MTL_TEST=1: the only process b2l_metal=1
+ * shows the device to. This library's constructor sends that process here
+ * before anything of backboardd's own runs; it asks Metal for its device,
+ * logs what it got ("mtl M1:") and exits. Nothing is drawn.
+ */
+#define MTL_TEST_MARKER  "/private/var/tmp/b2l-mtl-test.running"
+#define MTL_TEST_DELAY_S 60u
+#define MTL_TEST_LIMIT_S 60u
+
+extern char **environ;
+
+static io_connect_t mtl_test_log;
+
+static void
+mtl_test_say(const char *format, ...)
+{
+	char text[B2L_MALI_MAX_LOG - 1];
+	int head = snprintf(text, sizeof(text), "mtl M1: test: ");
+	va_list ap;
+	va_start(ap, format);
+	vsnprintf(text + head, sizeof(text) - (size_t)head, format, ap);
+	va_end(ap);
+	if (mtl_test_log == MACH_PORT_NULL) {
+		io_service_t service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("B2LMali"));
+		if (service != MACH_PORT_NULL) {
+			/* only kB2LMaliLog is sent: the kernel's runtime is not reached */
+			if (IOServiceOpen(service, mach_task_self(), B2L_MALI_CLIENT_BO, &mtl_test_log) != KERN_SUCCESS) {
+				mtl_test_log = MACH_PORT_NULL;
+			}
+			IOObjectRelease(service);
+		}
+	}
+	if (mtl_test_log != MACH_PORT_NULL) {
+		IOConnectCallMethod(mtl_test_log, kB2LMaliLog, NULL, 0, text, strnlen(text, sizeof(text)), NULL, NULL,
+		    NULL, NULL);
+	}
+}
+
+static int
+boot_arg_int(const char *prefix)
+{
+	char args[2048];
+	size_t size = sizeof(args) - 1;
+	if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0) {
+		return 0;
+	}
+	args[size < sizeof(args) ? size : sizeof(args) - 1] = 0;
+	size_t n = strlen(prefix);
+	for (const char *p = args; *p != 0;) {
+		while (*p == ' ') {
+			p++;
+		}
+		if (strncmp(p, prefix, n) == 0) {
+			return atoi(p + n);
+		}
+		const char *end = strchr(p, ' ');
+		if (end == NULL) {
+			break;
+		}
+		p = end;
+	}
+	return 0;
+}
+
+typedef void *(*mtl_send0_t)(void *, void *);
+typedef unsigned long (*mtl_send_u_t)(void *, void *, unsigned long);
+
+static void
+mtl_test_child(void)
+{
+	mtl_test_say("pid %d, b2l_metal=%d", getpid(), boot_arg_int("b2l_metal="));
+	void *metal = dlopen("/System/Library/Frameworks/Metal.framework/Metal", RTLD_NOW | RTLD_GLOBAL);
+	void *(*create)(void) = metal != NULL ? (void *(*)(void))dlsym(metal, "MTLCreateSystemDefaultDevice") : NULL;
+	void *(*sel)(const char *) = (void *(*)(const char *))dlsym(RTLD_DEFAULT, "sel_registerName");
+	void *send = dlsym(RTLD_DEFAULT, "objc_msgSend");
+	const char *(*class_name)(void *) = (const char *(*)(void *))dlsym(RTLD_DEFAULT, "object_getClassName");
+	if (create == NULL || sel == NULL || send == NULL || class_name == NULL) {
+		mtl_test_say("Metal or the Objective-C runtime not found: %s", dlerror());
+		_exit(3);
+	}
+	uint64_t start = mach_absolute_time();
+	void *device = create();
+	mach_timebase_info_data_t tb;
+	mach_timebase_info(&tb);
+	mtl_test_say("MTLCreateSystemDefaultDevice: %p (%s) in %llu ms", device, device != NULL ? class_name(device) : "-",
+	    (unsigned long long)((mach_absolute_time() - start) * tb.numer / tb.denom / 1000000));
+	if (device == NULL) {
+		_exit(2);
+	}
+	CFStringRef name = (CFStringRef)((mtl_send0_t)send)(device, sel("name"));
+	char text[128] = "?";
+	if (name != NULL) {
+		CFStringGetCString(name, text, sizeof(text), kCFStringEncodingUTF8);
+	}
+	mtl_test_say("name \"%s\", registryID %lu", text, (unsigned long)((mtl_send0_t)send)(device, sel("registryID")));
+	void *queue = ((mtl_send0_t)send)(device, sel("newCommandQueue"));
+	mtl_test_say("newCommandQueue: %p (%s)", queue, queue != NULL ? class_name(queue) : "-");
+	/* What Core Animation asks before it chooses its paths (b2l-metal.c logs
+	 * each one it has no method for, answered NO). */
+	static const char *const asked[] = {
+		"supportsTileShaders", "supportsMemorylessRenderTargets", "supportsRasterOrderGroups",
+		"supportsNativeHardwareFP16", "maxBufferLength",
+	};
+	for (unsigned i = 0; i < sizeof(asked) / sizeof(asked[0]); i++) {
+		unsigned long v = (unsigned long)((mtl_send0_t)send)(device, sel(asked[i]));
+		mtl_test_say("%s = %lu", asked[i], v);
+	}
+	unsigned long apple4 = ((mtl_send_u_t)send)(device, sel("supportsFamily:"), 1004);
+	mtl_test_say("supportsFamily:Apple4 = %lu", apple4);
+	_exit(0);
+}
+
+static void *
+mtl_test_thread(__unused void *argument)
+{
+	pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+	sleep(MTL_TEST_DELAY_S);
+	char path[1024];
+	uint32_t path_size = sizeof(path);
+	if (_NSGetExecutablePath(path, &path_size) != 0) {
+		return NULL;
+	}
+	unsigned envc = 0;
+	while (environ[envc] != NULL) {
+		envc++;
+	}
+	char **envp = calloc(envc + 2, sizeof(char *));
+	if (envp == NULL) {
+		return NULL;
+	}
+	for (unsigned i = 0; i < envc; i++) {
+		envp[i] = environ[i];
+	}
+	envp[envc] = "B2L_MTL_TEST=1";
+	char *argv[] = { path, NULL };
+	pid_t pid = 0;
+	int error = posix_spawn(&pid, path, NULL, NULL, argv, envp);
+	free(envp);
+	if (error != 0) {
+		log_line("mtl M1: posix_spawn %s failed: %d", path, error);
+		return NULL;
+	}
+	log_line("mtl M1: test child %d started", pid);
+	int status = 0;
+	for (unsigned waited = 0;; waited++) {
+		pid_t done = waitpid(pid, &status, WNOHANG);
+		if (done == pid) {
+			if (WIFEXITED(status)) {
+				log_line("mtl M1: test child %d exited %d", pid, WEXITSTATUS(status));
+			} else if (WIFSIGNALED(status)) {
+				log_line("mtl M1: test child %d died, signal %d", pid, WTERMSIG(status));
+			}
+			break;
+		}
+		if (done < 0 && errno != EINTR && kill(pid, 0) != 0) {
+			log_line("mtl M1: test child %d gone, status unknown", pid);
+			break;
+		}
+		if (waited >= MTL_TEST_LIMIT_S) {
+			log_line("mtl M1: test child %d still running after %u s, killed", pid, waited);
+			kill(pid, SIGKILL);
+			waitpid(pid, &status, 0);
+			break;
+		}
+		sleep(1);
+	}
+	return NULL;
+}
+
+static void
+mtl_test_start(void)
+{
+	if (boot_arg_int("b2l_metal=") < 1) {
+		return;
+	}
+	if (!once_per_boot(MTL_TEST_MARKER)) {
+		return;
+	}
+	pthread_t thread;
+	pthread_attr_t attributes;
+	pthread_attr_init(&attributes);
+	pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+	pthread_create(&thread, &attributes, mtl_test_thread, NULL);
+	pthread_attr_destroy(&attributes);
+}
+
+/*
  * The drawing client, opened by whichever thread needs it first: the start
  * thread, or Core Animation's render thread making its GLES context.
  */
@@ -3040,6 +3230,11 @@ b2l_gpu_start(void)
 	pthread_t thread;
 	pthread_attr_t attributes;
 
+	/* The Metal M1 test's child: ask Metal for its device, log, exit
+	 * (mtl_test_thread). */
+	if (getenv("B2L_MTL_TEST") != NULL) {
+		mtl_test_child();
+	}
 	/* The Metal M0 sweep's child: compile, log, exit (mtl_sweep_thread). */
 	const char *sweep = getenv("B2L_MTL_SWEEP");
 	if (sweep != NULL) {
@@ -3051,4 +3246,5 @@ b2l_gpu_start(void)
 	pthread_create(&thread, &attributes, start_thread, NULL);
 	pthread_attr_destroy(&attributes);
 	mtl_sweep_start();
+	mtl_test_start();
 }

@@ -4,6 +4,8 @@
  */
 #include <pexpert/pexpert.h>
 #include "b2l_userspace_payload.h"
+/* S10 port: Metal M1, read by B2LMali for its IOAcceleratorES (NULL: no plug-in). */
+const char *b2l_metal_plugin_name(void);
 /* Written by prepare-xnu.sh: the library from build-gpu-library.py, or a stub
  * defining B2L_HAS_GPU_UI_PAYLOAD 0. */
 #include "b2l_gpu_payload.h"
@@ -139,12 +141,36 @@ static void b2l_gpu_ui_publish(vfs_context_t ctx)
         printf("B2L KBD: %s publication error=%d bytes=%lu\n",B2L_KBD_LIBRARY,error,(unsigned long)sizeof(b2l_kbd_library));
     }
 #endif
+#ifdef B2L_HAS_METAL_PAYLOAD
+    /* S10 port: Metal M1 (docs/metal-on-panfrost.md). The plug-in Metal loads
+     * when B2LMali's IOAcceleratorES names it (boot argument b2l_metal >= 1):
+     * a bundle whose name carries its hash, so the existing-files-must-match
+     * rule holds from one build to the next. */
+    int metal=0;PE_parse_boot_argn("b2l_metal",&metal,sizeof(metal));
+    if(metal>=1){
+        int merror=b2l_apps_directory("/System/Library/Extensions",ctx);
+        if(!merror)merror=b2l_apps_directory(B2L_METAL_BUNDLE_DIR,ctx);
+        if(!merror)merror=b2l_apps_publish(B2L_METAL_BUNDLE_DIR "/Info.plist",B2L_METAL_BUNDLE_DIR "/.Info.plist",
+            b2l_metal_plist,sizeof(b2l_metal_plist),0644,ctx);
+        if(!merror)merror=b2l_apps_publish(B2L_METAL_BUNDLE_DIR "/B2LMetal",B2L_METAL_BUNDLE_DIR "/.B2LMetal",
+            b2l_metal_executable,sizeof(b2l_metal_executable),0755,ctx);
+        if(!merror)merror=VFS_SYNC(vnode_mount(rootvnode),MNT_WAIT,ctx);
+        printf("B2L METAL: %s publication error=%d bytes=%lu\n",B2L_METAL_BUNDLE_DIR,merror,
+            (unsigned long)sizeof(b2l_metal_executable));
+    }
+#endif
 }
+#ifdef B2L_HAS_METAL_PAYLOAD
+const char *b2l_metal_plugin_name(void){return B2L_METAL_PLUGIN_NAME;}
+#else
+const char *b2l_metal_plugin_name(void){return NULL;}
+#endif
 #else
 int b2l_gpu_ui_is_ready(void){return 0;}
 const char b2l_gpu_ui_setting[]="";
 int b2l_kbd_is_ready(void){return 0;}
 const char b2l_kbd_setting[]="";
+const char *b2l_metal_plugin_name(void){return NULL;}
 #endif /* B2L_HAS_GPU_UI_PAYLOAD */
 /* S10 port: Mesa for iOS beside the GPU library (b2l_mesa_seed.h). */
 #if B2L_SEED_APPS || B2L_HAS_GPU_UI_PAYLOAD
