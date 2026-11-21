@@ -336,3 +336,46 @@ Next, M2b: draws (vertex buffers and bytes, constant buffers, textures and
 samplers bound per stage, viewport and scissor, rasterizer state, depth-
 stencil, blend colour, draw and indexed draw), checked by a triangle drawn
 with std_vert0 into an IOSurface and read back.
+
+## M2b as written (build 68)
+
+- `b2l_mtl.h`: table version 2, the render encoder: pipeline, buffers (and
+  offsets), bytes, textures and samplers per stage, viewport, scissor, cull,
+  winding, fill, depth clip, depth-stencil state, stencil reference, blend
+  colour, draws (vertex count or indices, instances, base vertex and
+  instance).
+- `b2l_mtl.c`:
+  - A pipeline records what each stage reads, from its functions' interface:
+    the UBO count, device buffers, textures (null textures), samplers; the
+    shader's own constexpr samplers become sampler CSOs when it is made.
+    Storage images and argument buffers are logged as not bound.
+  - The encoder's state starts afresh with each pass (viewport and scissor the
+    whole target, Metal's defaults). A draw binds the shaders, blend, the
+    depth-stencil state (none: depth off), stencil reference and blend colour,
+    a rasterizer (cached per state: scissor always on, top-left rule,
+    half-pixel centre, first vertex provoking, depth 0 to 1, Metal's clockwise
+    = Gallium's counter-clockwise on a y-down screen), the viewport with its y
+    scale negated (Metal's NDC +y is up, row 0 the top), the vertex buffers the
+    elements read (bytes through the context's upload buffer), UBOs, SSBOs,
+    sampler views and samplers; a zero buffer, a zero 1 x 1 texture and a
+    nearest sampler stand in for what the shader reads and nothing bound.
+  - Indexed draws: the index bounds are computed from the buffer's mapping
+    (no Panfrost index cache), restart at the all-ones index for strips.
+  - After a command buffer that drew, nothing of it stays bound (Panfrost links
+    the bound vertex and fragment shaders whenever either is bound again).
+- `b2l-metal.c`: the render encoder's methods (with Core Animation's
+  `setFragmentTexture:atTextureIndex:samplerState:atSamplerIndex:`); depth
+  bias and visibility results are logged as not applied yet.
+- `b2l-mtltest.c`: two draws read back pixel by pixel:
+  - a triangle, std_vert0 + attachment_clear (which writes zero), vertices
+    from a buffer and the matrix from `setVertexBytes`, NDC (-1, 1), (1, 1),
+    (-1, -1) onto the IOSurface cleared blue: the top left half zero, the rest
+    blue (checks the orientation);
+  - a textured quad, image_rect_blit_vert + _frag (four vertices from
+    `[[vertex_id]]`, the rectangle in buffer 1), a 2 x 2 texture at
+    texture(3) with a nearest sampler: the left half of the target shows the
+    four texels in quarters, the right half the clear colour.
+
+QuartzCore's own selector references have no `drawPrimitives` or
+`setVertexBytes`: Core Animation's draws reach the encoder another way, which
+M3's log of unanswered messages will show.

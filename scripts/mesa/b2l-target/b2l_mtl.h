@@ -13,6 +13,8 @@
  * drops one, and a command buffer holds its own on what it records.
  * Everything a device does on the GPU is serialised under that device's lock
  * (one Gallium context per device).
+ *
+ * Version 2 (M2b): the render encoder's state and draws.
  */
 #ifndef B2L_MTL_H
 #define B2L_MTL_H
@@ -21,11 +23,24 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define B2L_MTL_API_VERSION 1
+#define B2L_MTL_API_VERSION 2
 
 #define B2L_MTL_MAX_COLORS     8
 #define B2L_MTL_MAX_ATTRIBUTES 31
 #define B2L_MTL_MAX_BUFFERS    31
+#define B2L_MTL_MAX_TEXTURES   32
+#define B2L_MTL_MAX_SAMPLERS   16
+
+/* Shader stages of the encoder's set* calls. */
+#define B2L_MTL_VERTEX   0
+#define B2L_MTL_FRAGMENT 1
+
+/* cmdbuf_set_raster's `which`: MTLCullMode, MTLWinding, MTLTriangleFillMode,
+ * MTLDepthClipMode. */
+#define B2L_MTL_CULL       0
+#define B2L_MTL_WINDING    1
+#define B2L_MTL_FILL       2
+#define B2L_MTL_DEPTH_CLIP 3
 
 struct b2l_mtl_device;
 struct b2l_mtl_buffer;
@@ -131,6 +146,22 @@ struct b2l_mtl_pass_desc {
 	uint32_t width, height;                 /* renderTargetWidth/Height, 0 when not set */
 };
 
+/* MTLViewport: the origin at the top left, in pixels; depth near and far. */
+struct b2l_mtl_viewport {
+	double x, y, width, height, znear, zfar;
+};
+
+/* A draw: MTLPrimitiveType; vertices start..start+count, or count indices of
+ * index_buffer (MTLIndexType 0 = 16-bit, 1 = 32-bit) from index_offset. */
+struct b2l_mtl_draw {
+	uint32_t primitive;
+	uint32_t start, count, instances, base_instance;
+	int32_t base_vertex;
+	struct b2l_mtl_buffer *index_buffer;    /* NULL: not indexed */
+	uint32_t index_type;
+	uint64_t index_offset;
+};
+
 struct b2l_mtl_api {
 	uint32_t version;
 
@@ -217,6 +248,30 @@ struct b2l_mtl_api {
 	 * the time from the first submission to the end. */
 	int (*cmdbuf_execute)(struct b2l_mtl_cmdbuf *cmdbuf, uint64_t *gpu_us, char *why, size_t why_size);
 	void (*cmdbuf_release)(struct b2l_mtl_cmdbuf *cmdbuf);
+
+	/* Version 2: the render encoder (between cmdbuf_pass_begin and _end). Its
+	 * state starts afresh with each pass, as Metal's encoders do: viewport and
+	 * scissor the whole target, no cull, clockwise front faces, fill, depth
+	 * clip, no depth-stencil state (no depth test), blend colour zero. */
+	void (*cmdbuf_set_pipeline)(struct b2l_mtl_cmdbuf *cmdbuf, struct b2l_mtl_render_pipeline *pipeline);
+	void (*cmdbuf_set_buffer)(struct b2l_mtl_cmdbuf *cmdbuf, uint32_t stage, uint32_t index,
+	    struct b2l_mtl_buffer *buffer, uint64_t offset);
+	void (*cmdbuf_set_buffer_offset)(struct b2l_mtl_cmdbuf *cmdbuf, uint32_t stage, uint32_t index,
+	    uint64_t offset);
+	void (*cmdbuf_set_bytes)(struct b2l_mtl_cmdbuf *cmdbuf, uint32_t stage, uint32_t index, const void *bytes,
+	    uint64_t length);
+	void (*cmdbuf_set_texture)(struct b2l_mtl_cmdbuf *cmdbuf, uint32_t stage, uint32_t index,
+	    struct b2l_mtl_texture *texture);
+	void (*cmdbuf_set_sampler)(struct b2l_mtl_cmdbuf *cmdbuf, uint32_t stage, uint32_t index,
+	    struct b2l_mtl_sampler *sampler);
+	void (*cmdbuf_set_viewport)(struct b2l_mtl_cmdbuf *cmdbuf, const struct b2l_mtl_viewport *viewport);
+	void (*cmdbuf_set_scissor)(struct b2l_mtl_cmdbuf *cmdbuf, uint32_t x, uint32_t y, uint32_t width,
+	    uint32_t height);
+	void (*cmdbuf_set_raster)(struct b2l_mtl_cmdbuf *cmdbuf, uint32_t which, uint32_t value);
+	void (*cmdbuf_set_depth_stencil)(struct b2l_mtl_cmdbuf *cmdbuf, struct b2l_mtl_depth_stencil *state);
+	void (*cmdbuf_set_stencil_ref)(struct b2l_mtl_cmdbuf *cmdbuf, uint32_t front, uint32_t back);
+	void (*cmdbuf_set_blend_color)(struct b2l_mtl_cmdbuf *cmdbuf, const float rgba[4]);
+	void (*cmdbuf_draw)(struct b2l_mtl_cmdbuf *cmdbuf, const struct b2l_mtl_draw *draw);
 };
 
 /* The table, or NULL if this library does not have that version. */

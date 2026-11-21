@@ -53,6 +53,10 @@
 #include "util/u_inlines.h"
 #include "util/u_math.h"
 #include "util/os_time.h"
+#include "util/bitscan.h"
+#include "util/half_float.h"
+#include "util/u_sampler.h"
+#include "util/u_upload_mgr.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_builder.h"
 #include "nir_air.h"
@@ -130,10 +134,71 @@ struct b2l_mtl_device {
 	struct pipe_context *pipe;
 	const nir_shader_compiler_options *nir_options;
 	bool pending;                   /* GPU work since the last settle() */
+	/* M2b: what a draw binds where the encoder bound nothing, and the
+	 * states every draw needs one of. */
+	struct pipe_resource *zero_buffer;              /* 4 KiB of zeros */
+	struct pipe_resource *zero_texture;             /* 1 x 1, RGBA 0 */
+	struct pipe_sampler_view *zero_view;
+	void *default_sampler, *default_dsa, *default_blend, *default_velems;
+	void *rasterizers[256];                         /* by raster_key() */
 };
 
 static struct b2l_mtl_device *the_device;
 static pthread_mutex_t open_lock = PTHREAD_MUTEX_INITIALIZER;
+
+#define ZERO_BYTES 4096
+
+/* The device's stand-ins and default states (M2b), made with its context. */
+static bool
+device_defaults(struct b2l_mtl_device *dev)
+{
+	static const uint8_t zeros[ZERO_BYTES];
+	struct pipe_screen *screen = dev->screen;
+	struct pipe_context *pipe = dev->pipe;
+	dev->zero_buffer = pipe_buffer_create(screen, PIPE_BIND_VERTEX_BUFFER | PIPE_BIND_CONSTANT_BUFFER |
+	    PIPE_BIND_SHADER_BUFFER, PIPE_USAGE_DEFAULT, ZERO_BYTES);
+	if (dev->zero_buffer != NULL) {
+		pipe->buffer_subdata(pipe, dev->zero_buffer, PIPE_MAP_WRITE, 0, ZERO_BYTES, zeros);
+	}
+	struct pipe_resource t;
+	memset(&t, 0, sizeof(t));
+	t.target = PIPE_TEXTURE_2D;
+	t.format = PIPE_FORMAT_R8G8B8A8_UNORM;
+	t.width0 = t.height0 = t.depth0 = t.array_size = 1;
+	t.bind = PIPE_BIND_SAMPLER_VIEW;
+	t.usage = PIPE_USAGE_DEFAULT;
+	dev->zero_texture = screen->resource_create(screen, &t);
+	if (dev->zero_texture != NULL) {
+		struct pipe_box box;
+		u_box_2d(0, 0, 1, 1, &box);
+		pipe->texture_subdata(pipe, dev->zero_texture, 0, PIPE_MAP_WRITE, &box, zeros, 4, 4);
+		struct pipe_sampler_view templ;
+		u_sampler_view_default_template(&templ, dev->zero_texture, t.format);
+		dev->zero_view = pipe->create_sampler_view(pipe, dev->zero_texture, &templ);
+	}
+	struct pipe_sampler_state s;
+	memset(&s, 0, sizeof(s));
+	s.wrap_s = s.wrap_t = s.wrap_r = PIPE_TEX_WRAP_CLAMP_TO_EDGE;
+	s.min_img_filter = s.mag_img_filter = PIPE_TEX_FILTER_NEAREST;
+	s.min_mip_filter = PIPE_TEX_MIPFILTER_NONE;
+	s.seamless_cube_map = 1;
+	dev->default_sampler = pipe->create_sampler_state(pipe, &s);
+	struct pipe_depth_stencil_alpha_state dsa;
+	memset(&dsa, 0, sizeof(dsa));
+	dev->default_dsa = pipe->create_depth_stencil_alpha_state(pipe, &dsa);
+	struct pipe_blend_state blend;
+	memset(&blend, 0, sizeof(blend));
+	blend.rt[0].colormask = PIPE_MASK_RGBA;
+	dev->default_blend = pipe->create_blend_state(pipe, &blend);
+	/* for a vertex function with no attributes: one zero read from buffer 0 */
+	struct pipe_vertex_element e;
+	memset(&e, 0, sizeof(e));
+	e.src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+	dev->default_velems = pipe->create_vertex_elements_state(pipe, 1, &e);
+	pipe->set_sample_mask(pipe, ~0u);
+	return dev->zero_buffer != NULL && dev->zero_view != NULL && dev->default_sampler != NULL &&
+	    dev->default_dsa != NULL && dev->default_blend != NULL && dev->default_velems != NULL;
+}
 
 static struct b2l_mtl_device *
 device_open(char *why, size_t why_size)
@@ -167,6 +232,10 @@ device_open(char *why, size_t why_size)
 	dev->screen = screen;
 	dev->pipe = pipe;
 	dev->nir_options = screen->get_compiler_options(screen, PIPE_SHADER_IR_NIR, PIPE_SHADER_FRAGMENT);
+	if (!device_defaults(dev)) {
+		/* the device stays: what fails is a draw, which says so */
+		b2l_drm_note("mtl M2: the draw defaults were not all made");
+	}
 	the_device = dev;
 	pthread_mutex_unlock(&open_lock);
 	b2l_drm_note("mtl M2: device on %s, a context of its own", screen->get_name(screen));
@@ -421,6 +490,7 @@ struct b2l_mtl_texture {
 	enum pipe_format format;
 	struct b2l_mtl_texture_desc desc;
 	IOSurfaceRef surface;           /* retained, for an imported surface */
+	struct pipe_sampler_view *view; /* made when a draw first samples it */
 };
 
 static void
@@ -428,6 +498,7 @@ texture_destroy(void *self)
 {
 	struct b2l_mtl_texture *t = self;
 	pthread_mutex_lock(&t->dev->lock);
+	pipe_sampler_view_reference(&t->view, NULL);
 	pipe_resource_reference(&t->res, NULL);
 	pthread_mutex_unlock(&t->dev->lock);
 	if (t->surface != NULL) {
@@ -1133,12 +1204,28 @@ function_translate(struct b2l_mtl_device *dev, struct b2l_mtl_function *f)
 
 /* ---- render pipelines ---- */
 
+/* What a stage of a pipeline reads, from its functions' interface (M2b):
+ * Metal's [[buffer(n)]] constant is UBO n, a device buffer SSBO n,
+ * [[texture(n)]] sampler view n, [[sampler(n)]] sampler state n. */
+struct stage_bindings {
+	unsigned ubos;                          /* the shader's UBO count, before Panfrost's sysvals */
+	uint32_t ssbo_mask, ssbo_written;
+	uint32_t texture_mask, null_texture_mask;
+	uint32_t sampler_mask;
+	void *inline_samplers[B2L_MTL_MAX_SAMPLERS];    /* constexpr samplers, made here */
+	unsigned images, argument_members;      /* not bound yet: logged when made */
+};
+
 struct b2l_mtl_render_pipeline {
 	struct obj base;
 	struct b2l_mtl_device *dev;
 	struct b2l_mtl_function *vertex, *fragment;     /* held */
 	void *vs, *fs, *blend, *velems;
 	unsigned num_elements;
+	uint32_t vb_mask;                       /* vertex buffer slots the elements read */
+	unsigned vb_count;                      /* the highest of them + 1 */
+	bool point_size;                        /* the vertex function writes [[point_size]] */
+	struct stage_bindings bind[2];          /* B2L_MTL_VERTEX, B2L_MTL_FRAGMENT */
 	struct b2l_mtl_render_pipeline_desc desc;
 };
 
@@ -1148,6 +1235,13 @@ render_pipeline_destroy(void *self)
 	struct b2l_mtl_render_pipeline *p = self;
 	struct pipe_context *pipe = p->dev->pipe;
 	pthread_mutex_lock(&p->dev->lock);
+	for (unsigned s = 0; s < 2; s++) {
+		for (unsigned i = 0; i < B2L_MTL_MAX_SAMPLERS; i++) {
+			if (p->bind[s].inline_samplers[i] != NULL) {
+				pipe->delete_sampler_state(pipe, p->bind[s].inline_samplers[i]);
+			}
+		}
+	}
 	if (p->vs != NULL) {
 		pipe->delete_vs_state(pipe, p->vs);
 	}
@@ -1303,6 +1397,94 @@ blend_op(uint32_t op)
 	}
 }
 
+/* What one stage reads (struct stage_bindings), from its interface. */
+static void
+collect_bindings(const struct air_shader_info *info, unsigned ubos, struct stage_bindings *b)
+{
+	memset(b, 0, sizeof(*b));
+	b->ubos = MIN2(ubos, B2L_MTL_MAX_BUFFERS);
+	for (unsigned i = 0; i < info->num_resources; i++) {
+		const struct air_resource *r = &info->resources[i];
+		if (r->argbuf_set != ~0u) {
+			b->argument_members++;
+			continue;
+		}
+		switch (r->kind) {
+		case AIR_RESOURCE_DEVICE_BUFFER:
+			if (r->index < B2L_MTL_MAX_BUFFERS) {
+				b->ssbo_mask |= 1u << r->index;
+				if (r->ir_write) {
+					b->ssbo_written |= 1u << r->index;
+				}
+			}
+			break;
+		case AIR_RESOURCE_TEXTURE:
+			if (r->index < B2L_MTL_MAX_TEXTURES) {
+				b->texture_mask |= 1u << r->index;
+				if (r->null_texture) {
+					b->null_texture_mask |= 1u << r->index;
+				}
+			}
+			break;
+		case AIR_RESOURCE_SAMPLER:
+			if (r->index < B2L_MTL_MAX_SAMPLERS && !r->inline_sampler) {
+				b->sampler_mask |= 1u << r->index;
+			}
+			break;
+		case AIR_RESOURCE_IMAGE:
+			b->images++;
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+static unsigned
+inline_wrap(enum air_sampler_address a)
+{
+	switch (a) {
+	case AIR_SAMPLER_CLAMP_TO_EDGE: return PIPE_TEX_WRAP_CLAMP_TO_EDGE;
+	case AIR_SAMPLER_REPEAT: return PIPE_TEX_WRAP_REPEAT;
+	case AIR_SAMPLER_MIRRORED_REPEAT: return PIPE_TEX_WRAP_MIRROR_REPEAT;
+	default: return PIPE_TEX_WRAP_CLAMP_TO_BORDER;      /* clamp to zero, clamp to border */
+	}
+}
+
+/* A constexpr sampler of the shader's own as a CSO (the device lock held).
+ * The compare function is left off: AIR numbers it as metal_stdlib does,
+ * not as the API does, and none of QuartzCore's three samplers sets it. */
+static void *
+inline_sampler(struct b2l_mtl_device *dev, const struct air_sampler_state *a)
+{
+	struct pipe_sampler_state s;
+	memset(&s, 0, sizeof(s));
+	s.wrap_s = inline_wrap(a->address[0]);
+	s.wrap_t = inline_wrap(a->address[1]);
+	s.wrap_r = inline_wrap(a->address[2]);
+	s.min_img_filter = a->min_filter == AIR_SAMPLER_NEAREST ? PIPE_TEX_FILTER_NEAREST : PIPE_TEX_FILTER_LINEAR;
+	s.mag_img_filter = a->mag_filter == AIR_SAMPLER_NEAREST ? PIPE_TEX_FILTER_NEAREST : PIPE_TEX_FILTER_LINEAR;
+	s.min_mip_filter = a->mip_filter == AIR_SAMPLER_MIP_LINEAR ? PIPE_TEX_MIPFILTER_LINEAR :
+	    a->mip_filter == AIR_SAMPLER_MIP_NEAREST ? PIPE_TEX_MIPFILTER_NEAREST : PIPE_TEX_MIPFILTER_NONE;
+	s.unnormalized_coords = a->pixel_coord;
+	s.max_anisotropy = a->max_anisotropy > 1 ? MIN2(a->max_anisotropy, 16) : 0;
+	s.seamless_cube_map = 1;
+	s.min_lod = _mesa_half_to_float(a->lod_min);
+	s.max_lod = _mesa_half_to_float(a->lod_max);
+	/* clamp to zero: transparent black; clamp to border: metal_stdlib's
+	 * border_color (transparent black, opaque black, opaque white) */
+	bool to_border = false;
+	for (unsigned i = 0; i < 3; i++) {
+		to_border |= a->address[i] == AIR_SAMPLER_CLAMP_TO_BORDER;
+	}
+	if (to_border) {
+		float colour = a->border_color == 2 ? 1.0f : 0.0f;
+		s.border_color.f[0] = s.border_color.f[1] = s.border_color.f[2] = colour;
+		s.border_color.f[3] = a->border_color != 0 ? 1.0f : 0.0f;
+	}
+	return dev->pipe->create_sampler_state(dev->pipe, &s);
+}
+
 /* MTLColorWriteMask: red 8, green 4, blue 2, alpha 1. */
 static unsigned
 write_mask(uint32_t m)
@@ -1393,6 +1575,15 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 		num_elements = MAX2(num_elements, slot + 1);
 	}
 	report->attributes = num_elements;
+	for (unsigned i = 0; i < num_elements; i++) {
+		p->vb_mask |= 1u << elements[i].vertex_buffer_index;
+		p->vb_count = MAX2(p->vb_count, elements[i].vertex_buffer_index + 1u);
+	}
+	p->point_size = (vs->info.outputs_written & VARYING_BIT_PSIZ) != 0;
+	collect_bindings(&desc->vertex->info, vs->info.num_ubos, &p->bind[B2L_MTL_VERTEX]);
+	if (fs != NULL) {
+		collect_bindings(&desc->fragment->info, fs->info.num_ubos, &p->bind[B2L_MTL_FRAGMENT]);
+	}
 
 	struct pipe_blend_state blend;
 	memset(&blend, 0, sizeof(blend));
@@ -1433,6 +1624,20 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 		p->velems = pipe->create_vertex_elements_state(pipe, num_elements, elements);
 	}
 	p->num_elements = num_elements;
+	unsigned inline_count = 0;
+	for (unsigned s = 0; s < 2; s++) {
+		const struct air_shader_info *info = s == B2L_MTL_VERTEX ? &desc->vertex->info :
+		    desc->fragment != NULL ? &desc->fragment->info : NULL;
+		for (unsigned i = 0; info != NULL && i < info->num_resources; i++) {
+			const struct air_resource *r = &info->resources[i];
+			if (r->kind == AIR_RESOURCE_SAMPLER && r->inline_sampler && r->index < B2L_MTL_MAX_SAMPLERS &&
+			    p->bind[s].inline_samplers[r->index] == NULL) {
+				p->bind[s].inline_samplers[r->index] = inline_sampler(dev, &r->sampler);
+				p->bind[s].sampler_mask |= 1u << r->index;
+				inline_count++;
+			}
+		}
+	}
 	pthread_mutex_unlock(&dev->lock);
 	if (p->vs == NULL || (fs != NULL && p->fs == NULL) || p->blend == NULL ||
 	    (num_elements != 0 && p->velems == NULL)) {
@@ -1447,6 +1652,13 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 	    function_name(desc->vertex), desc->fragment != NULL ? function_name(desc->fragment) : "-",
 	    report->translate_ms, report->compile_ms, report->vs_instructions, report->fs_instructions,
 	    report->varyings_linked, report->varyings_unmatched, report->attributes);
+	const struct stage_bindings *bv = &p->bind[B2L_MTL_VERTEX], *bf = &p->bind[B2L_MTL_FRAGMENT];
+	b2l_drm_note("mtl M2: pipeline %s binds: UBOs %u + %u, SSBOs 0x%x + 0x%x, textures 0x%x + 0x%x (null 0x%x), "
+	    "samplers 0x%x + 0x%x (%u inline), vertex buffers 0x%x%s%s",
+	    function_name(desc->vertex), bv->ubos, bf->ubos, bv->ssbo_mask, bf->ssbo_mask, bv->texture_mask,
+	    bf->texture_mask, bv->null_texture_mask | bf->null_texture_mask, bv->sampler_mask, bf->sampler_mask,
+	    inline_count, p->vb_mask, bv->images + bf->images != 0 ? "; storage images NOT bound" : "",
+	    bv->argument_members + bf->argument_members != 0 ? "; argument buffers NOT bound" : "");
 	return p;
 }
 
@@ -1467,6 +1679,20 @@ enum op_kind {
 	OP_BUFFER_TO_TEXTURE,
 	OP_TEXTURE_TO_BUFFER,
 	OP_UNSUPPORTED,
+	/* M2b: the render encoder */
+	OP_SET_PIPELINE,
+	OP_SET_BUFFER,
+	OP_SET_BUFFER_OFFSET,
+	OP_SET_BYTES,
+	OP_SET_TEXTURE,
+	OP_SET_SAMPLER,
+	OP_SET_VIEWPORT,
+	OP_SET_SCISSOR,
+	OP_SET_RASTER,
+	OP_SET_DEPTH_STENCIL,
+	OP_SET_STENCIL_REF,
+	OP_SET_BLEND_COLOR,
+	OP_DRAW,
 };
 
 struct op {
@@ -1495,6 +1721,32 @@ struct op {
 			uint32_t slice, level;
 		} buffer_texture;
 		const char *what;
+		struct b2l_mtl_render_pipeline *pipeline;
+		struct {
+			uint32_t stage, index;
+			struct b2l_mtl_buffer *buffer;
+			uint64_t offset;
+			uint8_t *bytes;                 /* OP_SET_BYTES: a copy, freed with the op */
+			uint32_t length;
+		} bind;
+		struct {
+			uint32_t stage, index;
+			struct b2l_mtl_texture *texture;
+			struct b2l_mtl_sampler *sampler;
+		} resource;
+		struct b2l_mtl_viewport viewport;
+		struct {
+			uint32_t x, y, width, height;
+		} scissor;
+		struct {
+			uint32_t which, value;
+		} raster;
+		struct b2l_mtl_depth_stencil *dsa;
+		struct {
+			uint32_t front, back;
+		} stencil_ref;
+		float blend_color[4];
+		struct b2l_mtl_draw draw;
 	} u;
 };
 
@@ -1532,6 +1784,27 @@ op_unref(struct op *op)
 	case OP_TEXTURE_TO_BUFFER:
 		obj_unref(op->u.buffer_texture.buffer);
 		obj_unref(op->u.buffer_texture.texture);
+		break;
+	case OP_SET_PIPELINE:
+		obj_unref(op->u.pipeline);
+		break;
+	case OP_SET_BUFFER:
+		obj_unref(op->u.bind.buffer);
+		break;
+	case OP_SET_BYTES:
+		free(op->u.bind.bytes);
+		break;
+	case OP_SET_TEXTURE:
+		obj_unref(op->u.resource.texture);
+		break;
+	case OP_SET_SAMPLER:
+		obj_unref(op->u.resource.sampler);
+		break;
+	case OP_SET_DEPTH_STENCIL:
+		obj_unref(op->u.dsa);
+		break;
+	case OP_DRAW:
+		obj_unref(op->u.draw.index_buffer);
 		break;
 	default:
 		break;
@@ -1695,6 +1968,557 @@ cmdbuf_unsupported(struct b2l_mtl_cmdbuf *cb, const char *what)
 	}
 }
 
+/* ---- the render encoder's commands (M2b) ---- */
+
+static void
+cmdbuf_set_pipeline(struct b2l_mtl_cmdbuf *cb, struct b2l_mtl_render_pipeline *pipeline)
+{
+	struct op *op = cmdbuf_push(cb, OP_SET_PIPELINE);
+	if (op != NULL) {
+		op->u.pipeline = obj_ref(pipeline);
+	}
+}
+
+static void
+cmdbuf_set_buffer(struct b2l_mtl_cmdbuf *cb, uint32_t stage, uint32_t index, struct b2l_mtl_buffer *buffer,
+    uint64_t offset)
+{
+	struct op *op = cmdbuf_push(cb, OP_SET_BUFFER);
+	if (op != NULL) {
+		op->u.bind.stage = stage;
+		op->u.bind.index = index;
+		op->u.bind.buffer = obj_ref(buffer);
+		op->u.bind.offset = offset;
+	}
+}
+
+static void
+cmdbuf_set_buffer_offset(struct b2l_mtl_cmdbuf *cb, uint32_t stage, uint32_t index, uint64_t offset)
+{
+	struct op *op = cmdbuf_push(cb, OP_SET_BUFFER_OFFSET);
+	if (op != NULL) {
+		op->u.bind.stage = stage;
+		op->u.bind.index = index;
+		op->u.bind.offset = offset;
+	}
+}
+
+/* setVertexBytes / setFragmentBytes: copied now (Metal allows 4 KB). */
+static void
+cmdbuf_set_bytes(struct b2l_mtl_cmdbuf *cb, uint32_t stage, uint32_t index, const void *bytes, uint64_t length)
+{
+	if (bytes == NULL || length == 0 || length > 65536) {
+		cmdbuf_unsupported(cb, "setBytes: no bytes, or more than 64 KB");
+		return;
+	}
+	uint8_t *copy = malloc((size_t)length);
+	if (copy == NULL) {
+		cmdbuf_unsupported(cb, "setBytes: out of memory");
+		return;
+	}
+	memcpy(copy, bytes, (size_t)length);
+	struct op *op = cmdbuf_push(cb, OP_SET_BYTES);
+	if (op == NULL) {
+		free(copy);
+		return;
+	}
+	op->u.bind.stage = stage;
+	op->u.bind.index = index;
+	op->u.bind.bytes = copy;
+	op->u.bind.length = (uint32_t)length;
+}
+
+static void
+cmdbuf_set_texture(struct b2l_mtl_cmdbuf *cb, uint32_t stage, uint32_t index, struct b2l_mtl_texture *texture)
+{
+	struct op *op = cmdbuf_push(cb, OP_SET_TEXTURE);
+	if (op != NULL) {
+		op->u.resource.stage = stage;
+		op->u.resource.index = index;
+		op->u.resource.texture = obj_ref(texture);
+	}
+}
+
+static void
+cmdbuf_set_sampler(struct b2l_mtl_cmdbuf *cb, uint32_t stage, uint32_t index, struct b2l_mtl_sampler *sampler)
+{
+	struct op *op = cmdbuf_push(cb, OP_SET_SAMPLER);
+	if (op != NULL) {
+		op->u.resource.stage = stage;
+		op->u.resource.index = index;
+		op->u.resource.sampler = obj_ref(sampler);
+	}
+}
+
+static void
+cmdbuf_set_viewport(struct b2l_mtl_cmdbuf *cb, const struct b2l_mtl_viewport *viewport)
+{
+	struct op *op = cmdbuf_push(cb, OP_SET_VIEWPORT);
+	if (op != NULL) {
+		op->u.viewport = *viewport;
+	}
+}
+
+static void
+cmdbuf_set_scissor(struct b2l_mtl_cmdbuf *cb, uint32_t x, uint32_t y, uint32_t width, uint32_t height)
+{
+	struct op *op = cmdbuf_push(cb, OP_SET_SCISSOR);
+	if (op != NULL) {
+		op->u.scissor.x = x;
+		op->u.scissor.y = y;
+		op->u.scissor.width = width;
+		op->u.scissor.height = height;
+	}
+}
+
+static void
+cmdbuf_set_raster(struct b2l_mtl_cmdbuf *cb, uint32_t which, uint32_t value)
+{
+	struct op *op = cmdbuf_push(cb, OP_SET_RASTER);
+	if (op != NULL) {
+		op->u.raster.which = which;
+		op->u.raster.value = value;
+	}
+}
+
+static void
+cmdbuf_set_depth_stencil(struct b2l_mtl_cmdbuf *cb, struct b2l_mtl_depth_stencil *state)
+{
+	struct op *op = cmdbuf_push(cb, OP_SET_DEPTH_STENCIL);
+	if (op != NULL) {
+		op->u.dsa = obj_ref(state);
+	}
+}
+
+static void
+cmdbuf_set_stencil_ref(struct b2l_mtl_cmdbuf *cb, uint32_t front, uint32_t back)
+{
+	struct op *op = cmdbuf_push(cb, OP_SET_STENCIL_REF);
+	if (op != NULL) {
+		op->u.stencil_ref.front = front;
+		op->u.stencil_ref.back = back;
+	}
+}
+
+static void
+cmdbuf_set_blend_color(struct b2l_mtl_cmdbuf *cb, const float rgba[4])
+{
+	struct op *op = cmdbuf_push(cb, OP_SET_BLEND_COLOR);
+	if (op != NULL) {
+		memcpy(op->u.blend_color, rgba, sizeof(op->u.blend_color));
+	}
+}
+
+static void
+cmdbuf_draw(struct b2l_mtl_cmdbuf *cb, const struct b2l_mtl_draw *draw)
+{
+	struct op *op = cmdbuf_push(cb, OP_DRAW);
+	if (op != NULL) {
+		op->u.draw = *draw;
+		obj_ref(draw->index_buffer);
+	}
+}
+
+/* ---- executing a render encoder ---- */
+
+struct bound {
+	struct b2l_mtl_buffer *buffer;          /* or ... */
+	uint64_t offset;
+	const uint8_t *bytes;                   /* ... setBytes's copy */
+	uint32_t length;
+};
+
+/* The encoder's state while a command buffer runs; afresh at each pass.
+ * Pointers only: the ops hold the references. */
+struct encoder_state {
+	bool in_pass;
+	unsigned width, height, samples;
+	struct b2l_mtl_render_pipeline *pipeline;
+	struct bound buffers[2][B2L_MTL_MAX_BUFFERS];
+	struct b2l_mtl_texture *textures[2][B2L_MTL_MAX_TEXTURES];
+	struct b2l_mtl_sampler *samplers[2][B2L_MTL_MAX_SAMPLERS];
+	struct b2l_mtl_viewport viewport;
+	struct pipe_scissor_state scissor;
+	uint32_t cull, winding, fill, depth_clip;
+	struct b2l_mtl_depth_stencil *dsa;
+	struct pipe_stencil_ref stencil_ref;
+	struct pipe_blend_color blend_color;
+	unsigned draws;
+};
+
+/* Metal's defaults for a new render encoder. */
+static void
+encoder_reset(struct encoder_state *st, unsigned width, unsigned height, unsigned samples)
+{
+	unsigned draws = st->draws;
+	memset(st, 0, sizeof(*st));
+	st->draws = draws;
+	st->in_pass = true;
+	st->width = width;
+	st->height = height;
+	st->samples = samples;
+	st->viewport.width = width;
+	st->viewport.height = height;
+	st->viewport.zfar = 1.0;
+	st->scissor.maxx = width;
+	st->scissor.maxy = height;
+}
+
+static struct pipe_sampler_view *
+texture_view(struct b2l_mtl_device *dev, struct b2l_mtl_texture *t)
+{
+	if (t->view == NULL) {
+		struct pipe_sampler_view templ;
+		u_sampler_view_default_template(&templ, t->res, t->format);
+		t->view = dev->pipe->create_sampler_view(dev->pipe, t->res, &templ);
+	}
+	return t->view;
+}
+
+static void *
+rasterizer(struct b2l_mtl_device *dev, const struct encoder_state *st, const struct b2l_mtl_render_pipeline *p)
+{
+	unsigned key = (st->cull & 3) | (st->winding & 1) << 2 | (st->fill & 1) << 3 | (st->depth_clip & 1) << 4 |
+	    (st->samples > 1 ? 1u : 0u) << 5 | (p->point_size ? 1u : 0u) << 6 | (p->desc.rasterization ? 0u : 1u) << 7;
+	if (dev->rasterizers[key] != NULL) {
+		return dev->rasterizers[key];
+	}
+	struct pipe_rasterizer_state r;
+	memset(&r, 0, sizeof(r));
+	r.cull_face = (st->cull & 3) == 1 ? PIPE_FACE_FRONT : (st->cull & 3) == 2 ? PIPE_FACE_BACK : PIPE_FACE_NONE;
+	/* Metal's clockwise is seen on a screen whose y grows downwards, as the
+	 * Mali's rows do: the same turn as Gallium's counter-clockwise, a
+	 * positive area in (x, row). MTLWindingClockwise is 0. */
+	r.front_ccw = (st->winding & 1) == 0;
+	r.fill_front = r.fill_back = (st->fill & 1) ? PIPE_POLYGON_MODE_LINE : PIPE_POLYGON_MODE_FILL;
+	r.scissor = 1;                          /* Metal's scissor is always on */
+	r.half_pixel_center = 1;
+	r.bottom_edge_rule = 0;                 /* top-left rule, y down */
+	r.flatshade_first = 1;                  /* Metal's provoking vertex is the first */
+	r.clip_halfz = 1;                       /* NDC depth 0 to 1 */
+	r.depth_clip_near = r.depth_clip_far = (st->depth_clip & 1) == 0;
+	r.depth_clamp = (st->depth_clip & 1) != 0;
+	r.multisample = st->samples > 1;
+	r.point_quad_rasterization = 1;
+	r.sprite_coord_mode = PIPE_SPRITE_COORD_UPPER_LEFT;
+	r.point_size_per_vertex = p->point_size;
+	r.point_size = 1.0f;
+	r.line_width = 1.0f;
+	r.rasterizer_discard = !p->desc.rasterization;
+	dev->rasterizers[key] = dev->pipe->create_rasterizer_state(dev->pipe, &r);
+	return dev->rasterizers[key];
+}
+
+/* MTLViewport to Gallium's: NDC +y is up in Metal and row 0 is the top, so
+ * the y scale is negative; depth 0 to 1 goes to znear..zfar. */
+static void
+viewport_state(const struct b2l_mtl_viewport *v, struct pipe_viewport_state *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->scale[0] = (float)(v->width * 0.5);
+	out->scale[1] = (float)(-v->height * 0.5);
+	out->scale[2] = (float)(v->zfar - v->znear);
+	out->translate[0] = (float)(v->x + v->width * 0.5);
+	out->translate[1] = (float)(v->y + v->height * 0.5);
+	out->translate[2] = (float)v->znear;
+	out->swizzle_x = PIPE_VIEWPORT_SWIZZLE_POSITIVE_X;
+	out->swizzle_y = PIPE_VIEWPORT_SWIZZLE_POSITIVE_Y;
+	out->swizzle_z = PIPE_VIEWPORT_SWIZZLE_POSITIVE_Z;
+	out->swizzle_w = PIPE_VIEWPORT_SWIZZLE_POSITIVE_W;
+}
+
+/* The vertex buffers the pipeline's elements read, at Metal's indices. */
+static void
+bind_vertex(struct b2l_mtl_device *dev, const struct encoder_state *st, const struct b2l_mtl_render_pipeline *p)
+{
+	struct pipe_context *pipe = dev->pipe;
+	pipe->bind_vertex_elements_state(pipe, p->velems != NULL ? p->velems : dev->default_velems);
+	uint32_t mask = p->velems != NULL ? p->vb_mask : 1u;
+	unsigned count = p->velems != NULL ? p->vb_count : 1;
+	struct pipe_vertex_buffer vb[B2L_MTL_MAX_BUFFERS];
+	memset(vb, 0, sizeof(vb));
+	for (unsigned i = 0; i < count && i < B2L_MTL_MAX_BUFFERS; i++) {
+		if ((mask & (1u << i)) == 0) {
+			continue;
+		}
+		const struct bound *b = &st->buffers[B2L_MTL_VERTEX][i];
+		if (b->bytes != NULL) {
+			u_upload_data(pipe->stream_uploader, 0, b->length, 16, b->bytes, &vb[i].buffer_offset,
+			    &vb[i].buffer.resource);
+		} else if (b->buffer != NULL && b->offset < b->buffer->length) {
+			pipe_resource_reference(&vb[i].buffer.resource, b->buffer->res);
+			vb[i].buffer_offset = (unsigned)b->offset;
+		} else {
+			pipe_resource_reference(&vb[i].buffer.resource, dev->zero_buffer);
+		}
+	}
+	/* the driver takes these references (p_context.h, set_vertex_buffers) */
+	pipe->set_vertex_buffers(pipe, MIN2(count, B2L_MTL_MAX_BUFFERS), vb);
+}
+
+/* One stage's buffers, textures and samplers; a zero stand-in for what the
+ * shader reads and the encoder did not bind. */
+static void
+bind_stage(struct b2l_mtl_device *dev, const struct encoder_state *st, enum pipe_shader_type shader, unsigned s,
+    const struct stage_bindings *b)
+{
+	struct pipe_context *pipe = dev->pipe;
+	for (unsigned i = 0; i < b->ubos; i++) {
+		const struct bound *bb = &st->buffers[s][i];
+		struct pipe_constant_buffer c;
+		memset(&c, 0, sizeof(c));
+		if (bb->bytes != NULL) {
+			c.user_buffer = bb->bytes;
+			c.buffer_size = bb->length;
+		} else if (bb->buffer != NULL && bb->offset < bb->buffer->length) {
+			c.buffer = bb->buffer->res;
+			c.buffer_offset = (unsigned)bb->offset;
+			c.buffer_size = (unsigned)MIN2(bb->buffer->length - bb->offset, 65536);
+		} else {
+			c.buffer = dev->zero_buffer;
+			c.buffer_size = ZERO_BYTES;
+		}
+		pipe->set_constant_buffer(pipe, shader, i, false, &c);
+	}
+	unsigned n = util_last_bit(b->ssbo_mask);
+	if (n != 0) {
+		struct pipe_shader_buffer sb[B2L_MTL_MAX_BUFFERS];
+		memset(sb, 0, sizeof(sb));
+		for (unsigned i = 0; i < n; i++) {
+			const struct bound *bb = &st->buffers[s][i];
+			if (bb->buffer != NULL && bb->offset < bb->buffer->length) {
+				sb[i].buffer = bb->buffer->res;
+				sb[i].buffer_offset = (unsigned)bb->offset;
+				sb[i].buffer_size = (unsigned)(bb->buffer->length - bb->offset);
+			} else {
+				sb[i].buffer = dev->zero_buffer;
+				sb[i].buffer_size = ZERO_BYTES;
+			}
+		}
+		pipe->set_shader_buffers(pipe, shader, 0, n, sb, b->ssbo_written);
+	}
+	n = util_last_bit(b->texture_mask);
+	if (n != 0) {
+		struct pipe_sampler_view *views[B2L_MTL_MAX_TEXTURES];
+		for (unsigned i = 0; i < n; i++) {
+			struct b2l_mtl_texture *t = st->textures[s][i];
+			views[i] = (b->null_texture_mask & (1u << i)) != 0 || t == NULL ? dev->zero_view : texture_view(dev, t);
+			if (views[i] == NULL) {
+				views[i] = dev->zero_view;
+			}
+		}
+		pipe->set_sampler_views(pipe, shader, 0, n, 0, false, views);
+	}
+	n = util_last_bit(b->sampler_mask);
+	if (n != 0) {
+		void *states[B2L_MTL_MAX_SAMPLERS];
+		for (unsigned i = 0; i < n; i++) {
+			struct b2l_mtl_sampler *bound_sampler = st->samplers[s][i];
+			states[i] = b->inline_samplers[i] != NULL ? b->inline_samplers[i] :
+			    bound_sampler != NULL ? bound_sampler->cso : dev->default_sampler;
+		}
+		pipe->bind_sampler_states(pipe, shader, 0, n, states);
+	}
+}
+
+/* The lowest and highest index a draw reads, from the buffer's mapping (the
+ * CPU wrote it), so that Panfrost needs no index cache of its own. */
+static bool
+index_bounds(const struct b2l_mtl_draw *d, unsigned size, bool restart, unsigned *min, unsigned *max)
+{
+	const struct b2l_mtl_buffer *b = d->index_buffer;
+	if (d->index_offset % size != 0 || d->index_offset + (uint64_t)d->count * size > b->length) {
+		return false;
+	}
+	const uint8_t *p = b->map + d->index_offset;
+	uint32_t lo = UINT32_MAX, hi = 0, restart_index = size == 2 ? 0xffffu : UINT32_MAX;
+	for (uint32_t i = 0; i < d->count; i++) {
+		uint32_t v = size == 2 ? ((const uint16_t *)p)[i] : ((const uint32_t *)p)[i];
+		if (restart && v == restart_index) {
+			continue;
+		}
+		lo = MIN2(lo, v);
+		hi = MAX2(hi, v);
+	}
+	if (lo > hi) {
+		lo = hi = 0;
+	}
+	*min = lo;
+	*max = hi;
+	return true;
+}
+
+static void
+exec_draw(struct b2l_mtl_device *dev, struct encoder_state *st, const struct b2l_mtl_draw *d, char *first,
+    size_t first_size)
+{
+	struct pipe_context *pipe = dev->pipe;
+	const struct b2l_mtl_render_pipeline *p = st->pipeline;
+	const char *problem = !st->in_pass ? "a draw outside a render pass" :
+	    p == NULL ? "a draw with no render pipeline state" : NULL;
+	enum mesa_prim mode = MESA_PRIM_TRIANGLES;
+	switch (d->primitive) {
+	case 0: mode = MESA_PRIM_POINTS; break;
+	case 1: mode = MESA_PRIM_LINES; break;
+	case 2: mode = MESA_PRIM_LINE_STRIP; break;
+	case 3: mode = MESA_PRIM_TRIANGLES; break;
+	case 4: mode = MESA_PRIM_TRIANGLE_STRIP; break;
+	default:
+		problem = "a primitive type Metal does not have";
+		break;
+	}
+	if (problem != NULL) {
+		if (first != NULL && first[0] == 0) {
+			say(first, first_size, "%s", problem);
+		}
+		return;
+	}
+	if (d->count == 0 || d->instances == 0) {
+		return;
+	}
+	struct pipe_draw_info info;
+	memset(&info, 0, sizeof(info));
+	info.mode = mode;
+	info.instance_count = d->instances;
+	info.start_instance = d->base_instance;
+	struct pipe_draw_start_count_bias draw = { d->start, d->count, 0 };
+	if (d->index_buffer != NULL) {
+		unsigned size = d->index_type == 1 ? 4 : 2;
+		bool strip = mode == MESA_PRIM_LINE_STRIP || mode == MESA_PRIM_TRIANGLE_STRIP;
+		unsigned lo = 0, hi = 0;
+		if (!index_bounds(d, size, strip, &lo, &hi)) {
+			if (first != NULL && first[0] == 0) {
+				say(first, first_size, "drawIndexedPrimitives: indices outside the index buffer");
+			}
+			return;
+		}
+		info.index_size = (uint16_t)size;
+		info.index.resource = d->index_buffer->res;
+		info.index_bounds_valid = true;
+		info.min_index = lo;
+		info.max_index = hi;
+		/* Metal restarts indexed strips at the all-ones index, always */
+		info.primitive_restart = strip;
+		info.restart_index = size == 2 ? 0xffffu : UINT32_MAX;
+		draw.start = (unsigned)(d->index_offset / size);
+		draw.index_bias = d->base_vertex;
+	}
+	pipe->bind_vs_state(pipe, p->vs);
+	pipe->bind_fs_state(pipe, p->fs);
+	pipe->bind_blend_state(pipe, p->blend);
+	pipe->bind_depth_stencil_alpha_state(pipe, st->dsa != NULL ? st->dsa->cso : dev->default_dsa);
+	pipe->set_stencil_ref(pipe, st->stencil_ref);
+	pipe->set_blend_color(pipe, &st->blend_color);
+	pipe->bind_rasterizer_state(pipe, rasterizer(dev, st, p));
+	struct pipe_viewport_state viewport;
+	viewport_state(&st->viewport, &viewport);
+	pipe->set_viewport_states(pipe, 0, 1, &viewport);
+	pipe->set_scissor_states(pipe, 0, 1, &st->scissor);
+	bind_vertex(dev, st, p);
+	bind_stage(dev, st, PIPE_SHADER_VERTEX, B2L_MTL_VERTEX, &p->bind[B2L_MTL_VERTEX]);
+	if (p->fs != NULL) {
+		bind_stage(dev, st, PIPE_SHADER_FRAGMENT, B2L_MTL_FRAGMENT, &p->bind[B2L_MTL_FRAGMENT]);
+	}
+	u_upload_unmap(pipe->stream_uploader);
+	pipe->draw_vbo(pipe, &info, 0, NULL, &draw, 1);
+	st->draws++;
+	dev->pending = true;
+}
+
+/* After a command buffer: nothing of its stays bound in the context, so a
+ * state it held may be deleted (Panfrost links the bound vertex and
+ * fragment shaders whenever either is bound again). */
+static void
+unbind_all(struct b2l_mtl_device *dev)
+{
+	struct pipe_context *pipe = dev->pipe;
+	static const enum pipe_shader_type stages[2] = { PIPE_SHADER_VERTEX, PIPE_SHADER_FRAGMENT };
+	void *no_samplers[B2L_MTL_MAX_SAMPLERS];
+	memset(no_samplers, 0, sizeof(no_samplers));
+	pipe->bind_fs_state(pipe, NULL);
+	pipe->bind_vs_state(pipe, NULL);
+	pipe->bind_blend_state(pipe, dev->default_blend);
+	pipe->bind_depth_stencil_alpha_state(pipe, dev->default_dsa);
+	pipe->bind_vertex_elements_state(pipe, dev->default_velems);
+	pipe->set_vertex_buffers(pipe, 0, NULL);
+	for (unsigned s = 0; s < 2; s++) {
+		for (unsigned i = 0; i < B2L_MTL_MAX_BUFFERS; i++) {
+			pipe->set_constant_buffer(pipe, stages[s], i, false, NULL);
+		}
+		pipe->set_shader_buffers(pipe, stages[s], 0, B2L_MTL_MAX_BUFFERS, NULL, 0);
+		pipe->set_sampler_views(pipe, stages[s], 0, 0, B2L_MTL_MAX_TEXTURES, false, NULL);
+		pipe->bind_sampler_states(pipe, stages[s], 0, B2L_MTL_MAX_SAMPLERS, no_samplers);
+	}
+}
+
+/* An encoder state command into `st` (the stage and index checked). */
+static void
+exec_state(struct encoder_state *st, const struct op *op)
+{
+	switch (op->kind) {
+	case OP_SET_PIPELINE:
+		st->pipeline = op->u.pipeline;
+		break;
+	case OP_SET_BUFFER:
+	case OP_SET_BUFFER_OFFSET:
+	case OP_SET_BYTES:
+		if (op->u.bind.stage < 2 && op->u.bind.index < B2L_MTL_MAX_BUFFERS) {
+			struct bound *b = &st->buffers[op->u.bind.stage][op->u.bind.index];
+			if (op->kind == OP_SET_BUFFER_OFFSET) {
+				b->offset = op->u.bind.offset;
+			} else {
+				b->buffer = op->u.bind.buffer;
+				b->offset = op->u.bind.offset;
+				b->bytes = op->u.bind.bytes;
+				b->length = op->u.bind.length;
+			}
+		}
+		break;
+	case OP_SET_TEXTURE:
+		if (op->u.resource.stage < 2 && op->u.resource.index < B2L_MTL_MAX_TEXTURES) {
+			st->textures[op->u.resource.stage][op->u.resource.index] = op->u.resource.texture;
+		}
+		break;
+	case OP_SET_SAMPLER:
+		if (op->u.resource.stage < 2 && op->u.resource.index < B2L_MTL_MAX_SAMPLERS) {
+			st->samplers[op->u.resource.stage][op->u.resource.index] = op->u.resource.sampler;
+		}
+		break;
+	case OP_SET_VIEWPORT:
+		st->viewport = op->u.viewport;
+		break;
+	case OP_SET_SCISSOR: {
+		uint32_t x = MIN2(op->u.scissor.x, st->width), y = MIN2(op->u.scissor.y, st->height);
+		st->scissor.minx = x;
+		st->scissor.miny = y;
+		st->scissor.maxx = (unsigned)MIN2((uint64_t)op->u.scissor.x + op->u.scissor.width, st->width);
+		st->scissor.maxy = (unsigned)MIN2((uint64_t)op->u.scissor.y + op->u.scissor.height, st->height);
+		break;
+	}
+	case OP_SET_RASTER:
+		switch (op->u.raster.which) {
+		case B2L_MTL_CULL: st->cull = op->u.raster.value; break;
+		case B2L_MTL_WINDING: st->winding = op->u.raster.value; break;
+		case B2L_MTL_FILL: st->fill = op->u.raster.value; break;
+		case B2L_MTL_DEPTH_CLIP: st->depth_clip = op->u.raster.value; break;
+		default: break;
+		}
+		break;
+	case OP_SET_DEPTH_STENCIL:
+		st->dsa = op->u.dsa;
+		break;
+	case OP_SET_STENCIL_REF:
+		st->stencil_ref.ref_value[0] = (uint8_t)op->u.stencil_ref.front;
+		st->stencil_ref.ref_value[1] = (uint8_t)op->u.stencil_ref.back;
+		break;
+	case OP_SET_BLEND_COLOR:
+		memcpy(st->blend_color.color, op->u.blend_color, sizeof(st->blend_color.color));
+		break;
+	default:
+		break;
+	}
+}
+
 static struct pipe_surface *
 pass_surface(struct b2l_mtl_cmdbuf *cb, const struct b2l_mtl_attachment *a)
 {
@@ -1715,7 +2539,8 @@ pass_surface(struct b2l_mtl_cmdbuf *cb, const struct b2l_mtl_attachment *a)
 }
 
 static void
-exec_pass_begin(struct b2l_mtl_cmdbuf *cb, const struct b2l_mtl_pass_desc *pass, char *why, size_t why_size)
+exec_pass_begin(struct b2l_mtl_cmdbuf *cb, struct encoder_state *st, const struct b2l_mtl_pass_desc *pass,
+    char *why, size_t why_size)
 {
 	struct pipe_context *pipe = cb->dev->pipe;
 	struct pipe_framebuffer_state fb;
@@ -1786,6 +2611,7 @@ exec_pass_begin(struct b2l_mtl_cmdbuf *cb, const struct b2l_mtl_pass_desc *pass,
 			cb->dev->pending = true;
 		}
 	}
+	encoder_reset(st, width, height, MAX2(samples, 1));
 }
 
 static void
@@ -1828,15 +2654,38 @@ cmdbuf_execute(struct b2l_mtl_cmdbuf *cb, uint64_t *gpu_us, char *why, size_t wh
 	struct b2l_mtl_device *dev = cb->dev;
 	struct pipe_context *pipe = dev->pipe;
 	char first[160] = "";
+	struct encoder_state *st = calloc(1, sizeof(*st));
+	if (st == NULL) {
+		say(why, why_size, "out of memory");
+		return -1;
+	}
 	pthread_mutex_lock(&dev->lock);
 	uint64_t t0 = now_us();
 	util_dynarray_foreach(&cb->ops, struct op, op) {
 		struct pipe_box box;
 		switch (op->kind) {
 		case OP_PASS_BEGIN:
-			exec_pass_begin(cb, &op->u.pass, first[0] == 0 ? first : NULL, sizeof(first));
+			exec_pass_begin(cb, st, &op->u.pass, first[0] == 0 ? first : NULL, sizeof(first));
 			break;
 		case OP_PASS_END:
+			st->in_pass = false;
+			break;
+		case OP_SET_PIPELINE:
+		case OP_SET_BUFFER:
+		case OP_SET_BUFFER_OFFSET:
+		case OP_SET_BYTES:
+		case OP_SET_TEXTURE:
+		case OP_SET_SAMPLER:
+		case OP_SET_VIEWPORT:
+		case OP_SET_SCISSOR:
+		case OP_SET_RASTER:
+		case OP_SET_DEPTH_STENCIL:
+		case OP_SET_STENCIL_REF:
+		case OP_SET_BLEND_COLOR:
+			exec_state(st, op);
+			break;
+		case OP_DRAW:
+			exec_draw(dev, st, &op->u.draw, first, sizeof(first));
 			break;
 		case OP_COPY_BUFFER:
 			if (op->u.copy_buffer.from_offset + op->u.copy_buffer.size > op->u.copy_buffer.from->length ||
@@ -1880,6 +2729,10 @@ cmdbuf_execute(struct b2l_mtl_cmdbuf *cb, uint64_t *gpu_us, char *why, size_t wh
 		}
 	}
 	settle(dev);
+	if (st->draws != 0) {
+		unbind_all(dev);
+	}
+	free(st);
 	/* Let go of the surfaces: the context keeps its own references in its
 	 * framebuffer state until it is replaced. */
 	struct pipe_framebuffer_state none;
@@ -1950,6 +2803,19 @@ static const struct b2l_mtl_api api = {
 	.cmdbuf_unsupported = cmdbuf_unsupported,
 	.cmdbuf_execute = cmdbuf_execute,
 	.cmdbuf_release = cmdbuf_release,
+	.cmdbuf_set_pipeline = cmdbuf_set_pipeline,
+	.cmdbuf_set_buffer = cmdbuf_set_buffer,
+	.cmdbuf_set_buffer_offset = cmdbuf_set_buffer_offset,
+	.cmdbuf_set_bytes = cmdbuf_set_bytes,
+	.cmdbuf_set_texture = cmdbuf_set_texture,
+	.cmdbuf_set_sampler = cmdbuf_set_sampler,
+	.cmdbuf_set_viewport = cmdbuf_set_viewport,
+	.cmdbuf_set_scissor = cmdbuf_set_scissor,
+	.cmdbuf_set_raster = cmdbuf_set_raster,
+	.cmdbuf_set_depth_stencil = cmdbuf_set_depth_stencil,
+	.cmdbuf_set_stencil_ref = cmdbuf_set_stencil_ref,
+	.cmdbuf_set_blend_color = cmdbuf_set_blend_color,
+	.cmdbuf_draw = cmdbuf_draw,
 };
 
 B2L_EXPORT const struct b2l_mtl_api *

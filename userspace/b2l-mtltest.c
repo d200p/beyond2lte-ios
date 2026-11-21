@@ -16,9 +16,11 @@
  *   and fixed_vert + the window server's uber shader with fc_texture_function
  *   given by name, as Core Animation gives it).
  *
- * Nothing is drawn (draws are M2b). One kernel log line per step ("B2L GPU
- * UI: mtl M2: test: ..."), with ok or FAILED, through a B2LMali client of its
- * own that only logs.
+ * M2b draws: a triangle onto the IOSurface (vertex buffer, setVertexBytes,
+ * viewport orientation) and a textured quad onto the texture (vertex_id strip,
+ * a 2 x 2 texture and a sampler), both read back pixel by pixel. One kernel
+ * log line per step ("B2L GPU UI: mtl M2: test: ..."), with ok or FAILED,
+ * through a B2LMali client of its own that only logs.
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
@@ -191,9 +193,9 @@ make_surface(void)
 	return surface;
 }
 
-/* A render pass on `cb` whose only work is its load action: clear `texture`. */
-static void
-clear_pass(id cb, id texture, clear_color color)
+/* A render encoder on `cb` whose pass first clears `texture`. */
+static id
+begin_pass(id cb, id texture, clear_color color)
 {
 	id pass = MSG(id)(cls("MTLRenderPassDescriptor"), S("renderPassDescriptor"));
 	id a = at(MSG(id)(pass, S("colorAttachments")), 0);
@@ -201,8 +203,14 @@ clear_pass(id cb, id texture, clear_color color)
 	MSG(void, unsigned long)(a, S("setLoadAction:"), 2);       /* MTLLoadActionClear */
 	MSG(void, unsigned long)(a, S("setStoreAction:"), 1);      /* MTLStoreActionStore */
 	MSG(void, clear_color)(a, S("setClearColor:"), color);
-	id encoder = MSG(id, id)(cb, S("renderCommandEncoderWithDescriptor:"), pass);
-	MSG(void)(encoder, S("endEncoding"));
+	return MSG(id, id)(cb, S("renderCommandEncoderWithDescriptor:"), pass);
+}
+
+/* A render pass on `cb` whose only work is its load action. */
+static void
+clear_pass(id cb, id texture, clear_color color)
+{
+	MSG(void)(begin_pass(cb, texture, color), S("endEncoding"));
 }
 
 /* Commit, wait; the status (4 completed, 5 error) and the error's text. */
@@ -238,8 +246,10 @@ wrong_pixels(const uint8_t *rows, size_t row_bytes, const uint8_t bgra[4], uint3
 	return wrong;
 }
 
-static void
-pipeline_test(id device, id library, const char *vertex, const char *fragment, bool uber)
+/* A pipeline of two QuartzCore functions; std: std_vert0's vertex layout,
+ * uber: fc_texture_function 0 given by name. Nil when refused. */
+static id
+pipeline_test(id device, id library, const char *vertex, const char *fragment, bool std, bool uber)
 {
 	char label[160], why[200];
 	snprintf(label, sizeof(label), "pipeline %s + %s%s", vertex, fragment, uber ? " (fc_texture_function 0 by name)" : "");
@@ -257,13 +267,13 @@ pipeline_test(id device, id library, const char *vertex, const char *fragment, b
 	}
 	if (v == nil || f == nil) {
 		verdict(label, false, "functions %s and %s %s", name_of(v), name_of(f), error_text(error, why, sizeof(why)));
-		return;
+		return nil;
 	}
 	id d = make("MTLRenderPipelineDescriptor");
 	MSG(void, id)(d, S("setVertexFunction:"), v);
 	MSG(void, id)(d, S("setFragmentFunction:"), f);
 	MSG(void, unsigned long)(at(MSG(id)(d, S("colorAttachments")), 0), S("setPixelFormat:"), 80);
-	if (!uber) {
+	if (std) {
 		/* std_vert0: position float4 (0), texcoord float2 (1), colour half4 (3) */
 		id vd = MSG(id)(cls("MTLVertexDescriptor"), S("vertexDescriptor"));
 		id attributes = MSG(id)(vd, S("attributes"));
@@ -282,7 +292,168 @@ pipeline_test(id device, id library, const char *vertex, const char *fragment, b
 	id p = MSG(id, id, id *)(device, S("newRenderPipelineStateWithDescriptor:error:"), d, &error);
 	verdict(label, p != nil, "%s in %llu ms%s%s", name_of(p), (unsigned long long)(now_ms() - t0),
 	    error != nil ? ": " : "", error_text(error, why, sizeof(why)));
+	return p;
 }
+
+static const float identity4[16] = { 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1 };
+
+/* " (x,y)=AARRGGBB" appended to out. */
+static void
+pixel_text(const uint8_t *rows, size_t row_bytes, unsigned x, unsigned y, char *out, size_t size)
+{
+	const uint8_t *p = rows + y * row_bytes + x * 4;
+	size_t n = strlen(out);
+	snprintf(out + n, size - n, " (%u,%u)=%02x%02x%02x%02x", x, y, p[3], p[2], p[1], p[0]);
+}
+
+static bool
+near(const uint8_t *p, const uint8_t *want, int slack)
+{
+	for (unsigned c = 0; c < 4; c++) {
+		int d = (int)p[c] - (int)want[c];
+		if (d < -slack || d > slack) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * M2b, a triangle: std_vert0 + attachment_clear (which writes zero), the
+ * vertices from a buffer, the matrix from setVertexBytes, onto the IOSurface
+ * cleared to (0.25, 0.5, 0.75, 1). NDC (-1, 1), (1, 1), (-1, -1) is the top
+ * left half of the target in Metal (row 0 at the top): a pixel whose centre
+ * has x + y < 64 is zero, one with x + y > 64 keeps the clear colour, the
+ * diagonal itself (x + y = 63) is left out.
+ */
+static void
+draw_triangle(id device, id queue, id pipeline, id target, IOSurfaceRef surface)
+{
+	struct vertex {
+		float position[4], st[2];
+		uint16_t colour[4];
+	} vertices[3] = {
+		{ { -1, 1, 0, 1 }, { 0, 0 }, { 0x3c00, 0, 0, 0x3c00 } },
+		{ { 1, 1, 0, 1 }, { 1, 0 }, { 0, 0x3c00, 0, 0x3c00 } },
+		{ { -1, -1, 0, 1 }, { 0, 1 }, { 0, 0, 0x3c00, 0x3c00 } },
+	};
+	char why[200], probes[160] = "";
+	uint64_t ms = 0;
+	id vb = MSG(id, const void *, unsigned long, unsigned long)(device, S("newBufferWithBytes:length:options:"),
+	    vertices, sizeof(vertices), 0);
+	id cb = MSG(id)(queue, S("commandBuffer"));
+	id e = begin_pass(cb, target, (clear_color){ 0.25, 0.5, 0.75, 1.0 });
+	MSG(void, id)(e, S("setRenderPipelineState:"), pipeline);
+	MSG(void, id, unsigned long, unsigned long)(e, S("setVertexBuffer:offset:atIndex:"), vb, 0, 0);
+	MSG(void, const void *, unsigned long, unsigned long)(e, S("setVertexBytes:length:atIndex:"), identity4,
+	    sizeof(identity4), 2);
+	MSG(void, unsigned long, unsigned long, unsigned long)(e, S("drawPrimitives:vertexStart:vertexCount:"),
+	    3 /* MTLPrimitiveTypeTriangle */, 0, 3);
+	MSG(void)(e, S("endEncoding"));
+	unsigned long status = run(cb, why, sizeof(why), &ms);
+	static const uint8_t blue[4] = { 191, 128, 64, 255 }, zero[4] = { 0, 0, 0, 0 };
+	unsigned wrong = 0, inside = 0;
+	IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+	const uint8_t *rows = IOSurfaceGetBaseAddress(surface);
+	size_t row_bytes = IOSurfaceGetBytesPerRow(surface);
+	for (unsigned y = 0; y < SIDE; y++) {
+		for (unsigned x = 0; x < SIDE; x++) {
+			if (x + y == SIDE - 1) {
+				continue;
+			}
+			bool in = x + y < SIDE - 1;
+			wrong += !near(rows + y * row_bytes + x * 4, in ? zero : blue, 1);
+			inside += in;
+		}
+	}
+	pixel_text(rows, row_bytes, 4, 4, probes, sizeof(probes));
+	pixel_text(rows, row_bytes, 59, 4, probes, sizeof(probes));
+	pixel_text(rows, row_bytes, 4, 59, probes, sizeof(probes));
+	pixel_text(rows, row_bytes, 59, 59, probes, sizeof(probes));
+	IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+	verdict("draw: triangle (std_vert0 + attachment_clear) into the IOSurface", vb != nil && status == 4 &&
+	    wrong == 0, "status %lu, %u of %u pixels wrong (%u inside), %llu ms;%s %s", status, wrong,
+	    (unsigned)(SIDE * SIDE - SIDE), inside, (unsigned long long)ms, probes, why);
+}
+
+/*
+ * M2b, a textured quad: image_rect_blit_vert + image_rect_blit_frag (a
+ * QuartzCore image: four vertices from [[vertex_id]] as a strip, its
+ * rectangle in vertex buffer 1, the matrix in 2, a 2 x 2 transform in 5), a
+ * 2 x 2 texture at texture(3) with a nearest sampler at sampler(0), the
+ * colour multiplier u[1] = 1 in fragment buffer 1. The rectangle is NDC
+ * (-1, -1) to (0, 1), st (0, 0) to (1, 1): the left half of the target, with
+ * st's row 0 at the bottom. So the top left quarter shows texel (0, 1) blue,
+ * the top right one (1, 1) white, the bottom left (0, 0) red, the bottom
+ * right (1, 0) green; the right half keeps the clear colour, black. Rows and
+ * columns where a boundary falls are left out.
+ */
+static void
+draw_quad(id device, id queue, id pipeline, id target)
+{
+	char why[200], probes[200] = "";
+	uint64_t ms = 0;
+	id td = MSG(id, unsigned long, unsigned long, unsigned long, bool)(cls("MTLTextureDescriptor"),
+	    S("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), 80, 2, 2, false);
+	MSG(void, unsigned long)(td, S("setUsage:"), 1);
+	id texels = MSG(id, id)(device, S("newTextureWithDescriptor:"), td);
+	/* BGRA: row 0 red, green; row 1 blue, white */
+	static const uint8_t colours[16] = { 0, 0, 255, 255, 0, 255, 0, 255, 255, 0, 0, 255, 255, 255, 255, 255 };
+	region_t r = { { 0, 0, 0 }, { 2, 2, 1 } };
+	if (texels != nil) {
+		MSG(void, region_t, unsigned long, const void *, unsigned long)(texels,
+		    S("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"), r, 0, colours, 8);
+	}
+	id sd = make("MTLSamplerDescriptor");          /* nearest, clamp to edge, normalised */
+	id sampler = MSG(id, id)(device, S("newSamplerStateWithDescriptor:"), sd);
+	struct {
+		float min[2], max[2], st_min[2], st_max[2];
+		uint32_t edge_mask, pad;
+	} rect = { { -1, -1 }, { 0, 1 }, { 0, 0 }, { 1, 1 }, 0, 0 };
+	static const float transform[4] = { 1, 0, 0, 1 };         /* float2x2 identity */
+	static const float u[8] = { 0, 0, 0, 0, 1, 1, 1, 1 };     /* u[1] = 1 */
+	id cb = MSG(id)(queue, S("commandBuffer"));
+	id e = begin_pass(cb, target, (clear_color){ 0.0, 0.0, 0.0, 1.0 });
+	MSG(void, id)(e, S("setRenderPipelineState:"), pipeline);
+	MSG(void, const void *, unsigned long, unsigned long)(e, S("setVertexBytes:length:atIndex:"), &rect,
+	    sizeof(rect), 1);
+	MSG(void, const void *, unsigned long, unsigned long)(e, S("setVertexBytes:length:atIndex:"), identity4,
+	    sizeof(identity4), 2);
+	MSG(void, const void *, unsigned long, unsigned long)(e, S("setVertexBytes:length:atIndex:"), transform,
+	    sizeof(transform), 5);
+	MSG(void, const void *, unsigned long, unsigned long)(e, S("setFragmentBytes:length:atIndex:"), u, sizeof(u), 1);
+	MSG(void, id, unsigned long)(e, S("setFragmentTexture:atIndex:"), texels, 3);
+	MSG(void, id, unsigned long)(e, S("setFragmentSamplerState:atIndex:"), sampler, 0);
+	MSG(void, unsigned long, unsigned long, unsigned long)(e, S("drawPrimitives:vertexStart:vertexCount:"),
+	    4 /* MTLPrimitiveTypeTriangleStrip */, 0, 4);
+	MSG(void)(e, S("endEncoding"));
+	unsigned long status = run(cb, why, sizeof(why), &ms);
+	static uint8_t back[ROW * SIDE];
+	region_t whole = { { 0, 0, 0 }, { SIDE, SIDE, 1 } };
+	MSG(void, void *, unsigned long, region_t, unsigned long)(target, S("getBytes:bytesPerRow:fromRegion:mipmapLevel:"),
+	    back, ROW, whole, 0);
+	static const uint8_t black[4] = { 0, 0, 0, 255 };
+	unsigned wrong = 0, checked = 0;
+	for (unsigned y = 0; y < SIDE; y++) {
+		for (unsigned x = 0; x < SIDE; x++) {
+			if (y == 31 || y == 32 || x == 15 || x == 16 || x == 31 || x == 32) {
+				continue;
+			}
+			const uint8_t *want = x > 32 ? black : colours + ((y < 32 ? 1u : 0u) * 2 + (x < 16 ? 0u : 1u)) * 4;
+			wrong += !near(back + y * ROW + x * 4, want, 2);
+			checked++;
+		}
+	}
+	pixel_text(back, ROW, 8, 8, probes, sizeof(probes));
+	pixel_text(back, ROW, 24, 8, probes, sizeof(probes));
+	pixel_text(back, ROW, 8, 56, probes, sizeof(probes));
+	pixel_text(back, ROW, 24, 56, probes, sizeof(probes));
+	pixel_text(back, ROW, 48, 32, probes, sizeof(probes));
+	verdict("draw: textured quad (image_rect_blit) into the texture", texels != nil && sampler != nil &&
+	    status == 4 && wrong == 0, "status %lu, %u of %u pixels wrong, %llu ms;%s %s", status, wrong, checked,
+	    (unsigned long long)ms, probes, why);
+}
+
 
 void
 b2l_mtl_test_run(void)
@@ -420,8 +591,17 @@ b2l_mtl_test_run(void)
 	verdict("QuartzCore's default.metallib", library != nil && functions > 100, "%s, %lu functions in %llu ms %s",
 	    name_of(library), functions, (unsigned long long)(now_ms() - t0), error_text(error, why, sizeof(why)));
 	if (library != nil) {
-		pipeline_test(device, library, "std_vert0_lph", "attachment_clear_frag_lph", false);
-		pipeline_test(device, library, "fixed_vert_lph_spc", "fixed_frag_lph_cph", true);
+		id solid = pipeline_test(device, library, "std_vert0_lph", "attachment_clear_frag_lph", true, false);
+		pipeline_test(device, library, "fixed_vert_lph_spc", "fixed_frag_lph_cph", false, true);
+		id image = pipeline_test(device, library, "image_rect_blit_vert_lph", "image_rect_blit_frag_lph", false,
+		    false);
+		/* M2b: the draws */
+		if (solid != nil && ts != nil) {
+			draw_triangle(device, queue, solid, ts, surface);
+		}
+		if (image != nil && t != nil) {
+			draw_quad(device, queue, image, t);
+		}
 	}
 	say("done: %u passed, %u failed", passed, failed);
 }

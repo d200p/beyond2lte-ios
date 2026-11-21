@@ -7,8 +7,10 @@
  * among them), samplers, depth-stencil states, libraries and functions (with
  * their constants, by index or by name), render pipelines (the shaders
  * compiled by Panfrost when the pipeline is made), command buffers with
- * render passes (load actions, clears) and blits. Draws are M2b: a draw is
- * recorded as not implemented and the command buffer ends in error.
+ * render passes (load actions, clears) and blits. M2b adds the render
+ * encoder's state and its draws (vertex buffers and bytes, constant buffers,
+ * textures and samplers per stage, viewport, scissor, cull, winding, fill,
+ * depth-stencil state, blend colour).
  *
  * What Metal does on iOS 26 (read from the 23G90 cache): it matches the
  * IOAcceleratorES services, reads MetalPluginName ("B2LMetal-<hash>", this
@@ -1984,56 +1986,478 @@ encoder_debug_group(id self, SEL _cmd, id name)
 	(void)name;
 }
 
-/* M2a has no draws: recorded as not implemented, the command buffer's error. */
+/* ---- the render encoder's state and draws (M2b) ---- */
+
+static struct b2l_mtl_render_pipeline *
+mesa_pipeline(id state)
+{
+	return state != nil && object_getClass(state) == gRenderPipelineClass ?
+	    ((struct pipeline_state *)state_of(state))->mp : NULL;
+}
+
+static struct b2l_mtl_sampler *
+mesa_sampler(id state)
+{
+	return state != nil && object_getClass(state) == gSamplerClass ?
+	    ((struct sampler_state *)state_of(state))->ms : NULL;
+}
+
+static struct b2l_mtl_depth_stencil *
+mesa_depth_stencil(id state)
+{
+	return state != nil && object_getClass(state) == gDepthStencilClass ?
+	    ((struct depth_stencil_state *)state_of(state))->md : NULL;
+}
+
+/* An object of another device's where this encoder needs one of its own:
+ * the command buffer's error. */
 static void
-render_draw(id self, SEL _cmd)
+foreign(struct b2l_mtl_cmdbuf *mc, SEL _cmd, id object)
+{
+	mtl->cmdbuf_unsupported(mc, sel_getName(_cmd));
+	if (first_time(_cmd)) {
+		say("-%s: %s is not this device's", sel_getName(_cmd), class_getName(object_getClass(object)));
+	}
+}
+
+static void
+render_set_pipeline(id self, SEL _cmd, id state)
+{
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	struct b2l_mtl_render_pipeline *mp = mesa_pipeline(state);
+	if (mc == NULL) {
+		return;
+	}
+	if (mp == NULL && state != nil) {
+		foreign(mc, _cmd, state);
+		return;
+	}
+	mtl->cmdbuf_set_pipeline(mc, mp);
+}
+
+static void
+set_buffer(id self, SEL _cmd, uint32_t stage, id buffer, unsigned long offset, unsigned long index)
+{
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	struct b2l_mtl_buffer *mb = mesa_buffer(buffer);
+	if (mc == NULL) {
+		return;
+	}
+	if (mb == NULL && buffer != nil) {
+		foreign(mc, _cmd, buffer);
+		return;
+	}
+	mtl->cmdbuf_set_buffer(mc, stage, (uint32_t)index, mb, offset);
+}
+
+static void
+render_vertex_buffer(id self, SEL _cmd, id buffer, unsigned long offset, unsigned long index)
+{
+	set_buffer(self, _cmd, B2L_MTL_VERTEX, buffer, offset, index);
+}
+
+static void
+render_fragment_buffer(id self, SEL _cmd, id buffer, unsigned long offset, unsigned long index)
+{
+	set_buffer(self, _cmd, B2L_MTL_FRAGMENT, buffer, offset, index);
+}
+
+static void
+set_buffers(id self, SEL _cmd, uint32_t stage, const id *buffers, const unsigned long *offsets, CFRange range)
+{
+	for (CFIndex i = 0; buffers != NULL && i < range.length; i++) {
+		set_buffer(self, _cmd, stage, buffers[i], offsets != NULL ? offsets[i] : 0,
+		    (unsigned long)(range.location + i));
+	}
+}
+
+static void
+render_vertex_buffers(id self, SEL _cmd, const id *buffers, const unsigned long *offsets, CFRange range)
+{
+	set_buffers(self, _cmd, B2L_MTL_VERTEX, buffers, offsets, range);
+}
+
+static void
+render_fragment_buffers(id self, SEL _cmd, const id *buffers, const unsigned long *offsets, CFRange range)
+{
+	set_buffers(self, _cmd, B2L_MTL_FRAGMENT, buffers, offsets, range);
+}
+
+static void
+render_vertex_buffer_offset(id self, SEL _cmd, unsigned long offset, unsigned long index)
+{
+	(void)_cmd;
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	if (mc != NULL) {
+		mtl->cmdbuf_set_buffer_offset(mc, B2L_MTL_VERTEX, (uint32_t)index, offset);
+	}
+}
+
+static void
+render_fragment_buffer_offset(id self, SEL _cmd, unsigned long offset, unsigned long index)
+{
+	(void)_cmd;
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	if (mc != NULL) {
+		mtl->cmdbuf_set_buffer_offset(mc, B2L_MTL_FRAGMENT, (uint32_t)index, offset);
+	}
+}
+
+static void
+render_vertex_bytes(id self, SEL _cmd, const void *bytes, unsigned long length, unsigned long index)
+{
+	(void)_cmd;
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	if (mc != NULL) {
+		mtl->cmdbuf_set_bytes(mc, B2L_MTL_VERTEX, (uint32_t)index, bytes, length);
+	}
+}
+
+static void
+render_fragment_bytes(id self, SEL _cmd, const void *bytes, unsigned long length, unsigned long index)
+{
+	(void)_cmd;
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	if (mc != NULL) {
+		mtl->cmdbuf_set_bytes(mc, B2L_MTL_FRAGMENT, (uint32_t)index, bytes, length);
+	}
+}
+
+static void
+set_texture(id self, SEL _cmd, uint32_t stage, id texture, unsigned long index)
+{
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	struct b2l_mtl_texture *mt = mesa_texture(texture);
+	if (mc == NULL) {
+		return;
+	}
+	if (mt == NULL && texture != nil) {
+		foreign(mc, _cmd, texture);
+		return;
+	}
+	mtl->cmdbuf_set_texture(mc, stage, (uint32_t)index, mt);
+}
+
+static void
+set_sampler(id self, SEL _cmd, uint32_t stage, id sampler, unsigned long index)
+{
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	struct b2l_mtl_sampler *ms = mesa_sampler(sampler);
+	if (mc == NULL) {
+		return;
+	}
+	if (ms == NULL && sampler != nil) {
+		foreign(mc, _cmd, sampler);
+		return;
+	}
+	mtl->cmdbuf_set_sampler(mc, stage, (uint32_t)index, ms);
+}
+
+static void
+render_vertex_texture(id self, SEL _cmd, id texture, unsigned long index)
+{
+	set_texture(self, _cmd, B2L_MTL_VERTEX, texture, index);
+}
+
+static void
+render_fragment_texture(id self, SEL _cmd, id texture, unsigned long index)
+{
+	set_texture(self, _cmd, B2L_MTL_FRAGMENT, texture, index);
+}
+
+static void
+render_vertex_textures(id self, SEL _cmd, const id *textures, CFRange range)
+{
+	for (CFIndex i = 0; textures != NULL && i < range.length; i++) {
+		set_texture(self, _cmd, B2L_MTL_VERTEX, textures[i], (unsigned long)(range.location + i));
+	}
+}
+
+static void
+render_fragment_textures(id self, SEL _cmd, const id *textures, CFRange range)
+{
+	for (CFIndex i = 0; textures != NULL && i < range.length; i++) {
+		set_texture(self, _cmd, B2L_MTL_FRAGMENT, textures[i], (unsigned long)(range.location + i));
+	}
+}
+
+static void
+render_vertex_sampler(id self, SEL _cmd, id sampler, unsigned long index)
+{
+	set_sampler(self, _cmd, B2L_MTL_VERTEX, sampler, index);
+}
+
+static void
+render_fragment_sampler(id self, SEL _cmd, id sampler, unsigned long index)
+{
+	set_sampler(self, _cmd, B2L_MTL_FRAGMENT, sampler, index);
+}
+
+static void
+render_vertex_samplers(id self, SEL _cmd, const id *samplers, CFRange range)
+{
+	for (CFIndex i = 0; samplers != NULL && i < range.length; i++) {
+		set_sampler(self, _cmd, B2L_MTL_VERTEX, samplers[i], (unsigned long)(range.location + i));
+	}
+}
+
+static void
+render_fragment_samplers(id self, SEL _cmd, const id *samplers, CFRange range)
+{
+	for (CFIndex i = 0; samplers != NULL && i < range.length; i++) {
+		set_sampler(self, _cmd, B2L_MTL_FRAGMENT, samplers[i], (unsigned long)(range.location + i));
+	}
+}
+
+/* Core Animation's own (MTLRenderCommandEncoderSPI): a texture and a sampler
+ * in one message. */
+static void
+render_fragment_texture_sampler(id self, SEL _cmd, id texture, unsigned long texture_index, id sampler,
+    unsigned long sampler_index)
+{
+	set_texture(self, _cmd, B2L_MTL_FRAGMENT, texture, texture_index);
+	set_sampler(self, _cmd, B2L_MTL_FRAGMENT, sampler, sampler_index);
+}
+
+typedef struct {
+	double x, y, width, height, znear, zfar;
+} mtl_viewport;
+
+typedef struct {
+	unsigned long x, y, width, height;
+} mtl_scissor;
+
+static void
+render_viewport(id self, SEL _cmd, mtl_viewport v)
+{
+	(void)_cmd;
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	if (mc != NULL) {
+		struct b2l_mtl_viewport viewport = { v.x, v.y, v.width, v.height, v.znear, v.zfar };
+		mtl->cmdbuf_set_viewport(mc, &viewport);
+	}
+}
+
+/* The first viewport only: the Mali draws to one. */
+static void
+render_viewports(id self, SEL _cmd, const mtl_viewport *viewports, unsigned long count)
+{
+	if (viewports != NULL && count != 0) {
+		render_viewport(self, _cmd, viewports[0]);
+	}
+}
+
+static void
+render_scissor(id self, SEL _cmd, mtl_scissor r)
+{
+	(void)_cmd;
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	if (mc != NULL) {
+		mtl->cmdbuf_set_scissor(mc, (uint32_t)r.x, (uint32_t)r.y, (uint32_t)r.width, (uint32_t)r.height);
+	}
+}
+
+static void
+set_raster(id self, uint32_t which, unsigned long value)
 {
 	struct b2l_mtl_cmdbuf *mc = recording(self);
 	if (mc != NULL) {
-		mtl->cmdbuf_unsupported(mc, sel_getName(_cmd));
-	}
-	if (first_time(_cmd)) {
-		say("-%s: draws are M2b, recorded as not implemented", sel_getName(_cmd));
+		mtl->cmdbuf_set_raster(mc, which, (uint32_t)value);
 	}
 }
 
 static void
-render_draw3(id self, SEL _cmd, unsigned long a, unsigned long b, unsigned long c)
+render_cull(id self, SEL _cmd, unsigned long mode)
 {
-	(void)a;
-	(void)b;
-	(void)c;
-	render_draw(self, _cmd);
+	(void)_cmd;
+	set_raster(self, B2L_MTL_CULL, mode);
 }
 
 static void
-render_draw4(id self, SEL _cmd, unsigned long a, unsigned long b, unsigned long c, unsigned long d)
+render_winding(id self, SEL _cmd, unsigned long winding)
 {
+	(void)_cmd;
+	set_raster(self, B2L_MTL_WINDING, winding);
+}
+
+static void
+render_fill(id self, SEL _cmd, unsigned long mode)
+{
+	(void)_cmd;
+	set_raster(self, B2L_MTL_FILL, mode);
+}
+
+static void
+render_depth_clip(id self, SEL _cmd, unsigned long mode)
+{
+	(void)_cmd;
+	set_raster(self, B2L_MTL_DEPTH_CLIP, mode);
+}
+
+/* Depth bias is not applied yet (logged once): Core Animation sets it in
+ * one place. */
+static void
+render_depth_bias(id self, SEL _cmd, float bias, float slope, float clamp)
+{
+	(void)self;
+	if ((bias != 0.0f || slope != 0.0f || clamp != 0.0f) && first_time(_cmd)) {
+		say("-setDepthBias:%g slopeScale:%g clamp:%g not applied yet", (double)bias, (double)slope,
+		    (double)clamp);
+	}
+}
+
+static void
+render_depth_stencil(id self, SEL _cmd, id state)
+{
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	struct b2l_mtl_depth_stencil *md = mesa_depth_stencil(state);
+	if (mc == NULL) {
+		return;
+	}
+	if (md == NULL && state != nil) {
+		foreign(mc, _cmd, state);
+		return;
+	}
+	mtl->cmdbuf_set_depth_stencil(mc, md);
+}
+
+static void
+render_stencil_refs(id self, SEL _cmd, uint32_t front, uint32_t back)
+{
+	(void)_cmd;
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	if (mc != NULL) {
+		mtl->cmdbuf_set_stencil_ref(mc, front, back);
+	}
+}
+
+static void
+render_stencil_ref(id self, SEL _cmd, uint32_t value)
+{
+	render_stencil_refs(self, _cmd, value, value);
+}
+
+static void
+render_blend_color(id self, SEL _cmd, float red, float green, float blue, float alpha)
+{
+	(void)_cmd;
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	if (mc != NULL) {
+		const float rgba[4] = { red, green, blue, alpha };
+		mtl->cmdbuf_set_blend_color(mc, rgba);
+	}
+}
+
+/* useResource:, useHeap:, barriers: nothing to do here (one queue, jobs run
+ * to their end). */
+static void
+render_ignore_id_number(id self, SEL _cmd, id object, unsigned long value)
+{
+	(void)self;
+	(void)_cmd;
+	(void)object;
+	(void)value;
+}
+
+static void
+render_ignore_id_number2(id self, SEL _cmd, id object, unsigned long a, unsigned long b)
+{
+	(void)self;
+	(void)_cmd;
+	(void)object;
+	(void)a;
+	(void)b;
+}
+
+static void
+render_ignore_numbers3(id self, SEL _cmd, unsigned long a, unsigned long b, unsigned long c)
+{
+	(void)self;
+	(void)_cmd;
 	(void)a;
 	(void)b;
 	(void)c;
-	(void)d;
-	render_draw(self, _cmd);
+}
+
+/* Visibility results (occlusion queries) are not counted yet. */
+static void
+render_visibility(id self, SEL _cmd, unsigned long mode, unsigned long offset)
+{
+	(void)self;
+	(void)offset;
+	if (mode != 0 && first_time(_cmd)) {
+		say("-setVisibilityResultMode:%lu not counted yet", mode);
+	}
+}
+
+static void
+draw(id self, SEL _cmd, unsigned long type, unsigned long start, unsigned long count, unsigned long instances,
+    unsigned long base_instance, id index_buffer, unsigned long index_type, unsigned long index_offset,
+    long base_vertex)
+{
+	struct b2l_mtl_cmdbuf *mc = recording(self);
+	if (mc == NULL) {
+		return;
+	}
+	struct b2l_mtl_draw d;
+	memset(&d, 0, sizeof(d));
+	d.primitive = (uint32_t)type;
+	d.start = (uint32_t)start;
+	d.count = (uint32_t)count;
+	d.instances = (uint32_t)instances;
+	d.base_instance = (uint32_t)base_instance;
+	d.base_vertex = (int32_t)base_vertex;
+	if (index_buffer != nil) {
+		d.index_buffer = mesa_buffer(index_buffer);
+		if (d.index_buffer == NULL) {
+			foreign(mc, _cmd, index_buffer);
+			return;
+		}
+		d.index_type = (uint32_t)index_type;
+		d.index_offset = index_offset;
+	}
+	mtl->cmdbuf_draw(mc, &d);
+}
+
+static void
+render_draw3(id self, SEL _cmd, unsigned long type, unsigned long start, unsigned long count)
+{
+	draw(self, _cmd, type, start, count, 1, 0, nil, 0, 0, 0);
+}
+
+static void
+render_draw4(id self, SEL _cmd, unsigned long type, unsigned long start, unsigned long count,
+    unsigned long instances)
+{
+	draw(self, _cmd, type, start, count, instances, 0, nil, 0, 0, 0);
+}
+
+static void
+render_draw5(id self, SEL _cmd, unsigned long type, unsigned long start, unsigned long count,
+    unsigned long instances, unsigned long base_instance)
+{
+	draw(self, _cmd, type, start, count, instances, base_instance, nil, 0, 0, 0);
 }
 
 static void
 render_draw_indexed(id self, SEL _cmd, unsigned long type, unsigned long count, unsigned long index_type,
     id buffer, unsigned long offset)
 {
-	(void)type;
-	(void)count;
-	(void)index_type;
-	(void)buffer;
-	(void)offset;
-	render_draw(self, _cmd);
+	draw(self, _cmd, type, 0, count, 1, 0, buffer, index_type, offset, 0);
 }
 
 static void
 render_draw_indexed_instanced(id self, SEL _cmd, unsigned long type, unsigned long count,
     unsigned long index_type, id buffer, unsigned long offset, unsigned long instances)
 {
-	(void)instances;
-	render_draw_indexed(self, _cmd, type, count, index_type, buffer, offset);
+	draw(self, _cmd, type, 0, count, instances, 0, buffer, index_type, offset, 0);
+}
+
+static void
+render_draw_indexed_base(id self, SEL _cmd, unsigned long type, unsigned long count, unsigned long index_type,
+    id buffer, unsigned long offset, unsigned long instances, long base_vertex, unsigned long base_instance)
+{
+	draw(self, _cmd, type, 0, count, instances, base_instance, buffer, index_type, offset, base_vertex);
 }
 
 static void
@@ -2480,13 +2904,64 @@ register_object_classes(Class device)
 		class_addMethod(c, S("pushDebugGroup:"), (IMP)encoder_debug_group, "v@:@");
 		class_addMethod(c, S("popDebugGroup"), (IMP)object_nothing, "v@:");
 		class_addMethod(c, S("insertDebugSignpost:"), (IMP)encoder_debug_group, "v@:@");
+		class_addMethod(c, S("setRenderPipelineState:"), (IMP)render_set_pipeline, "v@:@");
+		class_addMethod(c, S("setVertexBuffer:offset:atIndex:"), (IMP)render_vertex_buffer, "v@:@QQ");
+		class_addMethod(c, S("setFragmentBuffer:offset:atIndex:"), (IMP)render_fragment_buffer, "v@:@QQ");
+		class_addMethod(c, S("setVertexBuffers:offsets:withRange:"), (IMP)render_vertex_buffers,
+		    "v@:r^@r^Q{_NSRange=QQ}");
+		class_addMethod(c, S("setFragmentBuffers:offsets:withRange:"), (IMP)render_fragment_buffers,
+		    "v@:r^@r^Q{_NSRange=QQ}");
+		class_addMethod(c, S("setVertexBufferOffset:atIndex:"), (IMP)render_vertex_buffer_offset, "v@:QQ");
+		class_addMethod(c, S("setFragmentBufferOffset:atIndex:"), (IMP)render_fragment_buffer_offset, "v@:QQ");
+		class_addMethod(c, S("setVertexBytes:length:atIndex:"), (IMP)render_vertex_bytes, "v@:r^vQQ");
+		class_addMethod(c, S("setFragmentBytes:length:atIndex:"), (IMP)render_fragment_bytes, "v@:r^vQQ");
+		class_addMethod(c, S("setVertexTexture:atIndex:"), (IMP)render_vertex_texture, "v@:@Q");
+		class_addMethod(c, S("setFragmentTexture:atIndex:"), (IMP)render_fragment_texture, "v@:@Q");
+		class_addMethod(c, S("setVertexTextures:withRange:"), (IMP)render_vertex_textures, "v@:r^@{_NSRange=QQ}");
+		class_addMethod(c, S("setFragmentTextures:withRange:"), (IMP)render_fragment_textures,
+		    "v@:r^@{_NSRange=QQ}");
+		class_addMethod(c, S("setVertexSamplerState:atIndex:"), (IMP)render_vertex_sampler, "v@:@Q");
+		class_addMethod(c, S("setFragmentSamplerState:atIndex:"), (IMP)render_fragment_sampler, "v@:@Q");
+		class_addMethod(c, S("setVertexSamplerStates:withRange:"), (IMP)render_vertex_samplers,
+		    "v@:r^@{_NSRange=QQ}");
+		class_addMethod(c, S("setFragmentSamplerStates:withRange:"), (IMP)render_fragment_samplers,
+		    "v@:r^@{_NSRange=QQ}");
+		class_addMethod(c, S("setFragmentTexture:atTextureIndex:samplerState:atSamplerIndex:"),
+		    (IMP)render_fragment_texture_sampler, "v@:@Q@Q");
+		class_addMethod(c, S("setViewport:"), (IMP)render_viewport, "v@:{?=dddddd}");
+		class_addMethod(c, S("setViewports:count:"), (IMP)render_viewports, "v@:r^{?=dddddd}Q");
+		class_addMethod(c, S("setScissorRect:"), (IMP)render_scissor, "v@:{?=QQQQ}");
+		class_addMethod(c, S("setCullMode:"), (IMP)render_cull, "v@:Q");
+		class_addMethod(c, S("setFrontFacingWinding:"), (IMP)render_winding, "v@:Q");
+		class_addMethod(c, S("setTriangleFillMode:"), (IMP)render_fill, "v@:Q");
+		class_addMethod(c, S("setDepthClipMode:"), (IMP)render_depth_clip, "v@:Q");
+		class_addMethod(c, S("setDepthBias:slopeScale:clamp:"), (IMP)render_depth_bias, "v@:fff");
+		class_addMethod(c, S("setDepthStencilState:"), (IMP)render_depth_stencil, "v@:@");
+		class_addMethod(c, S("setStencilReferenceValue:"), (IMP)render_stencil_ref, "v@:I");
+		class_addMethod(c, S("setStencilFrontReferenceValue:backReferenceValue:"), (IMP)render_stencil_refs,
+		    "v@:II");
+		class_addMethod(c, S("setBlendColorRed:green:blue:alpha:"), (IMP)render_blend_color, "v@:ffff");
+		class_addMethod(c, S("setVisibilityResultMode:offset:"), (IMP)render_visibility, "v@:QQ");
+		class_addMethod(c, S("useResource:usage:"), (IMP)render_ignore_id_number, "v@:@Q");
+		class_addMethod(c, S("useResource:usage:stages:"), (IMP)render_ignore_id_number2, "v@:@QQ");
+		class_addMethod(c, S("useHeap:"), (IMP)object_nothing_id, "v@:@");
+		class_addMethod(c, S("useHeap:stages:"), (IMP)render_ignore_id_number, "v@:@Q");
+		class_addMethod(c, S("textureBarrier"), (IMP)object_nothing, "v@:");
+		class_addMethod(c, S("memoryBarrierWithScope:afterStages:beforeStages:"), (IMP)render_ignore_numbers3,
+		    "v@:QQQ");
 		class_addMethod(c, S("drawPrimitives:vertexStart:vertexCount:"), (IMP)render_draw3, "v@:QQQ");
 		class_addMethod(c, S("drawPrimitives:vertexStart:vertexCount:instanceCount:"), (IMP)render_draw4, "v@:QQQQ");
+		class_addMethod(c, S("drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:"),
+		    (IMP)render_draw5, "v@:QQQQQ");
 		class_addMethod(c, S("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:"),
 		    (IMP)render_draw_indexed, "v@:QQQ@Q");
 		class_addMethod(c,
 		    S("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:"),
 		    (IMP)render_draw_indexed_instanced, "v@:QQQ@QQ");
+		class_addMethod(c,
+		    S("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:instanceCount:baseVertex:"
+		      "baseInstance:"),
+		    (IMP)render_draw_indexed_base, "v@:QQQ@QQqQ");
 		objc_registerClassPair(c);
 		gRenderEncoderClass = c;
 	}
