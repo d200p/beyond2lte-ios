@@ -107,7 +107,8 @@ target="$src/src/gallium/targets/b2l"
 mkdir -p "$target"
 cp "$repo/scripts/mesa/b2l-target/meson.build" "$repo/scripts/mesa/b2l-target/b2l_mesa.c" \
   "$repo/scripts/mesa/b2l-target/b2l_eagl.c" "$repo/scripts/mesa/b2l-target/b2l_memset.c" \
-  "$repo/scripts/mesa/b2l-target/b2l_mtl_sweep.c" \
+  "$repo/scripts/mesa/b2l-target/b2l_mtl_sweep.c" "$repo/scripts/mesa/b2l-target/b2l_mtl.c" \
+  "$repo/scripts/mesa/b2l-target/b2l_mtl.h" \
   "$repo/scripts/mesa/b2l-drm/b2l_drm.c" "$repo/scripts/mesa/b2l-drm/b2l_drm.h" \
   "$repo/xnu-overlay/iokit/Kernel/arm/b2l_mali_uapi.h" "$target/"
 # The EAGL layer's GLI dispatch table, from the build machine's macOS SDK

@@ -39,8 +39,11 @@ def main():
                     '-fno-ptrauth-calls', '-fno-ptrauth-intrinsics',
                     '-I', str(ROOT / 'xnu-overlay/iokit/Kernel/arm'),
                     '-framework', 'CoreFoundation', '-framework', 'IOKit',
+                    # S10 port: Metal M2a's test (userspace/b2l-mtltest.c) is a Metal client
+                    '-framework', 'IOSurface', '-lobjc',
                     '-install_name', '/usr/local/lib/b2l-gpu.dylib',
-                    str(ROOT / 'userspace/b2l-gpu.c'), '-o', str(a.output)], check=True)
+                    str(ROOT / 'userspace/b2l-gpu.c'), str(ROOT / 'userspace/b2l-mtltest.c'),
+                    '-o', str(a.output)], check=True)
     subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(a.output)], check=True)
     data = a.output.read_bytes()
     if len(data) > LIMIT:
@@ -65,12 +68,16 @@ def main():
     # S10 port: Metal M1 (docs/metal-on-panfrost.md), the plug-in Metal loads when
     # B2LMali's IOAcceleratorES names it (userspace/b2l-metal.c): the executable and
     # Info.plist of /System/Library/Extensions/B2LMetal-<hash>.bundle, the hash over both.
+    # M2: it opens libb2l-mesa (B2L_MESA_LIBRARY) and takes its b2l_mtl_* table
+    # (scripts/mesa/b2l-target/b2l_mtl.h); blocks for the completion handlers.
     metal_out = a.output.parent / 'B2LMetal'
     subprocess.run(['xcrun', '--sdk', 'iphoneos', 'clang', '-target', 'arm64e-apple-ios26.0', '-isysroot', sdk,
+                    *defines,
                     '-O2', '-Wall', '-Wextra', '-Werror', '-dynamiclib', '-fno-ptrauth-returns',
-                    '-fno-ptrauth-calls', '-fno-ptrauth-intrinsics',
+                    '-fno-ptrauth-calls', '-fno-ptrauth-intrinsics', '-fblocks',
                     '-I', str(ROOT / 'xnu-overlay/iokit/Kernel/arm'),
-                    '-framework', 'CoreFoundation', '-framework', 'IOKit', '-lobjc',
+                    '-I', str(ROOT / 'scripts/mesa/b2l-target'),
+                    '-framework', 'CoreFoundation', '-framework', 'IOKit', '-framework', 'IOSurface', '-lobjc',
                     '-install_name', '@rpath/B2LMetal',
                     str(ROOT / 'userspace/b2l-metal.c'), '-o', str(metal_out)], check=True)
     subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(metal_out)], check=True)

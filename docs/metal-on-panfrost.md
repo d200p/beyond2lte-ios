@@ -238,3 +238,70 @@ Also in this build, for the OpenGL ES path: `gli_tex_image2D` and
 the upload reads is mapped and readable, and upload nothing otherwise -- boot
 65's backboardd crash (memcpy under `_mesa_TexImage2D`), the check UniXNU's
 AdrenoMetal added on 18 November for client buffers.
+
+## M1 result (boot 67, build 66)
+
+- The kernel published `B2LMetal-431d96f31bbd.bundle` (error 0) and registered
+  the IOAcceleratorES at level 1.
+- The test child: `MTLCreateSystemDefaultDevice()` returned a `B2LMetalDevice`
+  in 80 ms; `-name` "Mali-G76 MP12 (Panfrost, S10)", `-registryID` 8451 (the
+  accelerator port); `-newCommandQueue` a `B2LMetalQueue`. While adding the
+  device Metal asked one message the class has no method for: `-featureProfile`
+  (answered 0). `_MTLDevice` itself answers the capability questions:
+  `supportsTileShaders` 0, `supportsRasterOrderGroups` 0,
+  `supportsNativeHardwareFP16` 0, `supportsFamily:` Apple4 0 -- and
+  `supportsMemorylessRenderTargets` 1, which M2 has to answer itself.
+- backboardd, SpringBoard, chronod, iconservicesagent, WidgetRenderer, Weather
+  and MobilePhone loaded the bundle, were not shown the device, and stayed as
+  they were. No crash in the boot.
+- With an IOAcceleratorES present Core Animation stops looking for one sooner:
+  backboardd made its OpenGL ES renderer at about 49 s instead of 59 s; the
+  context was ready at about 61 s in both boots.
+- The texture upload page check did not have to act (Weather opened).
+
+## M2a as written (build 67)
+
+M2 in two builds: M2a the objects, the shaders through Gallium and render
+passes that only clear; M2b the draws.
+
+- `scripts/mesa/b2l-target/b2l_mtl.h`, `b2l_mtl.c`: the Gallium half, one
+  table (`b2l_mtl_api(1)`) the plug-in takes with one dlsym. The process's
+  Panfrost screen (`b2l_fscreen`, the EAGL layer's) and a context of its own
+  under a lock; buffers mapped once, persistently, for `-contents`; textures,
+  IOSurfaces imported as the EAGL layer imports them; sampler and
+  depth-stencil CSOs; libraries read by the AIR frontend (fat or thin, from a
+  file or bytes); functions with their constants (by index, or by name through
+  `air_module_function_constant_decls`), translated when a pipeline first needs
+  them and kept; render pipelines: fragment inputs linked to vertex outputs by
+  `air_varying.link`, system values lowered, the half-pixel position, driver
+  locations, then Panfrost's own `create_vs_state` / `create_fs_state` (which
+  compile the default variant there and then), blend and vertex element CSOs;
+  command buffers recorded as a list and executed in order at commit (render
+  passes: framebuffer, Clear load actions as `clear` per target; buffer copy
+  and fill; texture copy; buffer to texture and back), then a flush with a
+  fence. B2LMali runs each job to its end, so commit returns with the GPU's
+  work done.
+- `scripts/mesa/air`: two frontend additions (README): constant names and
+  types; the name varyings link by.
+- `userspace/b2l-metal.c`: buffers, textures (IOSurface ones), samplers,
+  depth-stencil states, libraries (URL, file, data, default), functions
+  (`newFunctionWithName:`, `...constantValues:error:`,
+  `newFunctionWithDescriptor:error:`, the constants read through Metal's own
+  `newIndexedConstantArray` / `newNamedConstantArray`), render pipeline states,
+  command buffers (commit, handlers on a serial queue, status, error), render,
+  blit and compute encoders. Every class but the device and the queue is made
+  on NSObject, so nothing of Metal's private bases runs uninitialised. Draws
+  and compute are recorded as not implemented: the command buffer ends in
+  error. `supportsMemorylessRenderTargets` is NO; a few limits answered.
+- `userspace/b2l-mtltest.c`: the test child's steps, each logged with ok or
+  FAILED ("mtl M2: test:"): buffers zeroed and from bytes; a blit copy and
+  fill; a 64 x 64 BGRA8 texture written and read back; an IOSurface texture;
+  render passes clearing the IOSurface to (0.25, 0.5, 0.75, 1) and the texture
+  to red, read back pixel by pixel; a texture copy; a sampler; QuartzCore's
+  library; pipelines std_vert0 + attachment_clear and fixed_vert_lph_spc +
+  fixed_frag_lph_cph with `fc_texture_function` = 0 given by name. The child
+  may run 120 s.
+
+Risk: the test's jobs share the GPU address space with backboardd's OpenGL ES
+work; a job that faults stops it until the GPU is reset, which would freeze
+the interface until a reboot.
