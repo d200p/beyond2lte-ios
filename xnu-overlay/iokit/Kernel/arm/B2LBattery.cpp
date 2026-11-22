@@ -15,7 +15,6 @@
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/pwr_mgt/IOPMPowerSource.h>
-#include <IOKit/system.h>               /* snprintf, memcpy (as B2LFramebuffer.cpp) */
 #include <kern/clock.h>
 #include <pexpert/pexpert.h>
 #include <arm64/b2l_diag.h>
@@ -95,10 +94,9 @@ class B2LBattery : public IOService {
 	IOWorkLoop *loop;
 	IOTimerEventSource *timer;
 	AppleSmartBattery *battery;
-	unsigned failures, logs, transferLogs, keepAliveLogs, chgLogs;
+	unsigned failures, logs, transferLogs, keepAliveLogs;
 	struct b2l_battery_state last;
-	bool published, keepAlive, chgTraced;
-	uint8_t chgRegs[18];            /* S10 port: charger INT_OK..CNFG_12, last logged */
+	bool published, keepAlive;
 public:
 	volatile bool halting;          /* the power-off path owns the bus: the poll stands down */
 	void haltKick();
@@ -115,7 +113,6 @@ private:
 	bool readFG(uint8_t reg, uint16_t *out);
 	bool writeReg(uint8_t addr, uint8_t reg, uint8_t value);
 	void chargerKeepAlive(uint8_t int_ok, uint8_t details01);
-	void chargerTrace(const struct b2l_battery_state *s);
 	const char *bringUpBus();
 	void sample();
 	static void poll(OSObject *owner, IOTimerEventSource *sender);
@@ -209,35 +206,6 @@ B2LBattery::chargerKeepAlive(uint8_t int_ok, uint8_t details01)
 	}
 }
 
-/* S10 port: boot 69 lost the charger 1 h 41 min after it was plugged in, and
- * charged at only ~200 mA net; the log kept no register for either. Read
- * only: CHG_INT_OK..CHG_CNFG_12 (0xB2..0xC3: status, details 00-02, the
- * mode, charge current, top-off, regulation voltage, watchdog, input current
- * limit and input selection) are logged with the uptime whenever they change.
- * CNFG_06, which the watchdog kick writes, is shown but not compared. */
-void
-B2LBattery::chargerTrace(const struct b2l_battery_state *s)
-{
-	uint8_t regs[sizeof(chgRegs)];
-	for (unsigned off = 0; off < sizeof(regs); off += 8) {
-		unsigned n = sizeof(regs) - off < 8 ? (unsigned)(sizeof(regs) - off) : 8u;
-		if (!readRegs(B2L_CHG_ADDR, (uint8_t)(B2L_CHG_INT_OK + off), regs + off, n)) return;
-	}
-	bool changed = !chgTraced;
-	for (unsigned i = 0; i < sizeof(regs); i++) {
-		if (i != B2L_CHG_CNFG_06 - B2L_CHG_INT_OK && regs[i] != chgRegs[i]) changed = true;
-	}
-	memcpy(chgRegs, regs, sizeof(regs));
-	chgTraced = true;
-	if (!changed || chgLogs >= 300) return;
-	chgLogs++;
-	char hex[3 * sizeof(regs) + 1];
-	for (unsigned i = 0; i < sizeof(regs); i++) snprintf(hex + 3 * i, 4, "%02x ", regs[i]);
-	hex[3 * sizeof(regs) - 1] = 0;              /* drop the last space */
-	b2l_diag_record("B2L BATTERY CHG: t=%llus %u%% %dmA ext=%d charging=%d full=%d regs 0xb2..0xc3: %s\n",
-	    (unsigned long long)(uptimeUS() / 1000000), s->percent, s->milliamps, s->external, s->charging, s->full, hex);
-}
-
 bool
 B2LBattery::readFG(uint8_t reg, uint16_t *out)
 {
@@ -317,7 +285,6 @@ B2LBattery::sample()
 		return;
 	}
 	failures = 0;
-	if (raw.charger_ok) chargerTrace(&s);
 	if (!published || s.percent != last.percent || s.external != last.external ||
 	    s.charging != last.charging || s.full != last.full) {
 		if (logs++ < 200) {
