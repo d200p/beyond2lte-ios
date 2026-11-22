@@ -111,6 +111,19 @@ typedef uintptr_t vm_offset_t;
 typedef unsigned long vm_size_t;
 #define VM_WIMG_IO 0x66
 #define NSEC_PER_MSEC 1000000u
+#define NSEC_PER_SEC 1000000000u
+/* S10 port: mode 11 runs in a kernel thread; these never start one. */
+#define KERN_SUCCESS 0
+typedef int kern_return_t;
+typedef int wait_result_t;
+typedef struct host_thread *thread_t;
+typedef void (*thread_continue_t)(void *, wait_result_t);
+static unsigned thread_starts;
+static kern_return_t kernel_thread_start(thread_continue_t fn, void *arg, thread_t *out) {
+    (void)fn; (void)arg; (void)out; thread_starts++; assert(0); return 1;
+}
+static void thread_deallocate(thread_t thread) { (void)thread; assert(0); }
+void read_frandom(void *p, unsigned n) { (void)p; (void)n; assert(0); }
 static _Alignas(16384) uint32_t memory[5][4096];
 static const uintptr_t physical[] = {0x15860000, 0x10430000, 0x13c40000, 0x13c00000, 0x13ed0000};
 static unsigned maps, unmapped, reads, fail_map;
@@ -201,10 +214,15 @@ static void reset(int requested, unsigned fail) {
     memset(memory, 0, sizeof(memory)); memset(logs, 0, sizeof(logs));
 }
 int main(void) {
-    const int disabled[] = {-1, 0, 11, 12, -2};
+    const int disabled[] = {-1, 0, 12, 13, -2};
     for (unsigned i = 0; i < sizeof(disabled)/sizeof(disabled[0]); i++) {
         reset(disabled[i], 0); b2l_wifi_diag_start();
         assert(!maps && !reads && !writes && !unmapped && strstr(logs, "disabled"));
+    }
+    /* Modes 10 and 11 need the staged private input before any MMIO or thread. */
+    for (int m = 10; m <= 11; m++) {
+        reset(m, 0); b2l_wifi_diag_start();
+        assert(!maps && !reads && !writes && !thread_starts && strstr(logs, "firmware input absent/invalid"));
     }
     for (unsigned i = 1; i <= 4; i++) {
         reset(1, i); b2l_wifi_diag_start();

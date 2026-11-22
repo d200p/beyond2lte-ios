@@ -357,14 +357,14 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     if(CacheSize){Dt.native_cache_base=CachePhysical;Dt.native_cache_size=CacheSize;}
     UINT64 WifiPhysical=ALIGN_VALUE(CachePhysical+CacheSize,4096);
     if(WifiFirmwareSize){
-        if(WifiFirmwareSize!=B2L_WIFI_FIRMWARE_BYTES||WifiPhysical<Base||
+        if(!b2l_wifi_attachment_valid(WifiFirmwareSize)||WifiPhysical<Base||
            WifiPhysical-Base>ArenaSize||WifiFirmwareSize+B2L_DT_SPACE+sizeof(*Args)+8192>ArenaSize-(WifiPhysical-Base)){
             Status=EFI_BAD_BUFFER_SIZE;goto Fail;
         }
         CopyMem((VOID*)(UINTN)WifiPhysical,WifiFirmware,WifiFirmwareSize);
         Dt.wifi_firmware_base=WifiPhysical;Dt.wifi_firmware_size=WifiFirmwareSize;
         FreePool(WifiFirmware);WifiFirmware=NULL;
-        Print(L"B2L: staged private WiFi firmware, %u bytes; execution remains disabled\r\n",(UINT32)WifiFirmwareSize);
+        Print(L"B2L: staged private WiFi firmware attachment, %u bytes\r\n",(UINT32)WifiFirmwareSize);
     }
     DtPhysical = ALIGN_VALUE(WifiPhysical+WifiFirmwareSize, 4096);
     B2lTouchHandoff(Dt.touch_status);
@@ -429,8 +429,12 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 /* Wi-Fi mode 10 (S10+ branch, 2026-11-10): the halted R4 gets the
                  * private firmware attachment copied to its TCM and read back. A
                  * BOOT without the attachment (every CI image) skips all Wi-Fi
-                 * MMIO; scripts/attach-wifi-firmware.py makes the private one. */
-                "b2l_wifi_diag=10 "
+                 * MMIO; scripts/attach-wifi-firmware.py makes the private one.
+                 * S10 port, mode 11 (docs/wifi-bringup.md): 360 s after start,
+                 * the same download, then the firmware booted with the board
+                 * NVRAM from the attachment (B2LFW002) for about 3 s, its shared
+                 * area and console read, and the R4 halted again. */
+                "b2l_wifi_diag=11 "
                 /* Metal M1 (docs/metal-on-panfrost.md): B2LMali publishes an
                  * IOAcceleratorES naming the B2LMetal plug-in, and backboardd's
                  * library asks Metal for its device in a child process 60 s

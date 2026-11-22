@@ -103,6 +103,9 @@ static void reset(int fw) {
     if(fw){memcpy(p+288,"B2LWIFI1",8);p[296]=2;p[301]=1;
       memcpy(p+302,"B2LFW001",8);le32(p+310,B2L_WIFI_FIRMWARE_BYTES);
       memset(p+320+4096,0x5a,B2L_WIFI_FIRMWARE_BYTES);}
+    /* S10 port: B2LFW002, 64 NVRAM bytes after the firmware. */
+    if(fw==2){p[309]='2';p[314]=64;p[315]=0;p[316]=0xbf;p[317]=0xff;
+      memset(p+320+4096+B2L_WIFI_FIRMWARE_BYTES,0x5a,64);}
 }
 static EFI_STATUS run(unsigned expect_firmware) {
     void *k=(void*)1,*f=(void*)1;size_t n=123,fn=123;uint8_t seed[256],mac[6];
@@ -110,7 +113,7 @@ static EFI_STATUS run(unsigned expect_firmware) {
     if(s){assert(!k&&!f&&!n&&!fn);}
     else {assert(n==4096&&!memcmp(k,image+6144+320,n));
       for(unsigned i=0;i<256;i++)assert(seed[i]==(uint8_t)i);
-      if(expect_firmware){assert(fn==B2L_WIFI_FIRMWARE_BYTES&&f&&mac[0]==2&&mac[5]==1);
+      if(expect_firmware){assert(fn==B2L_WIFI_FIRMWARE_BYTES+(expect_firmware==2 ? 64u:0u)&&f&&mac[0]==2&&mac[5]==1);
         for(size_t i=0;i<fn;i++)assert(((uint8_t*)f)[i]==0x5a);
         FreePool(f);}
       else assert(!f&&!fn);
@@ -120,6 +123,11 @@ static EFI_STATUS run(unsigned expect_firmware) {
 int main(void) {
     reset(0);assert(run(0)==0&&reads==3);
     reset(1);assert(run(1)==0&&reads==4);
+    reset(2);assert(run(2)==0&&reads==4);
+    for(unsigned i=14;i<32;i++){reset(2);image[6144+288+i]^=1;assert(run(0)==EFI_COMPROMISED_DATA);}
+    /* The firmware still fits, its 64 NVRAM bytes do not. */
+    reset(2);media.LastBlock=(6144+320+4096+B2L_WIFI_FIRMWARE_BYTES+63)/512-1;
+    assert(run(0)==EFI_COMPROMISED_DATA&&reads==2);
     reset(0);memset(image+6144+320+4096,0x5a,B2L_WIFI_FIRMWARE_BYTES);
     assert(run(0)==0&&reads==3); /* Stale tail is not an opt-in. */
     for(unsigned i=14;i<32;i++){reset(1);image[6144+288+i]^=1;assert(run(0)==EFI_COMPROMISED_DATA);}

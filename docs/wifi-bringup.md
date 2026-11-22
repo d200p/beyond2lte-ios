@@ -439,6 +439,61 @@ chip's OTP only when the interface comes up, and its boot log says
 "Couldn't find the nvram tag". Firmware execution (the next checkpoint)
 needs that answer.
 
+Mode 10 on the S10 (boot 68, build 67): the whole image went to TCM at
+`0x170000` and read back verified with the R4 halted, and every cleanup step
+verified.
+
+## S10: firmware boot (mode 11)
+
+The S10's loader now selects `b2l_wifi_diag=11`, which boots the copied
+firmware the way the Samsung kernel's `bcmdhd_101_16` does (LineageOS
+`android_kernel_samsung_exynos9820` at `a412cfaf`: `dhd_pcie.c`
+`dhdpcie_bus_write_vars`, `dhdpcie_wrt_rnd`, `dhdpcie_bus_download_state`,
+`dhdpcie_readshared`, `dhdpcie_readconsole`; `aiutils.c` `_ai_core_reset`;
+`bcmpcie.h` `pciedev_shared_t`; `hnd_cons.h`). The 4375 is not a
+multi-backplane chip (`siutils.h` `MULTIBP_CAP`), so no power requests are
+needed, and the R4 has one master wrapper (`0x18102000`), so its slave
+wrapper (`0x18109000`, EROM `+0x6c`) is not a second reset target (`ai_scan`
+fills `wrapba2` from slave wrappers only for cores without master wrappers).
+
+The NVRAM travels in the private attachment after the firmware (`B2LFW002`,
+[packaging](packaging.md)); XNU checks its layout and logs its entry count,
+`boardtype` and `boardrev`. Because a wedged link could cost the rest of the
+boot's results, mode 11 starts a kernel thread that sleeps 360 s, after the
+Metal test window, and then runs modes 1 to 10 unchanged. After the verified
+download:
+
+1. the NVRAM at `0x300000 - 4 - size`, the token
+   `(~(size/4) << 16) | (size/4)` at `0x2ffffc`, the seed record
+   `{0xfeedc0de, 128}` 8 bytes below the NVRAM and 128 random bytes below
+   that, every word read back, with the R4 checked halted first;
+2. backplane address 0: all ones means a secured vector and stops; otherwise
+   the image's first word is written there and read back;
+3. a 6 s pause, so these lines reach the disk before anything runs;
+4. `_ai_core_reset(0, 0)` on `0x18102000`: resetstatus (`+0x804`) idle, reset
+   asserted, ioctrl `FGC|CLOCK_EN`, reset released, ioctrl `CLOCK_EN`;
+5. up to 100 polls 20 ms apart of `0x2ffffc` until it holds neither the token
+   nor zero: the address of `pciedev_shared_t`;
+6. one second for the start-up messages, then only reads: the first eight
+   shared words (flags, trap, assert expression/file/line, console, msgtrace,
+   firmware ID), up to 4 KiB of console text before its write index, one log
+   line per firmware line, the assert strings, and the 20 trap words;
+7. `_ai_core_reset(CPUHALT, CPUHALT)` and the halted check, then the usual
+   cleanup and power-off.
+
+Bus mastering stays off on both sides, so the firmware cannot DMA; no ring,
+mailbox, doorbell or IRQ is set up and nothing is sent to it. Any failure
+before step 4 leaves the R4 halted; after it, the halt always runs on its own
+100 ms budget, and a failed halt is reported as a cleanup failure before the
+power-off. `tests/test_wifi_gen1.py` runs the sequence against a model R4 that
+publishes a shared area, a console and a trap record, and against a firmware
+that never answers, a lost vector write, a secured vector and a stuck
+resetstatus.
+
+The first S10 image with mode 11 attaches `nvram.txt_CS01_semco_b1`. The
+console's first lines should name the firmware and may show whether that
+board file suits this module.
+
 ## Recovery evidence
 
 With one rooted beyond2lte in TWRP, collect cached PCI IDs, resources, driver

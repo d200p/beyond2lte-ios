@@ -47,6 +47,17 @@ reports its physical range through `/chosen/b2l,wifi-firmware`. XNU validates
 the range and pinned SHA-256 before any Wi-Fi MMIO access. Firmware bytes and
 private address metadata are never CI inputs.
 
+S10 port, for Wi-Fi mode 11: the descriptor may instead be `B2LFW002`, the same
+firmware length, then a 16-bit NVRAM length, its 16-bit complement and two
+zero bytes, so a single flipped bit is rejected. The board NVRAM, processed as
+Linux DHD processes `nvram.txt` (`process_nvram` in `scripts/package-boot.py`:
+comments, carriage returns and empty lines dropped, each line ended by a NUL,
+padded to a word, one more NUL, rounded to a word), follows the firmware; it is
+a whole number of words, at most 32 KiB. The loader reads and stages both as
+one range. The NVRAM is not pinned by hash; the verifier and XNU check its
+layout (printable `name=value` entries, NUL padding, last word zero).
+`scripts/attach-wifi-firmware.py --nvram` writes this form.
+
 XNU requires all 256 seed bytes. Packaging obtains those bytes directly from
 `os.urandom(256)`; it does not repeat or pad a shorter seed. The loader rejects
 legacy `B2LXNU01` trailers, which supplied only 64 bytes, with a repackage error.

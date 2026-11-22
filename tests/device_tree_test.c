@@ -171,6 +171,11 @@ int main(void)
     assert(b2l_build_device_tree(small,sizeof(small),&c,&used)==-1);
     c.wifi_firmware_base=c.memory_base;c.wifi_firmware_size--;
     assert(b2l_build_device_tree(small,sizeof(small),&c,&used)==-1);
+    /* S10 port: NVRAM may follow, in whole words and at most 32 KiB. */
+    c.wifi_firmware_size=B2L_WIFI_FIRMWARE_BYTES+2;
+    assert(b2l_build_device_tree(small,sizeof(small),&c,&used)==-1);
+    c.wifi_firmware_size=B2L_WIFI_FIRMWARE_BYTES+32772;
+    assert(b2l_build_device_tree(small,sizeof(small),&c,&used)==-1);
     c.wifi_firmware_base=c.wifi_firmware_size=0;
     assert(b2l_build_device_tree(buf,sizeof(buf),&c,&used)==0);
     for(size_t capacity=0;capacity<used;++capacity) {

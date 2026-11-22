@@ -6,19 +6,41 @@
 #define B2L_WIFI_MAC_BYTES 6U
 #define B2L_BOOT_METADATA_BYTES 32U
 #define B2L_WIFI_FIRMWARE_BYTES 1297036U
+/* S10 port: Wi-Fi mode 11 boots that firmware, which needs the board NVRAM,
+ * DHD-processed, right after it in the same attachment (B2LFW002). */
+#define B2L_WIFI_NVRAM_MAX_BYTES 32768U
+/* The attachment is the firmware alone or followed by 4-byte-multiple NVRAM. */
+static inline int b2l_wifi_attachment_valid(unsigned long long size)
+{
+    if(size<B2L_WIFI_FIRMWARE_BYTES)return 0;
+    size-=B2L_WIFI_FIRMWARE_BYTES;
+    return size<=B2L_WIFI_NVRAM_MAX_BYTES&&!(size&3U);
+}
 /* Optional private firmware follows the Mach-O exactly. Explicit metadata
- * prevents stale bytes beyond a shorter BOOT image from becoming an input. */
+ * prevents stale bytes beyond a shorter BOOT image from becoming an input.
+ * B2LFW001: field[22..25] firmware size, field[26..31] zero.
+ * B2LFW002: the same, then field[26..27] NVRAM size, field[28..29] its
+ * complement, field[30..31] zero, so any single flipped bit is rejected.
+ * Returns the attachment's total size, 0 when absent, -1 when malformed. */
 static inline int b2l_boot_wifi_firmware(const unsigned char field[32])
 {
-    static const unsigned char tag[8]={'B','2','L','F','W','0','0','1'};
+    static const unsigned char tag[7]={'B','2','L','F','W','0','0'};
     unsigned any=0;
     for(unsigned i=14;i<32;i++)any|=field[i];
     if(!any)return 0;
-    for(unsigned i=0;i<8;i++)if(field[14+i]!=tag[i])return -1;
+    for(unsigned i=0;i<7;i++)if(field[14+i]!=tag[i])return -1;
     unsigned size=(unsigned)field[22]|(unsigned)field[23]<<8|
         (unsigned)field[24]<<16|(unsigned)field[25]<<24;
-    for(unsigned i=26;i<32;i++)if(field[i])return -1;
-    return size==B2L_WIFI_FIRMWARE_BYTES ? (int)size : -1;
+    if(size!=B2L_WIFI_FIRMWARE_BYTES)return -1;
+    if(field[21]=='1'){
+        for(unsigned i=26;i<32;i++)if(field[i])return -1;
+        return (int)size;
+    }
+    if(field[21]!='2'||field[30]||field[31])return -1;
+    unsigned nvram=(unsigned)field[26]|(unsigned)field[27]<<8;
+    unsigned check=(unsigned)field[28]|(unsigned)field[29]<<8;
+    if(!nvram||(nvram^check)!=0xffffU||!b2l_wifi_attachment_valid((unsigned long long)size+nvram))return -1;
+    return (int)(size+nvram);
 }
 static inline int b2l_wifi_mac_valid(const unsigned char mac[6])
 {

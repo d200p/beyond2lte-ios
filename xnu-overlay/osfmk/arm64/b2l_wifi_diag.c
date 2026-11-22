@@ -23,6 +23,13 @@
  * temporarily changing only BANKIDX and restoring its original value.
  * b2l_wifi_diag=10 writes the pinned private firmware to measured TCM and
  * reads every word back while R4 stays halted. No firmware execution.
+ * b2l_wifi_diag=11 (S10 port) also boots that firmware the way Linux DHD
+ * does: NVRAM, its length token and a random seed at the top of RAM, the
+ * reset vector, then the R4 released for about 3 s while only reads follow
+ * (the shared area, console text, trap/assert records), then halted again.
+ * Bus mastering, DMA rings, mailboxes and IRQs stay off; nothing is sent to
+ * the firmware. It runs in a kernel thread 360 s after start, after the
+ * Metal test window, so a wedge here cannot cost that boot's other results.
  * A powered PHY alone does not establish that DBI/ELBI accesses are safe.
  * All addresses/offsets are sourced in docs/wifi-bringup.md.
  */
@@ -30,6 +37,7 @@
 #include <arm64/b2l_wifi_phy_data.h>
 #include <kern/clock.h>
 #include <kern/misc_protos.h>
+#include <kern/thread.h>
 #include <mach/mach_time.h>
 #include <machine/machine_routines.h>
 #include <pexpert/pexpert.h>
@@ -40,11 +48,67 @@
 
 #define wlog(...) b2l_early_trace("B2L WIFI: " __VA_ARGS__)
 #define WIFI_FIRMWARE_BYTES 1297036u
+/* S10 port, mode 11: the DHD-processed NVRAM follows the firmware in the same
+ * private attachment (uefi/XnuLoader/BootMetadata.h, B2LFW002). */
+#define WIFI_NVRAM_MAX_BYTES 32768u
+#define WIFI_RAM_BASE 0x170000u
+#define WIFI_RAM_END 0x300000u
+#define WIFI_R4_WRAPPER 0x18102000u
+#define WIFI_DEFER_S 360u
 static const uint8_t *wifi_firmware;
+static const uint8_t *wifi_nvram;
+static unsigned wifi_nvram_bytes;
 extern void b2l_sha256(const void *, size_t, uint8_t[32]);
+extern void read_frandom(void *, unsigned int);
+
+/* The layout DHD's process_nvram_vars and download_nvram produce: printable
+ * name=value entries, each ended by one NUL, then NUL padding whose last four
+ * bytes are always zero. scripts/package-boot.py applies the same rule. */
+static int
+wifi_nvram_check(const uint8_t *p, unsigned n)
+{
+    unsigned entries = 0, start = 0, equals = 0, ended = 0;
+    char type[16] = "?", rev[16] = "?";
+    if (n < 8 || n > WIFI_NVRAM_MAX_BYTES || (n & 3) || p[n - 4] || p[n - 3] || p[n - 2] || p[n - 1])
+        goto bad;
+    for (unsigned i = 0; i < n; i++) {
+        uint8_t c = p[i];
+        if (ended) {
+            if (c) goto bad;
+            continue;
+        }
+        if (!c) {
+            if (i == start) { ended = 1; continue; }
+            if (equals <= start + 1) goto bad;
+            entries++; start = i + 1; equals = 0;
+            continue;
+        }
+        if (c < 0x20 || c > 0x7e) goto bad;
+        if (c == '=' && !equals) equals = i + 1;
+    }
+    if (!entries) goto bad;
+    for (unsigned i = 0; i < n && p[i]; ) {
+        unsigned length = 0;
+        while (p[i + length]) length++;
+        const char *entry = (const char *)p + i;
+        char *out = !strncmp(entry, "boardtype=", 10) ? type : !strncmp(entry, "boardrev=", 9) ? rev : NULL;
+        if (out) {
+            unsigned skip = out == type ? 10 : 9, copy = length - skip;
+            if (copy > 15) copy = 15;
+            memcpy(out, entry + skip, copy);
+            out[copy] = 0;
+        }
+        i += length + 1;
+    }
+    wlog("private NVRAM input verified: bytes=%u entries=%u boardtype=%s boardrev=%s\n", n, entries, type, rev);
+    return 0;
+bad:
+    wlog("private NVRAM input rejected: bytes=%u; not the DHD-processed layout\n", n);
+    return -1;
+}
 
 static int
-wifi_firmware_input(void)
+wifi_firmware_input(uint32_t mode)
 {
     static const uint8_t expected[32] = {
         0x16,0x76,0xf4,0x6c,0xe5,0x6b,0x96,0xf5,0x8d,0xc7,0x0d,0xe0,0x8b,0xea,0xab,0x4a,
@@ -57,18 +121,28 @@ wifi_firmware_input(void)
     uint8_t digest[32];
     const boot_args *args = (const boot_args *)PE_state.bootArgs;
     wifi_firmware = NULL;
+    wifi_nvram = NULL;
+    wifi_nvram_bytes = 0;
     if (!args || SecureDTLookupEntry(NULL, "/chosen", &dt) != kSuccess ||
         SecureDTGetProperty(dt, "b2l,wifi-firmware", &prop, &n) != kSuccess || n != sizeof(range)) return -1;
     memcpy(range, prop, sizeof(range));
-    if (range[1] != WIFI_FIRMWARE_BYTES || (range[0] & 4095) ||
+    /* The firmware alone (B2LFW001), or followed by the NVRAM (B2LFW002). */
+    if (range[1] < WIFI_FIRMWARE_BYTES || range[1] - WIFI_FIRMWARE_BYTES > WIFI_NVRAM_MAX_BYTES ||
+        ((range[1] - WIFI_FIRMWARE_BYTES) & 3) || (range[0] & 4095) ||
         range[0] < args->physBase || range[0] > args->topOfKernelData ||
         range[1] > args->topOfKernelData - range[0]) return -1;
     const uint8_t *data = (const uint8_t *)ml_static_ptovirt(range[0]);
     if (!data) return -1;
     b2l_sha256(data, WIFI_FIRMWARE_BYTES, digest);
     if (memcmp(digest, expected, sizeof(expected))) return -1;
+    unsigned nvram = (unsigned)(range[1] - WIFI_FIRMWARE_BYTES);
+    if (mode >= 11 && wifi_nvram_check(data + WIFI_FIRMWARE_BYTES, nvram)) return -1;
     wifi_firmware = data;
     wlog("private firmware input verified: bytes=%u SHA-256 pinned; no filesystem access\n", WIFI_FIRMWARE_BYTES);
+    if (mode >= 11) {
+        wifi_nvram = data + WIFI_FIRMWARE_BYTES;
+        wifi_nvram_bytes = nvram;
+    }
     return 0;
 }
 
@@ -473,6 +547,264 @@ stopped:
     return -1;
 }
 
+/* S10 port, mode 11. One backplane word through BAR0's 4 KiB window, moved
+ * only when needed; every access is bracketed by the same link/BAR guard. */
+static int
+wifi_bp_window(struct wifi_region *regions, uint32_t address, uint64_t deadline)
+{
+    uint32_t window = address & ~4095u;
+    if (wifi_bar_ready(regions, window, deadline)) return 0;
+    return wifi_backplane_window(regions, window, deadline) || !wifi_bar_ready(regions, window, deadline) ? -1 : 0;
+}
+
+static int
+wifi_bp_read(struct wifi_region *regions, uint32_t address, uint32_t *value, uint64_t deadline)
+{
+    if (wifi_bp_window(regions, address, deadline)) return -1;
+    *value = wifi_read(&regions[10], address & 4095u);
+    return wifi_bar_ready(regions, address & ~4095u, deadline) ? 0 : -1;
+}
+
+static int
+wifi_bp_write(struct wifi_region *regions, uint32_t address, uint32_t value, uint64_t deadline)
+{
+    if (wifi_bp_window(regions, address, deadline)) return -1;
+    wifi_write(&regions[10], address & 4095u, value);
+    return wifi_bar_ready(regions, address & ~4095u, deadline) ? 0 : -1;
+}
+
+static uint32_t
+wifi_le32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;
+}
+
+/* Word-aligned bytes into dongle RAM, each word read back. */
+static int
+wifi_bp_block(struct wifi_region *regions, uint32_t address, const uint8_t *data, unsigned bytes, uint64_t deadline)
+{
+    for (unsigned at = 0; at < bytes; at += 4) {
+        uint32_t word = wifi_le32(data + at), got = 0;
+        if (wifi_bp_write(regions, address + at, word, deadline) ||
+            wifi_bp_read(regions, address + at, &got, deadline) || got != word) {
+            wlog("RAM write stopped at %#x: got=%#x want=%#x\n", address + at, got, word);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* aiutils.c _ai_core_reset on the R4's only wrapper (one master wrapper, so
+ * no second one): each step waits up to 300 us for resetstatus to clear. */
+static int
+wifi_r4_idle(struct wifi_region *regions, uint64_t deadline)
+{
+    uint32_t status = 0;
+    for (unsigned i = 0; i < 30; i++) {
+        if (wifi_bp_read(regions, WIFI_R4_WRAPPER + 0x804, &status, deadline)) return -1;
+        if (!status) return 0;
+        delay(10);
+    }
+    wlog("R4 wrapper resetstatus stays %#x\n", status);
+    return -1;
+}
+
+static int
+wifi_r4_reset(struct wifi_region *regions, uint32_t bits, uint64_t deadline)
+{
+    uint32_t value = 0;
+    if (wifi_r4_idle(regions, deadline) ||
+        wifi_bp_write(regions, WIFI_R4_WRAPPER + 0x800, 1, deadline)) return -1;
+    delay(10);
+    if (wifi_r4_idle(regions, deadline) ||
+        wifi_bp_write(regions, WIFI_R4_WRAPPER + 0x408, bits | 3u, deadline) ||
+        wifi_bp_read(regions, WIFI_R4_WRAPPER + 0x408, &value, deadline) ||
+        wifi_r4_idle(regions, deadline)) return -1;
+    for (unsigned attempt = 0;; attempt++) {
+        if (wifi_bp_read(regions, WIFI_R4_WRAPPER + 0x800, &value, deadline)) return -1;
+        if (!value) break;
+        if (attempt == 9 || wifi_r4_idle(regions, deadline) ||
+            wifi_bp_write(regions, WIFI_R4_WRAPPER + 0x800, 0, deadline) ||
+            wifi_r4_idle(regions, deadline)) return -1;
+    }
+    if (wifi_bp_write(regions, WIFI_R4_WRAPPER + 0x408, bits | 1u, deadline) ||
+        wifi_bp_read(regions, WIFI_R4_WRAPPER + 0x408, &value, deadline)) return -1;
+    delay(10);
+    if ((value & 0x23u) == (bits | 1u)) return 0;
+    wlog("R4 wrapper ioctrl=%#x after reset, want %#x\n", value, bits | 1u);
+    return -1;
+}
+
+/* A NUL-terminated firmware string (assert file/expression), at most 95 bytes. */
+static void
+wifi_log_string(struct wifi_region *regions, const char *what, uint32_t address, uint64_t deadline)
+{
+    char text[96];
+    unsigned length = 0;
+    if (address < WIFI_RAM_BASE || address >= WIFI_RAM_END - 96) return;
+    for (uint32_t at = address & ~3u; length < sizeof(text) - 1; at += 4) {
+        uint32_t word;
+        if (wifi_bp_read(regions, at, &word, deadline)) break;
+        for (unsigned b = 0; b < 4 && length < sizeof(text) - 1; b++) {
+            if (at + b < address) continue;
+            char c = (char)(word >> (8 * b));
+            if (!c) goto done;
+            text[length++] = c >= 0x20 && c <= 0x7e ? c : '.';
+        }
+    }
+done:
+    text[length] = 0;
+    wlog("firmware %s: %s\n", what, text);
+}
+
+/* The text before the console's write index, one log line per firmware line. */
+static void
+wifi_log_console(struct wifi_region *regions, uint32_t console, uint64_t deadline)
+{
+    static char text[4096 + 4];
+    uint32_t buffer = 0, size = 0, index = 0;
+    if (console < WIFI_RAM_BASE || console > WIFI_RAM_END - 32 ||
+        wifi_bp_read(regions, console + 8, &buffer, deadline) ||
+        wifi_bp_read(regions, console + 12, &size, deadline) ||
+        wifi_bp_read(regions, console + 16, &index, deadline)) {
+        wlog("console structure at %#x unreadable\n", console);
+        return;
+    }
+    wlog("console at %#x: buffer=%#x size=%u index=%u\n", console, buffer, size, index);
+    if (buffer < WIFI_RAM_BASE || size == 0 || size > 0x10000 || buffer > WIFI_RAM_END - size || index > size) {
+        wlog("console buffer outside RAM or index beyond it; text not read\n");
+        return;
+    }
+    unsigned count = index > 4096 ? 4096 : index, from = index - count, length = 0;
+    for (uint32_t at = (buffer + from) & ~3u; at < buffer + index; at += 4) {
+        uint32_t word;
+        if (wifi_bp_read(regions, at, &word, deadline)) {
+            wlog("console read stopped at %#x\n", at);
+            break;
+        }
+        for (unsigned b = 0; b < 4; b++) {
+            if (at + b < buffer + from || at + b >= buffer + index) continue;
+            text[length++] = (char)(word >> (8 * b));
+        }
+    }
+    unsigned lines = 0, start = 0;
+    for (unsigned i = 0; i <= length && lines < 120; i++) {
+        if (i < length && text[i] != '\n' && i - start < 160) continue;
+        char saved = text[i];
+        text[i] = 0;
+        for (unsigned j = start; j < i; j++) {
+            if (text[j] == '\r') text[j] = ' ';
+            else if (text[j] < 0x20 || text[j] > 0x7e) text[j] = '.';
+        }
+        if (i > start) {
+            wlog("console: %s\n", text + start);
+            lines++;
+        }
+        text[i] = saved;
+        start = i < length && text[i] == '\n' ? i + 1 : i;
+    }
+    wlog("console end: bytes=%u lines=%u\n", length, lines);
+}
+
+static int
+wifi_firmware_boot(struct wifi_region *regions)
+{
+    const uint32_t top = WIFI_RAM_END - 4, varsize = wifi_nvram_bytes, varaddr = top - varsize;
+    const uint32_t token = (~(varsize / 4) << 16) | ((varsize / 4) & 0xffffu);
+    const uint32_t seed_meta = varaddr - 8, seed_addr = seed_meta - 128;
+    const uint32_t vector = wifi_firmware_word(0);
+    uint8_t seed[128], meta[8], token_bytes[4];
+    uint32_t before = 0, got = 0, shared = 0, words[8] = { 0 };
+    unsigned polls = 0, released = 0;
+    uint64_t deadline;
+    clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+    wlog("firmware boot begin: NVRAM %u bytes at %#x, token %#x at %#x, seed at %#x; DMA/BME/IRQs stay off\n",
+        varsize, varaddr, token, top, seed_addr);
+    for (unsigned i = 0; i < 4; i++) token_bytes[i] = (uint8_t)(token >> (8 * i));
+    for (unsigned i = 0; i < 4; i++) {
+        meta[i] = (uint8_t)(0xfeedc0deu >> (8 * i));
+        meta[4 + i] = (uint8_t)(128u >> (8 * i));
+    }
+    read_frandom(seed, sizeof(seed));
+    if (!wifi_firmware_halted(regions, deadline) ||
+        wifi_bp_block(regions, varaddr, wifi_nvram, varsize, deadline) ||
+        wifi_bp_block(regions, top, token_bytes, 4, deadline) ||
+        wifi_bp_block(regions, seed_meta, meta, 8, deadline) ||
+        wifi_bp_block(regions, seed_addr, seed, sizeof(seed), deadline)) {
+        wlog("firmware boot stopped: NVRAM/token/seed not written; R4 stays halted\n");
+        return 0;
+    }
+    /* dhdpcie_bus_download_state: the image's first word goes to backplane
+     * address 0; all ones there means a secured vector needing a signature. */
+    if (wifi_bp_read(regions, 0, &before, deadline) || before == UINT32_MAX ||
+        wifi_bp_write(regions, 0, vector, deadline) ||
+        wifi_bp_read(regions, 0, &got, deadline) || got != vector ||
+        !wifi_firmware_halted(regions, deadline)) {
+        wlog("firmware boot stopped: reset vector before=%#x got=%#x want=%#x; R4 stays halted\n", before, got, vector);
+        return 0;
+    }
+    wlog("NVRAM, token, seed and reset vector written and read back (address 0 held %#x); "
+        "pausing 6 s so these lines reach the disk before the R4 runs\n", before);
+    delay_for_interval(6000, NSEC_PER_MSEC);
+    clock_interval_to_deadline(5000, NSEC_PER_MSEC, &deadline);
+    if (wifi_r4_reset(regions, 0, deadline)) {
+        wlog("R4 release failed; halting it again\n");
+        goto halt;
+    }
+    released = 1;
+    wlog("R4 released: firmware running; waiting up to 2 s for its shared area\n");
+    /* dhdpcie_readshared: the last RAM word changes from the token to the
+     * address of pciedev_shared_t. */
+    for (; polls < 100; polls++) {
+        if (wifi_bp_read(regions, top, &shared, deadline)) {
+            wlog("shared poll lost the link/BAR guard after %u polls\n", polls);
+            goto halt;
+        }
+        if (shared != 0 && shared != token) break;
+        delay_for_interval(20, NSEC_PER_MSEC);
+    }
+    if (shared == 0 || shared == token || shared == UINT32_MAX || shared < WIFI_RAM_BASE || shared > top - 32) {
+        wlog("shared area not published: last word=%#x after %u polls\n", shared, polls);
+        goto halt;
+    }
+    /* Let the firmware finish its start-up messages, then read only. */
+    for (unsigned i = 0; i < 5; i++) delay_for_interval(200, NSEC_PER_MSEC);
+    for (unsigned i = 0; i < 8; i++) {
+        if (wifi_bp_read(regions, shared + 4 * i, &words[i], deadline)) {
+            wlog("shared area read failed at word %u\n", i);
+            goto halt;
+        }
+    }
+    wlog("shared at %#x after %u polls: flags=%#x version=%u trap=%#x assert_exp=%#x assert_file=%#x "
+        "assert_line=%u console=%#x msgtrace=%#x fwid=%#x\n", shared, polls, words[0], words[0] & 0xffu,
+        words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+    wifi_log_console(regions, words[5], deadline);
+    if (words[0] & 0x200u) {
+        wifi_log_string(regions, "assert file", words[3], deadline);
+        wifi_log_string(regions, "assert expression", words[2], deadline);
+    }
+    if ((words[0] & 0x400u) && words[1] >= WIFI_RAM_BASE && words[1] <= top - 80) {
+        uint32_t trap[20];
+        for (unsigned i = 0; i < 20; i++)
+            if (wifi_bp_read(regions, words[1] + 4 * i, &trap[i], deadline)) goto halt;
+        wlog("firmware trap: type=%#x epc=%#x cpsr=%#x spsr=%#x\n", trap[0], trap[1], trap[2], trap[3]);
+        for (unsigned i = 0; i < 16; i += 4)
+            wlog("firmware trap: r%u=%#x r%u=%#x r%u=%#x r%u=%#x\n", i, trap[4 + i], i + 1, trap[5 + i],
+                i + 2, trap[6 + i], i + 3, trap[7 + i]);
+    }
+halt:
+    /* dhdpcie_bus_download_state(enter): halt the ARM and remove reset. */
+    clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
+    if (wifi_r4_reset(regions, 0x20, deadline) || !wifi_firmware_halted(regions, deadline)) {
+        wlog("firmware boot end: R4 was %s and could NOT be halted again; power-off follows\n",
+            released ? "released" : "not released");
+        return -1;
+    }
+    wlog("firmware boot end: R4 %s, halted again; power-off follows\n",
+        released ? "ran" : "never ran");
+    return 0;
+}
+
 static int
 wifi_chipcommon_probe(struct wifi_region *regions, uint32_t mode)
 {
@@ -574,14 +906,21 @@ wifi_chipcommon_probe(struct wifi_region *regions, uint32_t mode)
                 }
                 stage = "tcm-inventory";
                 if (wifi_tcm_inventory(regions, &cleanup_failed, &measured_tcm)) goto out;
-                if (mode == 10) {
+                if (mode >= 10) {
                     stage = "firmware-prerequisites";
-                    if (!measured_tcm || !wifi_firmware) {
+                    if (!measured_tcm || !wifi_firmware || (mode == 11 && !wifi_nvram)) {
                         wlog("firmware download skipped: measured TCM/input prerequisites absent\n");
                         goto out;
                     }
                     stage = "firmware-download";
                     if (wifi_firmware_download(regions)) goto out;
+                    if (mode == 11) {
+                        stage = "firmware-boot";
+                        if (wifi_firmware_boot(regions)) {
+                            cleanup_failed = -1;
+                            goto out;
+                        }
+                    }
                 }
             }
         }
@@ -953,10 +1292,9 @@ wifi_power_probe(struct wifi_region *regions, uint32_t mode)
     wlog("power probe restore %s; no firmware or networking\n", restore_failed ? "FAILED" : "verified");
 }
 
-void
-b2l_wifi_diag_start(void)
+static void
+wifi_diag_run(uint32_t mode)
 {
-    uint32_t mode = 0;
     struct wifi_region regions[] = {
         { 0x15860000, 0, 0x4000 }, /* PMU: PCIe0 PHY isolation */
         { 0x10430000, 0, 0x4000 }, /* PERIC0 GPIO: GPG0-5 WLAN_REG_ON */
@@ -974,14 +1312,6 @@ b2l_wifi_diag_start(void)
     static const unsigned qch[] = { 0x3034, 0x3038, 0x303c, 0x3040, 0x3044 };
     unsigned count = 4;
 
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 10) {
-        wlog("diagnostic disabled; no MMIO access\n");
-        return;
-    }
-    if (mode == 10 && wifi_firmware_input()) {
-        wlog("firmware input absent/invalid; no MMIO access\n");
-        return;
-    }
     if (mode == 3) count = 5;
     if (mode == 4) count = 9;
     if (mode == 5) count = 10;
@@ -1031,4 +1361,41 @@ out:
         if (regions[i - 1].mapped)
             ml_io_unmap(regions[i - 1].mapped, regions[i - 1].size);
     }
+}
+
+/* S10 port, mode 11: the same sequence later, in its own kernel thread. */
+static void
+wifi_deferred(void *argument, wait_result_t result)
+{
+    (void)argument;
+    (void)result;
+    delay_for_interval(WIFI_DEFER_S, NSEC_PER_SEC);
+    wlog("mode 11: deferred run begins\n");
+    wifi_diag_run(11);
+    wlog("mode 11: deferred run finished\n");
+}
+
+void
+b2l_wifi_diag_start(void)
+{
+    uint32_t mode = 0;
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 11) {
+        wlog("diagnostic disabled; no MMIO access\n");
+        return;
+    }
+    if (mode >= 10 && wifi_firmware_input(mode)) {
+        wlog("firmware input absent/invalid; no MMIO access\n");
+        return;
+    }
+    if (mode == 11) {
+        thread_t thread;
+        if (kernel_thread_start(wifi_deferred, NULL, &thread) != KERN_SUCCESS) {
+            wlog("mode 11: thread start failed; no MMIO access\n");
+            return;
+        }
+        thread_deallocate(thread);
+        wlog("mode 11: firmware download and boot deferred %u s, after the Metal test window\n", WIFI_DEFER_S);
+        return;
+    }
+    wifi_diag_run(mode);
 }

@@ -76,12 +76,62 @@ static int PE_parse_boot_argn(const char *name, void *value, unsigned size) {
 }
 static uint64_t mach_absolute_time(void) { return now_us; }
 static void clock_interval_to_deadline(unsigned n, unsigned unit, uint64_t *at) {
-    assert((n == 500 || (mode >= 5 && n == 100) || (mode == 10 && n == 5000)) && unit == NSEC_PER_MSEC); *at = now_us + n * 1000;
+    assert((n == 500 || (mode >= 5 && n == 100) || (mode >= 10 && n == 5000) || (mode == 11 && n == 2000)) &&
+        unit == NSEC_PER_MSEC); *at = now_us + n * 1000;
 }
 static void delay(unsigned us) { assert(us == 10 || us == 20 || us == 100); now_us += us; }
+/* S10 port, mode 11: the deferral, the R4 model and its synthetic firmware. */
+#define NSEC_PER_SEC 1000000000u
+#define KERN_SUCCESS 0
+typedef int kern_return_t;
+typedef int wait_result_t;
+typedef struct host_thread *thread_t;
+typedef void (*thread_continue_t)(void *, wait_result_t);
+static unsigned thread_starts, thread_fail, threads_released, deferred_s;
 static void delay_for_interval(unsigned n, unsigned unit) {
+    if (unit == NSEC_PER_SEC) {
+        /* The deferral sleeps before any mapping; it is not part of the probe's time. */
+        assert(mode == 11 && n == 360 && !deferred_s && !maps); deferred_s = n; return;
+    }
     assert(unit == NSEC_PER_MSEC && (n == 1 || n == 20 || n == 200 ||
-        (mode >= 5 && (n == 9 || n == 100)))); now_us += n * 1000;
+        (mode >= 5 && (n == 9 || n == 100)) || (mode == 11 && n == 6000))); now_us += n * 1000;
+}
+static kern_return_t kernel_thread_start(thread_continue_t fn, void *arg, thread_t *out) {
+    assert(mode == 11 && !thread_starts++ && !maps);
+    if (thread_fail) return 5;
+    *out = (thread_t)&thread_starts;
+    fn(arg, 0); /* The thread's whole run, synchronously. */
+    return KERN_SUCCESS;
+}
+static void thread_deallocate(thread_t thread) { assert(thread == (thread_t)&thread_starts); threads_released++; }
+void read_frandom(void *p, unsigned n) {
+    assert(mode == 11 && n == 128);
+    for (unsigned i = 0; i < n; i++) ((uint8_t *)p)[i] = (uint8_t)(0xa5u ^ i);
+}
+#define TCM11_TOP ((0x2ffffcu - 0x170000u) / 4)
+static uint32_t tcm11[0x190000 / 4];
+static uint32_t vector0, r4_io, r4_reset;
+static unsigned r4_running, r4_runs, run_polls, status_stuck, boot_fault, nvram_fixture_bytes;
+static const char console_text[] =
+    "\r\nRTE (PCIE-MSG_BUF) 17.10.157 (r) on BCM4375 r5 @ 37.4/168.0/1600.0MHz\n"
+    "000000.007 pciedev ready\nlast line without newline";
+static void tcm11_put(uint32_t address, uint32_t value) {
+    assert(address >= 0x170000 && address < 0x300000 && !(address & 3));
+    tcm11[(address - 0x170000) / 4] = value;
+}
+static void start_firmware(void) {
+    /* Released only after NVRAM, token and reset vector are in place. */
+    uint32_t words = nvram_fixture_bytes / 4;
+    assert(tcm11[TCM11_TOP] == ((~words << 16) | words) && vector0 == 0x2e211407); /* fixture bytes 7,20,33,46 */
+    tcm11_put(0x2f0000, boot_fault == 2 ? 0x407 : 7); /* flags: version 7 (+ trap) */
+    tcm11_put(0x2f0004, 0x2f0200);
+    tcm11_put(0x2f0014, 0x2f0100);
+    tcm11_put(0x2f001c, 0x5a5a1234);
+    tcm11_put(0x2f0108, 0x2f1000);
+    tcm11_put(0x2f010c, 0x2000);
+    tcm11_put(0x2f0110, sizeof(console_text) - 1);
+    memcpy((uint8_t *)tcm11 + (0x2f1000 - 0x170000), console_text, sizeof(console_text) - 1);
+    for (unsigned i = 0; i < 20; i++) tcm11_put(0x2f0200 + 4 * i, 0x100 + i);
 }
 static uintptr_t ml_io_map_unmappable(uintptr_t pa, unsigned long size, unsigned flags) {
     assert(maps < (mode >= 6 ? 11u : mode + 5) && pa == physical[maps] && size == 0x4000 && flags == VM_WIMG_IO);
@@ -123,6 +173,11 @@ static int valid_link_setup(void) {
         (memory[8][0x710/4] & 0x3f0000) == 0x10000 &&
         (memory[8][0x80c/4] & 0x1f00) == 0x100 && memory[8][0xb40/4] == 26;
 }
+/* Mode 11 after the TCM inventory: address 0, the R4 wrapper and all of RAM. */
+static int boot11_window(uint32_t window) {
+    return mode == 11 && bank_reads == 13 &&
+        (window == 0 || window == 0x18102000 || (window >= 0x170000 && window < 0x300000));
+}
 static uint32_t host_read(uintptr_t address, unsigned off) {
     unsigned i = region_index(address); assert(!(off & 3) && off < 0x4000); powered(i);
     int allowed = (i == 0 && off == 0x71c) ||
@@ -146,7 +201,8 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
                 (off == 0x408 || off == 0x500 || off == 0x800)) ||
             (mode >= 9 && memory[9][0x2080/4] == 0x18002000 && (off == 0x40 || off == 0x44)) ||
             (mode == 10 && memory[9][0x2080/4] >= 0x170000 &&
-             memory[9][0x2080/4] <= 0x2ac000 && off < 4096)));
+             memory[9][0x2080/4] <= 0x2ac000 && off < 4096) ||
+            (boot11_window(memory[9][0x2080/4]) && off < 4096)));
     assert(allowed);
     if (i == 8 && (off == 0x0c || off == 0x18 || (off >= 0x900 && off <= 0x91c)))
         assert(mode >= 5 && trained && valid_link_setup());
@@ -188,6 +244,24 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
     }
     if (i == 10) {
         uint32_t window = memory[9][0x2080/4];
+        if (boot11_window(window)) {
+            assert(off < 4096 && (memory[9][0x2004/4] & 7) == 2 && atu0[1] == 0x80000000);
+            assert(memory[8][0x900/4] == 1 && !(memory[8][4/4] & 0x145));
+            if (window == 0) { assert(off == 0); return boot_fault == 4 ? UINT32_MAX : vector0; }
+            if (window == 0x18102000) {
+                assert(off == 0x408 || off == 0x800 || off == 0x804);
+                if (off == 0x804) {
+                    if (status_stuck) { status_stuck--; return 1; }
+                    return 0;
+                }
+                return off == 0x408 ? r4_io : r4_reset;
+            }
+            unsigned index = (window - 0x170000 + off) / 4;
+            /* The synthetic firmware publishes its shared area on the third poll. */
+            if (r4_running && index == TCM11_TOP && ++run_polls == 3 && boot_fault != 1)
+                tcm11[index] = 0x2f0000;
+            return tcm11[index];
+        }
         if (mode == 10 && window >= 0x170000 && window <= 0x2ac000) {
             unsigned index = (window - 0x170000 + off)/4;
             assert(off < 4096 && index < sizeof(firmware_ram)/4 && index == fw_reads);
@@ -297,6 +371,31 @@ static void host_write(uintptr_t address, unsigned off, uint32_t value) {
     uint32_t before = memory[i][off/4], mask = 0;
     if (i == 10) {
         uint32_t window = memory[9][0x2080/4];
+        if (boot11_window(window)) {
+            assert(off < 4096 && (memory[9][0x2004/4] & 7) == 2 && atu0[1] == 0x80000000);
+            assert(memory[8][0x900/4] == 1 && !(memory[8][4/4] & 0x145));
+            writes++;
+            if (window == 0) {
+                assert(off == 0 && !r4_running && !r4_runs && boot_fault != 4);
+                if (boot_fault == 3) return; /* Lost write: the readback must catch it. */
+                vector0 = value;
+                if (boot_fault == 5) status_stuck = 30; /* Release waits fail; the halt works. */
+                return;
+            }
+            if (window == 0x18102000) {
+                assert(off == 0x408 || off == 0x800);
+                if (off == 0x800) { assert(value <= 1); r4_reset = value; }
+                else { assert(value == 3 || value == 1 || value == 0x23 || value == 0x21); r4_io = value; }
+                unsigned running = !r4_reset && (r4_io & 0x23) == 1;
+                if (running && !r4_running) { r4_runs++; start_firmware(); }
+                r4_running = running;
+                return;
+            }
+            /* RAM is written only while the R4 is halted and before it has ever run. */
+            assert(!r4_running && !r4_runs && !(r4_io & 2) && (r4_io & 0x20));
+            tcm11[(window - 0x170000 + off) / 4] = value;
+            return;
+        }
         if (mode == 10 && window >= 0x170000 && window <= 0x2ac000) {
             unsigned index = (window - 0x170000 + off)/4;
             assert(off < 4096 && index < sizeof(firmware_ram)/4 && index == fw_writes);
@@ -331,7 +430,8 @@ static void host_write(uintptr_t address, unsigned off, uint32_t value) {
         if (off == 0x2014) assert(value == 0);
         if (off == 0x2080) assert(value == 0x18000000 || value == 0x18001000 || (mode >= 7 && value == 0x18111000) ||
             (mode >= 8 && (value == 0x18103000 || value == 0x18102000 || value == 0x18002000)) ||
-            (mode == 10 && value >= 0x170000 && value <= 0x2ac000 && !(value & 4095)));
+            (mode == 10 && value >= 0x170000 && value <= 0x2ac000 && !(value & 4095)) ||
+            (mode == 11 && (value == 0 || (value >= 0x170000 && value < 0x300000 && !(value & 4095)))));
         writes++; config_writes++;
         if (mode == 10 && bank_reads == 13 && off == 0x2080 &&
             (value == 0x18102000 || (value >= 0x170000 && value <= 0x2ac000))) {
@@ -442,8 +542,11 @@ static void reset(unsigned which, unsigned failure) {
     wrapper_reads[0] = wrapper_reads[1] = r4_cap_reads = core_fault = 0;
     bank_reads = bank_writes = tcm_fault = 0; bank_index = 7;
     fw_reads = fw_writes = fw_guards = fw_fault = fw_drop_word = fw_windows = fw_drop_window = 0;
-    if (mode == 10) { firmware_fixture_setup(); memset(firmware_ram, 0, sizeof(firmware_ram)); }
-    for (unsigned b = 0; b < 13; b++) bank_info[b] = mode == 10 ? (b == 4 ? 0x88c07 : 0x108c0f) : b < 5 ? 0x203 : 0xf;
+    if (mode >= 10) { firmware_fixture_setup(); memset(firmware_ram, 0, sizeof(firmware_ram)); }
+    for (unsigned b = 0; b < 13; b++) bank_info[b] = mode >= 10 ? (b == 4 ? 0x88c07 : 0x108c0f) : b < 5 ? 0x203 : 0xf;
+    thread_starts = thread_fail = threads_released = deferred_s = 0;
+    memset(tcm11, 0, sizeof(tcm11)); vector0 = 0; r4_io = 0x21; r4_reset = 0;
+    r4_running = r4_runs = run_polls = status_stuck = boot_fault = nvram_fixture_bytes = 0;
     memset(wrapper_values, 0, sizeof(wrapper_values)); wrapper_values[0][0] = 1; wrapper_values[1][0] = 0x21;
     erom[0] = 0x4bf80001; erom[1] = 0x39000201; erom[2] = 0x18000005;
     erom[3] = 0x4bf83c01; erom[4] = 0x42000201; erom[5] = 0x18001005; erom[6] = 0xf;
@@ -499,7 +602,9 @@ static void verify_quiet(void) {
     assert(strstr(logs, "power probe restore verified"));
     if (strstr(logs, "Gen1 probe begin:"))
         assert(!(memory[4][0xc/4] | memory[4][0x10/4] | memory[4][0x14/4]));
-    assert(unmaps == (mode >= 6 ? 11u : mode + 5) && now_us < (mode == 10 ? 7000000u : 1000000u) && link_polls <= 500);
+    assert(unmaps == (mode >= 6 ? 11u : mode + 5) && link_polls <= 500 &&
+        now_us < (mode == 11 ? 20000000u : mode == 10 ? 7000000u : 1000000u));
+    if (mode == 11) assert(!r4_running && !r4_reset && r4_io == 0x21); /* Halted before power-off. */
     if (mode >= 5) {
         uint32_t expected_control = endpoint_fault == 7 || endpoint_fault == 10 ? 0x80000000 : 0;
         if (endpoint_fault == 16) expected_control = UINT32_MAX;
@@ -829,6 +934,66 @@ int main(void) {
     reset(8,0);tcm_fault=9;b2l_wifi_diag_start();verify_quiet();
     assert(!fw_reads && !fw_writes && !bank_reads);
     puts("Firmware: authenticated reserved input, exact measured TCM scope, full synthetic image/readback, halted R4 per page, deadline/link/readback/lost-write and cleanup guards passed");
+    /* S10 port, mode 11: the DHD start sequence on the synthetic firmware. */
+    mode = 11;
+    static const char entries[] = "boardtype=0x1234\0boardrev=0x1101\0macaddr=00:90:4c:c5:12:38";
+    uint8_t good[64] = { 0 };
+    memcpy(good, entries, sizeof(entries)); /* 59 bytes, then DHD's NUL padding to 64 */
+    for (unsigned bad = 1; bad <= 5; bad++) {
+        uint8_t nvram[64];
+        memcpy(nvram, good, sizeof(nvram));
+        if (bad == 1) nvram[3] = 1;          /* a control character */
+        if (bad == 2) nvram[9] = '-';        /* an entry without '=' */
+        if (bad == 3) nvram[62] = 'x';       /* the last word is not zero */
+        if (bad == 4) nvram[60] = 'y';       /* text after the end */
+        reset(8, 0);
+        if (bad != 5) firmware_fixture_nvram(nvram, sizeof(nvram)); /* 5: the firmware alone */
+        b2l_wifi_diag_start();
+        assert(!maps && !writes && !thread_starts && strstr(logs, "firmware input absent/invalid; no MMIO access"));
+        assert((strstr(logs, "private NVRAM input rejected: bytes=64") != NULL) == (bad != 5));
+    }
+    reset(8, 0); firmware_fixture_nvram(good, sizeof(good)); thread_fail = 1; b2l_wifi_diag_start();
+    assert(!maps && !writes && thread_starts == 1 && !threads_released && !deferred_s);
+    assert(strstr(logs, "mode 11: thread start failed; no MMIO access"));
+    const uint32_t varaddr = 0x2ffffc - sizeof(good);
+    for (unsigned fault = 0; fault <= 5; fault++) {
+        reset(8, 0); firmware_fixture_nvram(good, sizeof(good)); nvram_fixture_bytes = sizeof(good);
+        boot_fault = fault;
+        b2l_wifi_diag_start(); verify_quiet();
+        assert(thread_starts == 1 && threads_released == 1 && deferred_s == 360);
+        assert(strstr(logs, "private NVRAM input verified: bytes=64 entries=3 boardtype=0x1234 boardrev=0x1101"));
+        assert(strstr(logs, "firmware download complete: bytes=1297036 readback=verified R4=halted"));
+        assert(!memcmp(tcm11, firmware_fixture, 1297036));
+        assert(!memcmp((uint8_t *)tcm11 + (varaddr - 0x170000), good, sizeof(good)));
+        assert(tcm11[TCM11_TOP] == (fault == 0 || fault == 2 ? 0x2f0000u : 0xffef0010u));
+        assert(tcm11[(varaddr - 8 - 0x170000) / 4] == 0xfeedc0de && tcm11[(varaddr - 4 - 0x170000) / 4] == 128);
+        for (unsigned b = 0; b < 128; b++)
+            assert(((uint8_t *)tcm11)[varaddr - 136 - 0x170000 + b] == (uint8_t)(0xa5u ^ b));
+        assert(vector0 == (fault == 3 || fault == 4 ? 0 : 0x2e211407u));
+        assert(r4_runs == (fault <= 2 ? 1u : 0u));
+        assert(strstr(logs, "cleanup=verified") && strstr(logs, "Gen1 quiesce verified"));
+        assert(strstr(logs, "mode 11: deferred run finished"));
+        if (fault <= 2) {
+            assert(strstr(logs, "R4 released: firmware running"));
+            assert(strstr(logs, "firmware boot end: R4 ran, halted again"));
+        }
+        if (fault == 0 || fault == 2) {
+            assert(strstr(logs, "shared at 0x2f0000 after 2 polls: flags="));
+            assert(strstr(logs, "console at 0x2f0100: buffer=0x2f1000 size=8192 index="));
+            assert(strstr(logs, "console: RTE (PCIE-MSG_BUF) 17.10.157 (r) on BCM4375 r5 @ 37.4/168.0/1600.0MHz\n"));
+            assert(strstr(logs, "console: 000000.007 pciedev ready\n"));
+            assert(strstr(logs, "console: last line without newline\n"));
+            assert(strstr(logs, "lines=4\n"));
+            assert((strstr(logs, "firmware trap: type=0x100 epc=0x101") != NULL) == (fault == 2));
+        }
+        if (fault == 1) assert(strstr(logs, "shared area not published: last word=0xffef0010 after 100 polls"));
+        if (fault == 3) assert(strstr(logs, "firmware boot stopped: reset vector before=0 got=0 want=0x2e211407"));
+        if (fault == 4) assert(strstr(logs, "firmware boot stopped: reset vector before=0xffffffff"));
+        if (fault >= 3) assert(!strstr(logs, "R4 released"));
+        if (fault == 5) assert(strstr(logs, "R4 wrapper resetstatus stays 0x1") &&
+            strstr(logs, "firmware boot end: R4 never ran, halted again"));
+    }
+    puts("Firmware boot: NVRAM layout guard, deferred thread, DHD NVRAM/token/seed/vector order, release and re-halt, shared/console/trap reads, read-only RAM while running passed");
 }
 '''
 

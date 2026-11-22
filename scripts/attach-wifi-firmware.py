@@ -9,12 +9,17 @@ and the B2LFW001 descriptor, and the pinned original station firmware
 file. The loader then hands it to XNU through /chosen/b2l,wifi-firmware, and
 b2l_wifi_diag=10 copies it to the halted chip's RAM.
 
+S10 port: --nvram also attaches the board's nvram.txt, processed the way Linux
+DHD processes it (scripts/package-boot.py process_nvram), right after the
+firmware; the descriptor becomes B2LFW002 and b2l_wifi_diag=11 boots the
+firmware with it. The NVRAM is not pinned by hash: the kernel checks its layout.
+
 The result holds a personal address and vendor firmware: write it outside the
 repository, never upload it. No phone I/O is done here.
 
   python3 scripts/attach-wifi-firmware.py --boot boot.img \
       --firmware /private/bcmdhd_sta.bin_b1 --mac-file /private/wifi-mac.txt \
-      --output /private/boot-wifi.img
+      [--nvram /private/nvram.txt_CS01_semco_b1] --output /private/boot-wifi.img
 """
 import argparse
 import hashlib
@@ -29,7 +34,7 @@ package_boot = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package_boot)
 
 
-def attach(boot, firmware, mac):
+def attach(boot, firmware, mac, nvram=None):
     info = package_boot.check_boot(boot)
     if info["wifi_firmware_bytes"]:
         raise ValueError("the BOOT image already carries firmware")
@@ -43,8 +48,9 @@ def attach(boot, firmware, mac):
     end = trailer + offset + size
     if end != len(data):
         raise ValueError("unexpected bytes after the Mach-O")
-    field = package_boot.wifi_metadata(mac, len(blob))
-    return data[:trailer + 288] + field + data[trailer + 320:end] + blob
+    board = package_boot.process_nvram(nvram.read_bytes()) if nvram else b""
+    field = package_boot.wifi_metadata(mac, len(blob), len(board))
+    return data[:trailer + 288] + field + data[trailer + 320:end] + blob + board
 
 
 def main():
@@ -52,12 +58,13 @@ def main():
     p.add_argument("--boot", type=Path, required=True, help="BOOT image from CI, without firmware")
     p.add_argument("--firmware", type=Path, required=True, help="private bcmdhd_sta.bin_b1")
     p.add_argument("--mac-file", type=Path, required=True, help="private file: six colon-separated octets")
+    p.add_argument("--nvram", type=Path, help="private board nvram.txt, for b2l_wifi_diag=11")
     p.add_argument("--output", type=Path, required=True, help="private output image (must not exist)")
     a = p.parse_args()
     if a.output.exists():
         p.error("output exists; refusing to overwrite")
     try:
-        image = attach(a.boot, a.firmware, package_boot.read_wifi_mac(a.mac_file))
+        image = attach(a.boot, a.firmware, package_boot.read_wifi_mac(a.mac_file), a.nvram)
         a.output.write_bytes(image)
         info = package_boot.check_boot(a.output)
     except ValueError as error:
@@ -66,6 +73,7 @@ def main():
         print(f"attach failed: {error}", file=sys.stderr)
         return 2
     print(f"boot_bytes={info['boot_bytes']} firmware_offset={info['wifi_firmware_file_offset']} "
+          f"nvram_bytes={info['wifi_nvram_bytes']} "
           f"sha256={hashlib.sha256(a.output.read_bytes()).hexdigest()}")
     return 0
 

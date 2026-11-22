@@ -84,29 +84,100 @@ def read_wifi_mac(path):
     return mac
 
 
-def wifi_metadata(mac=None, firmware_size=0):
+# S10 port: Wi-Fi mode 11 boots the firmware with the board NVRAM, which
+# follows the firmware in the attachment (B2LFW002, uefi/XnuLoader/BootMetadata.h).
+WIFI_NVRAM_MAX = 32768
+NVRAM_LAYOUT_ERROR = "private NVRAM is not in the DHD-processed layout"
+
+
+def check_nvram(data):
+    """The rule b2l_wifi_diag.c applies: printable name=value entries, each
+    ended by one NUL, then NUL padding; whole words; the last word zero.
+    Error text never includes the private content."""
+    if len(data) < 8 or len(data) > WIFI_NVRAM_MAX or len(data) % 4 or any(data[-4:]):
+        raise ValueError(NVRAM_LAYOUT_ERROR)
+    body = data.rstrip(b"\0")
+    if not body:
+        raise ValueError(NVRAM_LAYOUT_ERROR)
+    for entry in body.split(b"\0"):
+        if not entry or any(c < 0x20 or c > 0x7e for c in entry) or entry.find(b"=") < 1:
+            raise ValueError(NVRAM_LAYOUT_ERROR)
+    return len(data)
+
+
+def process_nvram(text):
+    """What Linux DHD writes to the chip from an nvram.txt (bcmutils.c
+    process_nvram_vars, then dhdpcie_download_nvram): carriage returns and
+    '#' comments to the end of the line dropped, empty lines dropped, each
+    line ended by a NUL; padded to a word, one more NUL, rounded to a word."""
+    out = bytearray()
+    find_newline = False
+    column = 0
+    for c in text:
+        if c == 0x0d:
+            continue
+        if find_newline and c != 0x0a:
+            continue
+        find_newline = False
+        if c == 0x23:
+            find_newline = True
+            continue
+        if c == 0x0a:
+            if column:
+                out.append(0)
+                column = 0
+            continue
+        out.append(c)
+        column += 1
+    out += bytes(-len(out) % 4)
+    out.append(0)
+    out += bytes(-len(out) % 4)
+    check_nvram(bytes(out))
+    return bytes(out)
+
+
+def wifi_metadata(mac=None, firmware_size=0, nvram_size=0):
     if mac is None:
-        if firmware_size:
+        if firmware_size or nvram_size:
             raise ValueError("private firmware requires WiFi metadata")
         return bytes(32)
     if len(mac) != 6 or not any(mac) or mac[0] & 1:
         raise ValueError("WiFi metadata requires six nonzero unicast address octets")
     if firmware_size not in (0, WIFI_FIRMWARE_SIZE):
         raise ValueError("unsupported private firmware length")
-    extension = b"B2LFW001" + struct.pack("<I", firmware_size) + bytes(6) if firmware_size else bytes(18)
+    if nvram_size and (not firmware_size or nvram_size > WIFI_NVRAM_MAX or nvram_size % 4):
+        raise ValueError("unsupported private NVRAM length")
+    if nvram_size:
+        extension = b"B2LFW002" + struct.pack("<IHH", firmware_size, nvram_size, nvram_size ^ 0xffff) + bytes(2)
+    elif firmware_size:
+        extension = b"B2LFW001" + struct.pack("<I", firmware_size) + bytes(6)
+    else:
+        extension = bytes(18)
     return b"B2LWIFI1" + mac + extension
 
 
-def wifi_firmware_size(field):
+def wifi_attachment(field):
+    """(firmware bytes, NVRAM bytes) the descriptor declares."""
     extension = field[14:]
     if extension == bytes(18):
-        return 0
-    if len(extension) != 18 or extension[:8] != b"B2LFW001" or any(extension[12:]):
+        return 0, 0
+    if len(extension) != 18 or extension[:7] != b"B2LFW00" or extension[7:8] not in (b"1", b"2"):
         raise ValueError("invalid private firmware descriptor")
     size = struct.unpack_from("<I", extension, 8)[0]
     if size != WIFI_FIRMWARE_SIZE:
         raise ValueError("unsupported private firmware length")
-    return size
+    if extension[7:8] == b"1":
+        if any(extension[12:]):
+            raise ValueError("invalid private firmware descriptor")
+        return size, 0
+    nvram, check = struct.unpack_from("<HH", extension, 12)
+    if any(extension[16:]) or not nvram or nvram ^ check != 0xffff or nvram > WIFI_NVRAM_MAX or nvram % 4:
+        raise ValueError("invalid private firmware descriptor")
+    return size, nvram
+
+
+def wifi_firmware_size(field):
+    return wifi_attachment(field)[0]
 
 
 def check_wifi_metadata(field):
@@ -114,7 +185,7 @@ def check_wifi_metadata(field):
         return False
     if len(field) != 32 or field[:8] != b"B2LWIFI1":
         raise ValueError("invalid optional BOOT WiFi metadata")
-    wifi_metadata(field[8:14], wifi_firmware_size(field))
+    wifi_metadata(field[8:14], *wifi_attachment(field))
     return True
 
 
@@ -202,12 +273,15 @@ def check_boot(path):
     if size < 4096 or size > 128 * 1024 * 1024 or trailer + offset + size > len(data):
         raise ValueError("invalid BOOT trailer size")
     wifi_present = check_wifi_metadata(data[trailer + 288:trailer + 320])
-    firmware_size = wifi_firmware_size(data[trailer + 288:trailer + 320])
+    firmware_size, nvram_size = wifi_attachment(data[trailer + 288:trailer + 320])
     firmware_offset = trailer + offset + size
-    if firmware_offset + firmware_size != len(data):
+    if firmware_offset + firmware_size + nvram_size != len(data):
         raise ValueError("invalid BOOT trailer size")
-    if firmware_size and hashlib.sha256(data[firmware_offset:]).hexdigest() != WIFI_FIRMWARE_SHA256:
+    firmware_end = firmware_offset + firmware_size
+    if firmware_size and hashlib.sha256(data[firmware_offset:firmware_end]).hexdigest() != WIFI_FIRMWARE_SHA256:
         raise ValueError("private firmware SHA-256 mismatch")
+    if nvram_size:
+        check_nvram(data[firmware_end:])
     macho = trailer + offset
     if struct.unpack_from("<III", data, macho) != (0xfeedfacf, 0x0100000c, 0):
         raise ValueError("XNU must be a thin, plain ARM64 Mach-O image")
@@ -215,7 +289,8 @@ def check_boot(path):
             "xnu_bytes": size, "boot_bytes": len(data), "ramdisk_bytes": 0,
             "payload_version": PAYLOAD_VERSION, "seed_bytes": SEED_SIZE,
             "wifi_mac_present": wifi_present, "wifi_firmware_bytes": firmware_size,
-            "wifi_firmware_file_offset": firmware_offset if firmware_size else None}
+            "wifi_firmware_file_offset": firmware_offset if firmware_size else None,
+            "wifi_nvram_bytes": nvram_size}
 
 
 def main():

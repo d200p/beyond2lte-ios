@@ -64,7 +64,7 @@ int b2l_build_device_tree(void *buffer, b2l_size capacity,
         (!b2l_secondary_address(c->secondary_base) || c->secondary_size!=B2L_SECONDARY_BYTES))return -1;
     if(c->ram_count&&b2l_ram_validate(c->ram,c->ram_count,c->memory_base,c->memory_size))return -1;
     if((c->wifi_firmware_base||c->wifi_firmware_size)&&
-       (c->wifi_firmware_size!=B2L_WIFI_FIRMWARE_BYTES||(c->wifi_firmware_base&4095)||
+       (!b2l_wifi_attachment_valid(c->wifi_firmware_size)||(c->wifi_firmware_base&4095)||
         c->wifi_firmware_base<c->memory_base||c->wifi_firmware_base-c->memory_base>c->memory_size||
         c->wifi_firmware_size>c->memory_size-(c->wifi_firmware_base-c->memory_base)))return -1;
     mem_regs[0] = c->memory_base; mem_regs[1] = c->memory_size;
