@@ -476,3 +476,36 @@ offset changes. The listener test, Apple's `MTLSharedEventListener` being nil
 whichever way, now calls our `notifyListener` without one. The `B2L CS`
 lines (17,000 a session, which pushed everything else out of the log ring)
 are kept for the first 64, then one in 1000 with the count.
+
+### Boot 73 (build 71) and what was added after it
+
+30 of 31 tests pass. The listener test now passes: with a nil listener our
+`notifyListener` runs the block on the completion queue at value 5. The
+`B2L CS` limit kept the log readable. CARenderer still leaves its target
+zero, and the new lines narrow down why:
+
+- Core Animation's constants do arrive: 5 to `fixed_vert_lph_spc` (all zero)
+  and 60 to `fixed_frag_lph_cph` (`fc_attachment_count=1`,
+  `fc_blend_function=0x3e`, ...). The line that would say how many of the 60
+  were matched was cut at the log's 256 bytes, and the fragment shader is
+  still 278 NIR instructions, as with the test's one constant. So whether
+  the 60 are applied is not settled yet.
+- The vertex shader's `buffer(2)` is a `float4x4` (the AIR metadata says so,
+  64 bytes). At bind time Core Animation's vertex buffer 2 at offset 256
+  and fragment buffer 1 at offset 0 hold only zeros. The vertices at
+  offset 512 are already in place: pixel positions (0,0), (32,0), (32,64)
+  with the colour as half4 (1,0,0,1), and so are the indices at 768
+  (0 1 2 2 3 0). With a zero matrix every vertex lands on one point and
+  nothing is drawn, which matches the zero target.
+- No `newBufferWithBytesNoCopy`, blit or compute is involved. The only
+  unimplemented calls were `-featureProfile` and the protection options.
+
+Our command buffers run all their commands at `commit`. If Core Animation
+filled the matrix only after binding, the GPU would still see it, so it is
+either written somewhere else or not at all. Added to the next build:
+
+- Each buffer a traced encoder binds (stage, index, last offset, including
+  `setVertexBufferOffset:`) is read again at each draw and at `commit`: 64
+  bytes, and 128 for the uniforms of buffer 2 and up.
+- A function's summary (matched constants) comes first, then its constants
+  on as many lines as they need.

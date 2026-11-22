@@ -671,7 +671,8 @@ read/write indices. Then the firmware runs 2 s more on its own, and the
 console is read again from where the first read stopped.
 
 The next step after this one is the host side itself: rings in host
-memory, bus mastering, the doorbell and interrupts, which no mode does yet.
+memory, bus mastering and the doorbells (mode 13, below; interrupts stay
+off there too).
 
 Result (boot 72, build 70): flags `0x30040007` (IPC revision 7,
 `d2h_sync_xorcsum`, `hostrdy`, `no_oob_dw`; indices in dongle memory),
@@ -691,3 +692,68 @@ cleaned/invalidated around each use), `use-msi = "false"` (the legacy
 interrupt, SPI 0xfd, or polling); `use-ia` only drives a PHY CDR-reset
 sequencer. Bus mastering is still off on both sides, so until mode 13 the
 chip cannot reach host memory at all.
+
+Boot 73 (build 71) ran mode 12 again with the same result. The shared area
+was at `0x24f8bc` again, while the console (`0x2e9768`) and `ring_info`
+(`0x2e0dd4`, ring memory `0x2e0e20`) were elsewhere than in boot 72: the
+firmware lays out its heap from the host's random seed. Mode 13 therefore
+reads every address from the shared area of that boot.
+
+## S10: the host side of the rings (mode 13)
+
+`b2l_wifi_diag=13` repeats mode 12 and then does the host half of DHD's
+start for this firmware, in the order `dhd_prot_init` and
+`dhd_bus_hostready` use (`dhd_msgbuf.c`, `dhd_pcie.c`, `bcmmsgbuf.h`,
+`bcmpcie.h`, `pcie_core.h` in `bcmdhd_101_16` at `a412cfaf`). It goes ahead
+only for flags with IPC revision 7, `hostrdy` and `d2h_sync_xorcsum`, and
+without `dma_index`, `2byte_indices`, `idma`, `ifrm` or `dar`; otherwise it
+logs the flags and stops.
+
+1. Host memory: 96 KiB from `kmem_alloc_contig`, below 4 GiB, zeroed,
+   `KMA_PERMANENT` (never freed, so a late DMA can only land in it). It is
+   used only if every page is physically contiguous and the extent lies in
+   owned RAM (`b2l_ram_contains_range`), as for `b2l_ufs_transport.c`. The
+   device tree says no cache coherency, so the CPU cleans the extent before
+   any doorbell and cleans and invalidates it before reading what the chip
+   wrote.
+2. The five common rings at their IPC 7 sizes: control submission 64×40,
+   rx post 512×32, control completion 64×24, tx completion 1024×24, rx
+   completion 512×40. For each, `ring_mem_t` max items, item size and base
+   are written in dongle RAM and read back, and every read/write index is
+   set to 0 (4-byte indices in dongle memory).
+3. The D2H scratch buffer (address, then length 8) and `host_cap` =
+   `0x801407`: version 7, `HOSTCAP_H2D_ENABLE_HOSTRDY`,
+   `HOSTCAP_DS_NO_OOB_DW` and `HOSTCAP_UR_FW_NO_TRAP`. It leaves out
+   `EXTENDED_TRAP_DATA`, which would need a trap buffer.
+4. Bus mastering, root port first (the bridge forwards upstream requests),
+   then the endpoint. Memory decoding stays on and the status bits are
+   written as zero. The guards of every later access expect it on, so it
+   cannot be lost silently. If only the root port takes it, it is switched
+   off again at once.
+5. Hostready: `0x12345678` to DB1 (`PCIH2D_DB1`, PCIe2 core `0x18003000` +
+   `0x144`). The firmware does not set `PCIE_SHARED_DAR`, so DHD uses these
+   registers and not the DAR copies. Then 200 ms, the state and the console.
+6. Two ioctl-response buffers (8 KiB) and four event buffers (2 KiB) posted
+   on the control submission ring the way `dhd_prot_rxbufpost_ctrl` does:
+   message type `0x0b`/`0x0d`, epoch from sequence number 254 modulo 253, a
+   request id, length and address. Then write index 6 and DB0 (`+0x140`)
+   with `0xff000006` (`DHD_WRPTR_UPDATE_H2D_DB_MAGIC`).
+7. For 2 s, every 200 ms, the step logs what changed: the firmware's read
+   index of the control submissions, the completion write indices,
+   `PCIMailBoxInt` (`+0xc30` for core rev 64) and the D2H mailbox data.
+   Then it logs every completion with its xorcsum check (all words XOR to
+   zero), the scratch words and any buffer the chip wrote, and reads the
+   console once more.
+
+No ioctl is sent and no interrupt is unmasked. When the R4 is halted again,
+bus mastering goes off on the endpoint and then on the root port, before
+the usual power-off. A read index of 6 means the chip read the phone's
+memory, and a completion means it wrote there.
+
+`tests/test_wifi_gen1.py` models phone memory as the CPU sees it and as the
+chip sees it, with only the cache calls copying between the two. Its
+firmware checks everything above at each doorbell, takes the buffers and
+writes one completion with a valid xorcsum plus an event. The faults cover
+no memory, a page hole, memory outside owned RAM, no `hostrdy` flag, a
+firmware that never takes the buffers, and an endpoint that will not
+master.

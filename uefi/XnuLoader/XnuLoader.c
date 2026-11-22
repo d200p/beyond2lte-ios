@@ -435,8 +435,11 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * NVRAM from the attachment (B2LFW002) for about 3 s, its shared
                  * area and console read, and the R4 halted again. Mode 12 (boot
                  * 70 booted it in mode 11): also the ring layout it set up for
-                 * the host, read only, 2 s more and its console again. */
-                "b2l_wifi_diag=12 "
+                 * the host, read only, 2 s more and its console again. Mode 13
+                 * (boots 72 and 73 ran mode 12): also the host side of those
+                 * rings in phone memory, bus mastering, the hostready and
+                 * control doorbells with six posted buffers, 2 s of polling. */
+                "b2l_wifi_diag=13 "
                 /* S10 port: test boots come back to TWRP by themselves 8 min
                  * after start (after Metal's test and Wi-Fi's deferred run),
                  * synced like the volume-key chord (B2LPower.cpp). */

@@ -124,6 +124,35 @@ static kern_return_t kernel_thread_start(thread_continue_t fn, void *arg, thread
 }
 static void thread_deallocate(thread_t thread) { (void)thread; assert(0); }
 void read_frandom(void *p, unsigned n) { (void)p; (void)n; assert(0); }
+/* S10 port, mode 13's host memory, cache and RAM checks: never reached here. */
+typedef unsigned ppnum_t;
+typedef uint64_t addr64_t;
+typedef void *pmap_t;
+typedef void *vm_map_t;
+#define PAGE_SIZE 16384u
+#define PAGE_MASK 16383u
+#define PAGE_SHIFT 14
+#define KMA_DATA 1u
+#define KMA_ZERO 2u
+#define KMA_PERMANENT 4u
+#define VM_KERN_MEMORY_IOKIT 1
+#define ptoa_64(p) ((uint64_t)(p) << PAGE_SHIFT)
+static vm_map_t kernel_map;
+static pmap_t kernel_pmap;
+static kern_return_t kmem_alloc_contig(vm_map_t map, vm_offset_t *va, vm_size_t size, vm_offset_t mask,
+    ppnum_t max, ppnum_t pmask, unsigned flags, int tag) {
+    (void)map; (void)va; (void)size; (void)mask; (void)max; (void)pmask; (void)flags; (void)tag;
+    assert(0); return 1;
+}
+ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va) { (void)pmap; (void)va; assert(0); return 0; }
+static void CleanPoC_DcacheRegion(vm_offset_t va, unsigned long size) { (void)va; (void)size; assert(0); }
+static void FlushPoC_DcacheRegion(vm_offset_t va, unsigned long size) { (void)va; (void)size; assert(0); }
+struct b2l_ram_range { uint64_t base, size; };
+static struct b2l_ram_range b2l_owned_ram[1];
+static unsigned b2l_owned_ram_count;
+static int b2l_ram_contains_range(const struct b2l_ram_range *r, unsigned n, uint64_t pa, uint64_t size) {
+    (void)r; (void)n; (void)pa; (void)size; assert(0); return 0;
+}
 static _Alignas(16384) uint32_t memory[5][4096];
 static const uintptr_t physical[] = {0x15860000, 0x10430000, 0x13c40000, 0x13c00000, 0x13ed0000};
 static unsigned maps, unmapped, reads, fail_map;
@@ -214,13 +243,13 @@ static void reset(int requested, unsigned fail) {
     memset(memory, 0, sizeof(memory)); memset(logs, 0, sizeof(logs));
 }
 int main(void) {
-    const int disabled[] = {-1, 0, 13, 14, -2};
+    const int disabled[] = {-1, 0, 14, 15, -2};
     for (unsigned i = 0; i < sizeof(disabled)/sizeof(disabled[0]); i++) {
         reset(disabled[i], 0); b2l_wifi_diag_start();
         assert(!maps && !reads && !writes && !unmapped && strstr(logs, "disabled"));
     }
-    /* Modes 10 to 12 need the staged private input before any MMIO or thread. */
-    for (int m = 10; m <= 12; m++) {
+    /* Modes 10 to 13 need the staged private input before any MMIO or thread. */
+    for (int m = 10; m <= 13; m++) {
         reset(m, 0); b2l_wifi_diag_start();
         assert(!maps && !reads && !writes && !thread_starts && strstr(logs, "firmware input absent/invalid"));
     }

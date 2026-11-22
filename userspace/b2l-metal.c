@@ -1559,21 +1559,38 @@ library_function(id self, id name, id values, id *error)
 	 * first 40 of a process), and what function_new said about them. */
 	static unsigned described;
 	if (__atomic_fetch_add(&described, 1, __ATOMIC_RELAXED) < 40) {
-		char list[600] = "";
+		/* The summary first: boot 73's one line was cut at 256 bytes in
+		 * the middle of 60 constants, before what function_new said. The
+		 * constants follow, as many lines as they take. */
+		say("function %s: %s, %u constants given; %s", text, values == nil ? "no constant values" :
+		    class_getName(object_getClass(values)), count, why[0] != 0 ? why : "-");
+		char list[168] = "";
 		size_t at = 0;
-		for (unsigned i = 0; i < count && at < sizeof(list) - 64; i++) {
+		unsigned first = 0;
+		for (unsigned i = 0; i < count; i++) {
 			uint64_t bits = 0;
 			memcpy(&bits, constants[i].bytes, constants[i].size < sizeof(bits) ? constants[i].size : sizeof(bits));
+			char one[96];
 			int n = constants[i].index >= 0 ?
-			    snprintf(list + at, sizeof(list) - at, " #%d=%llx", (int)constants[i].index, (unsigned long long)bits) :
-			    snprintf(list + at, sizeof(list) - at, " %s=%llx", constants[i].name != NULL ? constants[i].name : "?",
+			    snprintf(one, sizeof(one), " #%d=%llx", (int)constants[i].index, (unsigned long long)bits) :
+			    snprintf(one, sizeof(one), " %s=%llx", constants[i].name != NULL ? constants[i].name : "?",
 			    (unsigned long long)bits);
-			if (n > 0) {
-				at += (size_t)n;
+			if (n <= 0) {
+				continue;
+			}
+			if (at != 0 && at + (size_t)n >= sizeof(list)) {
+				say("function %s constants %u-%u:%s", text, first, i - 1, list);
+				at = 0;
+				first = i;
+			}
+			at += (size_t)snprintf(list + at, sizeof(list) - at, "%s", one);
+			if (at >= sizeof(list)) {
+				at = sizeof(list) - 1;
 			}
 		}
-		say("function %s: %s, %u constants given:%s%s%s", text, values == nil ? "no constant values" :
-		    class_getName(object_getClass(values)), count, list[0] != 0 ? list : " none", why[0] != 0 ? "; " : "", why);
+		if (at != 0) {
+			say("function %s constants %u-%u:%s", text, first, count - 1, list);
+		}
 	} else if (strstr(why, "not this function") != NULL) {
 		say("function %s (%u constants given): %s", text, count, why);
 	}
@@ -2418,6 +2435,15 @@ struct cmdbuf_state {
 	id signal_events[MAX_HANDLERS];         /* encodeSignalEvent:value:, retained */
 	uint64_t signal_values[MAX_HANDLERS];
 	unsigned num_signals;
+	/* S10 port: the buffers a traced encoder bound (one per stage and
+	 * index, the last offset), read again at each draw and at commit: boot
+	 * 73's Core Animation uniforms were zero when they were bound. */
+	struct watched {
+		id buffer;              /* retained */
+		unsigned long offset;
+		uint32_t stage, index;
+	} watch[8];
+	unsigned num_watch;
 };
 
 static void
@@ -2441,6 +2467,50 @@ cmdbuf_free(void *p)
 	}
 	for (unsigned i = 0; i < s->num_signals; i++) {
 		objc_release(s->signal_events[i]);
+	}
+	for (unsigned i = 0; i < s->num_watch; i++) {
+		objc_release(s->watch[i].buffer);
+	}
+}
+
+/* The first 64 bytes as 32-bit words: floats, matrices, colours. */
+static void
+bytes_line(const char *what, const void *bytes, unsigned long length, unsigned long index)
+{
+	char text[16 * 9 + 1] = "";
+	const uint8_t *p = bytes;
+	for (unsigned long i = 0; p != NULL && i + 4 <= length && i < 64; i += 4) {
+		uint32_t w = (uint32_t)p[i] | (uint32_t)p[i + 1] << 8 | (uint32_t)p[i + 2] << 16 | (uint32_t)p[i + 3] << 24;
+		size_t at = strlen(text);
+		snprintf(text + at, sizeof(text) - at, " %08x", w);
+	}
+	say("ca: %s bytes %lu: %lu bytes:%s", what, index, length, text);
+}
+
+/* What the watched buffers hold now (the first 64 bytes at the offset of
+ * each, and 64 more for the uniforms of buffer 2 and up). */
+static unsigned watch_lines;
+
+static void
+watch_dump(struct cmdbuf_state *c, const char *when)
+{
+	for (unsigned i = 0; c != NULL && i < c->num_watch; i++) {
+		const struct watched *w = &c->watch[i];
+		unsigned long length = msg_u(w->buffer, "length");
+		const uint8_t *p = ((const uint8_t *(*)(id, SEL))objc_msgSend)(w->buffer, S("contents"));
+		if (p == NULL || w->offset >= length) {
+			continue;
+		}
+		unsigned long left = length - w->offset;
+		for (unsigned long part = 0; part < (w->index >= 2 ? 2u : 1u) && part * 64 < left; part++) {
+			if (__atomic_fetch_add(&watch_lines, 1, __ATOMIC_RELAXED) >= 64) {
+				return;
+			}
+			char what[64];
+			snprintf(what, sizeof(what), "%s, %s buffer %u at %lu", when,
+			    w->stage == B2L_MTL_VERTEX ? "vertex" : "fragment", w->index, w->offset + part * 64);
+			bytes_line(what, p + w->offset + part * 64, left - part * 64 < 64 ? left - part * 64 : 64, w->index);
+		}
 	}
 }
 
@@ -2511,6 +2581,7 @@ cmdbuf_commit(id self, SEL _cmd)
 	}
 	s->committed = true;
 	s->status = CB_SCHEDULED;
+	watch_dump(s, "at commit");
 	uint64_t gpu_us = 0;
 	char why[192] = "";
 	double start = CFAbsoluteTimeGetCurrent();
@@ -2981,6 +3052,7 @@ render_set_pipeline(id self, SEL _cmd, id state)
 }
 
 static void trace_bytes(id self, const char *stage, const void *bytes, unsigned long length, unsigned long index);
+static void watch_buffer(id encoder, uint32_t stage, id buffer, unsigned long offset, unsigned long index);
 
 static void
 set_buffer(id self, SEL _cmd, uint32_t stage, id buffer, unsigned long offset, unsigned long index)
@@ -2998,6 +3070,7 @@ set_buffer(id self, SEL _cmd, uint32_t stage, id buffer, unsigned long offset, u
 		unsigned long length = buffer != nil ? msg_u(buffer, "length") : 0ul;
 		say("ca: %s buffer %lu: %p offset %lu of %lu bytes", stage == B2L_MTL_VERTEX ? "vertex" : "fragment", index,
 		    (void *)buffer, offset, length);
+		watch_buffer(self, stage, buffer, offset, index);
 		/* What is there now (Core Animation writes before it encodes). */
 		const uint8_t *p = buffer != nil ? ((const uint8_t *(*)(id, SEL))objc_msgSend)(buffer, S("contents")) : NULL;
 		if (p != NULL && offset < length) {
@@ -3012,21 +3085,53 @@ set_buffer(id self, SEL _cmd, uint32_t stage, id buffer, unsigned long offset, u
 	mtl->cmdbuf_set_buffer(mc, stage, (uint32_t)index, mb, offset);
 }
 
-/* The first 64 bytes as 32-bit words: floats, matrices, colours. */
 static void
 trace_bytes(id self, const char *stage, const void *bytes, unsigned long length, unsigned long index)
 {
-	if (!tracing(self)) {
+	if (tracing(self)) {
+		bytes_line(stage, bytes, length, index);
+	}
+}
+
+/* S10 port: a watched buffer's new offset (setVertexBufferOffset:atIndex:). */
+static void
+watch_offset(id encoder, uint32_t stage, unsigned long offset, unsigned long index)
+{
+	struct encoder_state *e = state_of(encoder);
+	struct cmdbuf_state *c = e != NULL ? state_of(e->cmdbuf) : NULL;
+	for (unsigned i = 0; c != NULL && i < c->num_watch; i++) {
+		if (c->watch[i].stage == stage && c->watch[i].index == index) {
+			c->watch[i].offset = offset;
+		}
+	}
+}
+
+/* S10 port: remember a traced encoder's buffer for watch_dump. */
+static void
+watch_buffer(id encoder, uint32_t stage, id buffer, unsigned long offset, unsigned long index)
+{
+	struct encoder_state *e = state_of(encoder);
+	struct cmdbuf_state *c = e != NULL ? state_of(e->cmdbuf) : NULL;
+	if (c == NULL || buffer == nil) {
 		return;
 	}
-	char text[16 * 11 + 1] = "";
-	const uint8_t *p = bytes;
-	for (unsigned long i = 0; p != NULL && i + 4 <= length && i < 64; i += 4) {
-		uint32_t w = (uint32_t)p[i] | (uint32_t)p[i + 1] << 8 | (uint32_t)p[i + 2] << 16 | (uint32_t)p[i + 3] << 24;
-		size_t at = strlen(text);
-		snprintf(text + at, sizeof(text) - at, " %08x", w);
+	unsigned i = 0;
+	while (i < c->num_watch && (c->watch[i].stage != stage || c->watch[i].index != index)) {
+		i++;
 	}
-	say("ca: %s bytes %lu: %lu bytes:%s", stage, index, length, text);
+	if (i == c->num_watch) {
+		if (i == sizeof(c->watch) / sizeof(c->watch[0])) {
+			return;
+		}
+		c->watch[i].buffer = objc_retain(buffer);
+		c->num_watch++;
+	} else if (c->watch[i].buffer != buffer) {
+		objc_release(c->watch[i].buffer);
+		c->watch[i].buffer = objc_retain(buffer);
+	}
+	c->watch[i].offset = offset;
+	c->watch[i].stage = stage;
+	c->watch[i].index = (uint32_t)index;
 }
 
 static void
@@ -3070,6 +3175,7 @@ render_vertex_buffer_offset(id self, SEL _cmd, unsigned long offset, unsigned lo
 	if (mc != NULL) {
 		if (tracing(self)) {
 			say("ca: vertex buffer %lu offset now %lu", index, offset);
+			watch_offset(self, B2L_MTL_VERTEX, offset, index);
 		}
 		mtl->cmdbuf_set_buffer_offset(mc, B2L_MTL_VERTEX, (uint32_t)index, offset);
 	}
@@ -3083,6 +3189,7 @@ render_fragment_buffer_offset(id self, SEL _cmd, unsigned long offset, unsigned 
 	if (mc != NULL) {
 		if (tracing(self)) {
 			say("ca: fragment buffer %lu offset now %lu", index, offset);
+			watch_offset(self, B2L_MTL_FRAGMENT, offset, index);
 		}
 		mtl->cmdbuf_set_buffer_offset(mc, B2L_MTL_FRAGMENT, (uint32_t)index, offset);
 	}
@@ -3429,6 +3536,8 @@ draw(id self, SEL _cmd, unsigned long type, unsigned long start, unsigned long c
 			trace_bytes(self, "index", p + index_offset, bytes < length - index_offset ? bytes : length - index_offset,
 			    index_offset);
 		}
+		struct encoder_state *e = state_of(self);
+		watch_dump(e != NULL ? state_of(e->cmdbuf) : NULL, "at draw");
 	}
 	mtl->cmdbuf_draw(mc, &d);
 }

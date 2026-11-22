@@ -108,6 +108,79 @@ void read_frandom(void *p, unsigned n) {
     assert(mode >= 11 && n == 128);
     for (unsigned i = 0; i < n; i++) ((uint8_t *)p)[i] = (uint8_t)(0xa5u ^ i);
 }
+/* S10 port, mode 13: phone memory as the CPU sees it (host_cpu) and as the
+ * chip sees it (host_dram); only the cache calls move bytes between them. */
+typedef unsigned ppnum_t;
+typedef uint64_t addr64_t;
+typedef void *pmap_t;
+typedef void *vm_map_t;
+#define PAGE_SIZE 16384u
+#define PAGE_MASK 16383u
+#define PAGE_SHIFT 14
+#define KMA_DATA 1u
+#define KMA_ZERO 2u
+#define KMA_PERMANENT 4u
+#define VM_KERN_MEMORY_IOKIT 1
+#define ptoa_64(p) ((uint64_t)(p) << PAGE_SHIFT)
+#define HOST13_PA 0x9f000000u
+#define HOST13_BYTES 0x18000u
+static vm_map_t kernel_map;
+static pmap_t kernel_pmap;
+static _Alignas(16384) uint8_t host_cpu[HOST13_BYTES];
+static uint8_t host_dram[HOST13_BYTES], host_dev[HOST13_BYTES];
+static unsigned host13_fault, host_allocs, cleans, flushes, bme_ever, hostready13, db0_13;
+static uint32_t mailbox13;
+static kern_return_t kmem_alloc_contig(vm_map_t map, vm_offset_t *va, vm_size_t size, vm_offset_t mask,
+    ppnum_t max, ppnum_t pmask, unsigned flags, int tag) {
+    assert(mode >= 13 && !map && size == HOST13_BYTES && mask == PAGE_MASK && max == 0x3ffff && !pmask);
+    assert(flags == (KMA_DATA | KMA_ZERO | KMA_PERMANENT) && tag == VM_KERN_MEMORY_IOKIT && !host_allocs++);
+    if (host13_fault == 1) return 3;
+    memset(host_cpu, 0, sizeof(host_cpu));      /* KMA_ZERO, through the cache */
+    memset(host_dram, 0xee, sizeof(host_dram)); /* stale until cleaned */
+    *va = (vm_offset_t)host_cpu;
+    return KERN_SUCCESS;
+}
+ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va) {
+    uintptr_t base = (uintptr_t)host_cpu;
+    assert(!pmap && va >= base && va < base + HOST13_BYTES && !((va - base) % PAGE_SIZE));
+    unsigned page = (unsigned)((va - base) / PAGE_SIZE);
+    return (HOST13_PA >> PAGE_SHIFT) + page + (host13_fault == 2 && page == 3 ? 7u : 0u);
+}
+static unsigned host13_offset(vm_offset_t va, unsigned long size) {
+    uintptr_t base = (uintptr_t)host_cpu;
+    assert(mode >= 13 && host_allocs == 1 && va >= base && size && va + size <= base + HOST13_BYTES);
+    return (unsigned)(va - base);
+}
+static void CleanPoC_DcacheRegion(vm_offset_t va, unsigned long size) {
+    unsigned off = host13_offset(va, size);
+    memcpy(host_dram + off, host_cpu + off, size);
+    cleans++;
+}
+static void FlushPoC_DcacheRegion(vm_offset_t va, unsigned long size) {
+    unsigned off = host13_offset(va, size);
+    for (unsigned long i = off; i < off + size; i++) {
+        if (!host_dev[i]) assert(host_cpu[i] == host_dram[i]); /* no CPU write left uncleaned */
+        host_cpu[i] = host_dram[i];
+    }
+    flushes++;
+}
+struct b2l_ram_range { uint64_t base, size; };
+static struct b2l_ram_range b2l_owned_ram[1] = { { 0x80000000u, 0x20000000u } };
+static unsigned b2l_owned_ram_count = 1;
+static int b2l_ram_contains_range(const struct b2l_ram_range *r, unsigned n, uint64_t pa, uint64_t size) {
+    assert(r == b2l_owned_ram && n == 1 && size == HOST13_BYTES);
+    return host13_fault != 3 && pa >= r->base && pa + size <= r->base + r->size;
+}
+/* Bus mastering: off on both sides, or (mode 13, host memory in place) on at
+ * the root port, with the endpoint on or not yet. */
+static int bme_ok(void) {
+    uint32_t rc = memory[8][4/4] & 0x145, ep = memory[9][0x2004/4] & 4;
+    if (!(rc & 4)) return !rc && !ep;
+    return mode >= 13 && host_allocs && rc == 4;
+}
+static int master13_on(void) {
+    return mode >= 13 && (memory[9][0x2004/4] & 7) == 6 && (memory[8][4/4] & 0x145) == 4;
+}
 #define TCM11_TOP ((0x2ffffcu - 0x170000u) / 4)
 static uint32_t tcm11[0x190000 / 4];
 static uint32_t vector0, r4_io, r4_reset;
@@ -123,7 +196,7 @@ static void start_firmware(void) {
     /* Released only after NVRAM, token and reset vector are in place. */
     uint32_t words = nvram_fixture_bytes / 4;
     assert(tcm11[TCM11_TOP] == ((~words << 16) | words) && vector0 == 0x2e211407); /* fixture bytes 7,20,33,46 */
-    tcm11_put(0x2f0000, boot_fault == 2 ? 0x407 : 7); /* flags: version 7 (+ trap) */
+    tcm11_put(0x2f0000, mode >= 13 && host13_fault != 4 ? 0x30040007u : boot_fault == 2 ? 0x407 : 7);
     tcm11_put(0x2f0004, 0x2f0200);
     tcm11_put(0x2f0014, 0x2f0100);
     tcm11_put(0x2f001c, 0x5a5a1234);
@@ -149,6 +222,58 @@ static void start_firmware(void) {
         tcm11_put(0x2f0604 + 16 * r, rings[r][1]);
     }
     tcm11_put(0x2f0720, 1);                 /* the firmware wrote one control completion */
+}
+/* Mode 13 writes into the running firmware's RAM only what dhd_prot_init
+ * writes, all before bus mastering except the control submission write index. */
+static void tcm13_write(uint32_t address, uint32_t value) {
+    int ring_mem = address >= 0x2f0600 && address < 0x2f0650 && (address & 15) >= 4;
+    int index = (address >= 0x2f0700 && address < 0x2f0708) || (address >= 0x2f0710 && address < 0x2f0718) ||
+        (address >= 0x2f0720 && address < 0x2f072c) || (address >= 0x2f0730 && address < 0x2f073c);
+    int shared = address == 0x2f0034 || address == 0x2f0038 || address == 0x2f003c || address == 0x2f0054;
+    assert(mode >= 13 && host_allocs == 1 && (ring_mem || index || shared));
+    if (address == 0x2f0700 && value) assert(value == 6 && master13_on() && hostready13 && !db0_13);
+    else assert(!bme_ever && !hostready13 && (index ? !value : 1));
+    tcm11[(address - 0x170000) / 4] = value;
+}
+static uint32_t tcm13(uint32_t address) { return tcm11[(address - 0x170000) / 4]; }
+static void pcie13_write(unsigned off, uint32_t value) {
+    static const uint32_t rings[5][3] = { { 0x00000, 64, 40 }, { 0x01000, 512, 32 }, { 0x05000, 64, 24 },
+                                          { 0x06000, 1024, 24 }, { 0x0c000, 512, 40 } };
+    assert(mode >= 13 && master13_on() && r4_running);
+    if (off == 0x144) {
+        /* dhd_bus_hostready: everything dhd_prot_init writes is in place, and
+         * the zeroed rings reached memory. */
+        assert(value == 0x12345678 && !hostready13++);
+        for (unsigned r = 0; r < 5; r++) {
+            assert(tcm13(0x2f0604 + 16 * r) == (rings[r][1] | rings[r][2] << 16));
+            assert(tcm13(0x2f0608 + 16 * r) == HOST13_PA + rings[r][0] && !tcm13(0x2f060c + 16 * r));
+        }
+        assert(tcm13(0x2f0034) == 8 && tcm13(0x2f0038) == HOST13_PA + 0x11000 && !tcm13(0x2f003c));
+        assert(tcm13(0x2f0054) == 0x801407 && !tcm13(0x2f0720));
+        for (unsigned i = 0; i < HOST13_BYTES; i++) assert(!host_dram[i]);
+        return;
+    }
+    assert(off == 0x140 && value == 0xff000006 && hostready13 && !db0_13++ && tcm13(0x2f0700) == 6);
+    for (unsigned i = 0; i < 6; i++) {
+        const uint8_t *item = host_dram + 40 * i;   /* what the chip reads */
+        uint32_t request, low, high;
+        memcpy(&request, item + 4, 4); memcpy(&low, item + 16, 4); memcpy(&high, item + 20, 4);
+        assert(item[0] == (i < 2 ? 0x0b : 0x0d) && !item[1] && !item[2] && item[3] == 1 + i && request == 1 + i);
+        assert((item[8] | item[9] << 8) == (i < 2 ? 0x2000 : 0x800) && !high &&
+            low == HOST13_PA + (i < 2 ? 0x12000 + 0x2000 * i : 0x16000 + 0x800 * (i - 2)));
+        for (unsigned b = 10; b < 16; b++) assert(!item[b]);
+        for (unsigned b = 24; b < 40; b++) assert(!item[b]);
+    }
+    if (host13_fault == 5) return;  /* the firmware never takes them */
+    tcm11[(0x2f0710 - 0x170000) / 4] = 6;
+    /* One control completion with a valid xorcsum, and an event. */
+    uint32_t c[6] = { 0x01000002u, 0x77, 0x00020000u, 0x11, 0x22, 0 };
+    c[5] = c[0] ^ c[1] ^ c[2] ^ c[3] ^ c[4];
+    memcpy(host_dram + 0x5000, c, sizeof(c)); memset(host_dev + 0x5000, 1, sizeof(c));
+    static const uint32_t event[4] = { 0xe1, 0xe2, 0xe3, 0xe4 };
+    memcpy(host_dram + 0x16000, event, sizeof(event)); memset(host_dev + 0x16000, 1, sizeof(event));
+    tcm11[(0x2f0720 - 0x170000) / 4] = 1;
+    mailbox13 = 0x100;
 }
 static uintptr_t ml_io_map_unmappable(uintptr_t pa, unsigned long size, unsigned flags) {
     assert(maps < (mode >= 6 ? 11u : mode + 5) && pa == physical[maps] && size == 0x4000 && flags == VM_WIMG_IO);
@@ -186,14 +311,15 @@ static int valid_link_setup(void) {
         !(memory[4][0x0c/4] | memory[4][0x10/4] | memory[4][0x14/4]) &&
         memory[6][0xf8/4] == 0x70 && memory[6][0x100/4] == 0x87 &&
         memory[6][0x104/4] == 0x50 && !(memory[6][0xd0/4] & 0xc0) &&
-        !(memory[8][0x04/4] & 0x145) && (memory[8][0xa0/4] & 15) == 1 &&
+        !(memory[8][0x04/4] & 0x141) && bme_ok() && (memory[8][0xa0/4] & 15) == 1 &&
         (memory[8][0x710/4] & 0x3f0000) == 0x10000 &&
         (memory[8][0x80c/4] & 0x1f00) == 0x100 && memory[8][0xb40/4] == 26;
 }
 /* Mode 11 after the TCM inventory: address 0, the R4 wrapper and all of RAM. */
 static int boot11_window(uint32_t window) {
     return mode >= 11 && bank_reads == 13 &&
-        (window == 0 || window == 0x18102000 || (window >= 0x170000 && window < 0x300000));
+        (window == 0 || window == 0x18102000 || (window >= 0x170000 && window < 0x300000) ||
+         (mode >= 13 && window == 0x18003000));
 }
 static uint32_t host_read(uintptr_t address, unsigned off) {
     unsigned i = region_index(address); assert(!(off & 3) && off < 0x4000); powered(i);
@@ -247,7 +373,7 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
         else assert(mode >= 6 && (off == 0x2004 || off == 0x2010 || off == 0x2014 || off == 0x2080));
         assert(trained && valid_link_setup() && now_us >= enabled_at + 100000);
         assert(memory[8][0x900/4] == 1 && (memory[8][0x18/4] & 0xffffff) == 0x10100);
-        assert(!(memory[8][4/4] & 0x145));
+        assert(!(memory[8][4/4] & 0x141) && bme_ok());
         assert(atu[0] == 4 && atu[1] == 0x80000000 && atu[2] == 0x14ffe000 &&
             atu[3] == 0 && atu[4] == 0x14ffefff && atu[5] == 0x01000000 && atu[6] == 0);
         if (endpoint_fault == 11) now_us += 110000;
@@ -262,9 +388,10 @@ static uint32_t host_read(uintptr_t address, unsigned off) {
     if (i == 10) {
         uint32_t window = memory[9][0x2080/4];
         if (boot11_window(window)) {
-            assert(off < 4096 && (memory[9][0x2004/4] & 7) == 2 && atu0[1] == 0x80000000);
-            assert(memory[8][0x900/4] == 1 && !(memory[8][4/4] & 0x145));
+            assert(off < 4096 && (memory[9][0x2004/4] & 3) == 2 && atu0[1] == 0x80000000);
+            assert(memory[8][0x900/4] == 1 && !(memory[8][4/4] & 0x141) && bme_ok());
             if (window == 0) { assert(off == 0); return boot_fault == 4 ? UINT32_MAX : vector0; }
+            if (window == 0x18003000) { assert(off == 0xc30 && master13_on()); return mailbox13; }
             if (window == 0x18102000) {
                 assert(off == 0x408 || off == 0x800 || off == 0x804);
                 if (off == 0x804) {
@@ -389,9 +516,10 @@ static void host_write(uintptr_t address, unsigned off, uint32_t value) {
     if (i == 10) {
         uint32_t window = memory[9][0x2080/4];
         if (boot11_window(window)) {
-            assert(off < 4096 && (memory[9][0x2004/4] & 7) == 2 && atu0[1] == 0x80000000);
-            assert(memory[8][0x900/4] == 1 && !(memory[8][4/4] & 0x145));
+            assert(off < 4096 && (memory[9][0x2004/4] & 3) == 2 && atu0[1] == 0x80000000);
+            assert(memory[8][0x900/4] == 1 && !(memory[8][4/4] & 0x141) && bme_ok());
             writes++;
+            if (window == 0x18003000) { pcie13_write(off, value); return; }
             if (window == 0) {
                 assert(off == 0 && !r4_running && !r4_runs && boot_fault != 4);
                 if (boot_fault == 3) return; /* Lost write: the readback must catch it. */
@@ -408,6 +536,7 @@ static void host_write(uintptr_t address, unsigned off, uint32_t value) {
                 r4_running = running;
                 return;
             }
+            if (mode >= 13 && r4_running) { tcm13_write(window + off, value); return; }
             /* RAM is written only while the R4 is halted and before it has ever run. */
             assert(!r4_running && !r4_runs && !(r4_io & 2) && (r4_io & 0x20));
             tcm11[(window - 0x170000 + off) / 4] = value;
@@ -439,16 +568,21 @@ static void host_write(uintptr_t address, unsigned off, uint32_t value) {
         assert(mode >= 6 && endpoint_reads == 4 && memory[8][0x900/4] == 1 && atu[1] == 0x80000000);
         assert(off == 0x2004 || off == 0x2010 || off == 0x2014 || off == 0x2080);
         if (off == 0x2004) {
-            assert(!(value >> 16) && ((value & 7) == 0 || (value & 7) == 2));
+            assert(!(value >> 16) && ((value & 3) == 0 || (value & 3) == 2));
+            /* S10 port, mode 13: the endpoint masters only after the root port forwards. */
+            assert(!(value & 4) || (mode >= 13 && host_allocs && (memory[8][4/4] & 4)));
             assert(!((before ^ value) & 0xfff8)); /* Preserve unrelated command bits. */
+            if (value & 4) bme_ever = 1;
+            if (host13_fault == 6 && (value & 4)) value &= ~4u; /* it does not stick */
         }
-        else assert(!(memory[9][0x2004/4] & 7)); /* Never move a live BAR. */
+        else assert(!(memory[9][0x2004/4] & 3)); /* Never move a live BAR. */
         if (off == 0x2010) assert(value == 4 || value == 0x14400004);
         if (off == 0x2014) assert(value == 0);
         if (off == 0x2080) assert(value == 0x18000000 || value == 0x18001000 || (mode >= 7 && value == 0x18111000) ||
             (mode >= 8 && (value == 0x18103000 || value == 0x18102000 || value == 0x18002000)) ||
             (mode == 10 && value >= 0x170000 && value <= 0x2ac000 && !(value & 4095)) ||
-            (mode >= 11 && (value == 0 || (value >= 0x170000 && value < 0x300000 && !(value & 4095)))));
+            (mode >= 11 && (value == 0 || (value >= 0x170000 && value < 0x300000 && !(value & 4095)))) ||
+            (mode >= 13 && value == 0x18003000));
         writes++; config_writes++;
         if (mode == 10 && bank_reads == 13 && off == 0x2080 &&
             (value == 0x18102000 || (value >= 0x170000 && value <= 0x2ac000))) {
@@ -518,7 +652,13 @@ static void host_write(uintptr_t address, unsigned off, uint32_t value) {
         if (mode >= 5 && off == 0x900) { mask = UINT32_MAX; assert(value == original_viewport || value == 1 || (mode >= 6 && value == 0)); }
         if (off == 4 || off == 0x44 || off == 0x80 || off == 0xa0) {
             assert(!(value >> 16));
-            if (off == 4) assert(!(value & 0x145));
+            if (off == 4) {
+                assert(!(value & 0x141));
+                /* S10 port, mode 13: the root port forwards only with the host memory in
+                 * place and the endpoint memory-only; it stops only after the endpoint. */
+                if (value & 4) { assert(mode >= 13 && host_allocs && (memory[9][0x2004/4] & 7) == 2); bme_ever = 1; }
+                else assert(!(memory[9][0x2004/4] & 4));
+            }
             if (off == 0x44) assert(!(value & 0x8000));
             writes++;
             if (writes != drop_write) {
@@ -562,6 +702,9 @@ static void reset(unsigned which, unsigned failure) {
     if (mode >= 10) { firmware_fixture_setup(); memset(firmware_ram, 0, sizeof(firmware_ram)); }
     for (unsigned b = 0; b < 13; b++) bank_info[b] = mode >= 10 ? (b == 4 ? 0x88c07 : 0x108c0f) : b < 5 ? 0x203 : 0xf;
     thread_starts = thread_fail = threads_released = deferred_s = 0;
+    host13_fault = host_allocs = cleans = flushes = bme_ever = hostready13 = db0_13 = 0; mailbox13 = 0;
+    memset(host_cpu, 0, sizeof(host_cpu)); memset(host_dram, 0, sizeof(host_dram)); memset(host_dev, 0, sizeof(host_dev));
+    wifi_host = NULL; wifi_host_pa = 0; wifi_master = 0;
     memset(tcm11, 0, sizeof(tcm11)); vector0 = 0; r4_io = 0x21; r4_reset = 0;
     r4_running = r4_runs = run_polls = status_stuck = boot_fault = nvram_fixture_bytes = 0;
     memset(wrapper_values, 0, sizeof(wrapper_values)); wrapper_values[0][0] = 1; wrapper_values[1][0] = 0x21;
@@ -1041,6 +1184,60 @@ int main(void) {
         assert(strstr(logs, "console: no new text since index"));
     }
     puts("Firmware host layout: whole shared area, ring info, common rings and indices, mailboxes, a second console read, all read only, passed");
+    /* S10 port, mode 13: the host side of the rings on the synthetic firmware.
+     * 1 no memory, 2 a page hole, 3 not owned RAM, 4 no hostready flag,
+     * 5 the firmware never takes the buffers, 6 the endpoint will not master. */
+    mode = 13;
+    for (unsigned fault = 0; fault <= 6; fault++) {
+        reset(8, 0); firmware_fixture_nvram(good, sizeof(good)); nvram_fixture_bytes = sizeof(good);
+        host13_fault = fault;
+        b2l_wifi_diag_start(); verify_quiet();
+        assert(thread_starts == 1 && threads_released == 1 && deferred_s == 360 && r4_runs == 1);
+        assert(strstr(logs, "mode 13: deferred run finished") && strstr(logs, "cleanup=verified"));
+        assert(strstr(logs, "firmware boot end: R4 ran, halted again"));
+        assert(!wifi_master && !(memory[8][4/4] & 4) && !(memory[9][0x2004/4] & 4));
+        assert(host_allocs == (fault == 4 ? 0u : 1u));
+        if (fault == 4) {
+            assert(strstr(logs, "mode 13: flags 0x7 are not IPC 7 with hostready and xorcsum") && !bme_ever);
+            continue;
+        }
+        if (fault == 1) {
+            assert(strstr(logs, "mode 13: no contiguous host memory below 4 GiB") && !bme_ever && !cleans);
+            continue;
+        }
+        if (fault == 2 || fault == 3) {
+            assert(strstr(logs, "is not contiguous owned RAM below 4 GiB; kept, not used") && !bme_ever && !cleans);
+            continue;
+        }
+        assert(strstr(logs, "mode 13: host memory 98304 bytes at pa 0x9f000000: contiguous owned RAM"));
+        assert(strstr(logs, "five common rings at pa 0x9f000000, indices zero, scratch at 0x9f011000 (8 bytes), "
+            "host_cap 0x801407: written and read back"));
+        assert(bme_ever);
+        if (fault == 6) {
+            assert(strstr(logs, "bus mastering did not come on; nothing rung; off again verified"));
+            assert(!hostready13 && !db0_13 && !strstr(logs, "bus mastering off again (endpoint"));
+            continue;
+        }
+        assert(strstr(logs, "bus mastering on: root port, then endpoint") && hostready13 == 1 && db0_13 == 1);
+        assert(strstr(logs, "after hostready: control submissions read 0 of 6; completion writes 0 0 0; mailbox int 0;"));
+        assert(strstr(logs, "2 ioctl-response and 4 event buffers posted, control submission write index 6, DB0 0xff000006"));
+        assert(strstr(logs, "bus mastering off again (endpoint, then root port); host memory kept, never reused"));
+        assert(strstr(logs, "mode 13: scratch 0 0\n") && flushes == 1 && cleans >= 2);
+        if (fault == 5) {
+            assert(strstr(logs, "2000 ms after the posts: control submissions read 0 of 6; completion writes 0 0 0"));
+            assert(!strstr(logs, " 200 ms after the posts") && !strstr(logs, "ring 2 item 0"));
+            continue;
+        }
+        assert(strstr(logs, " 200 ms after the posts: control submissions read 6 of 6; completion writes 1 0 0; "
+            "mailbox int 0x100"));
+        assert(strstr(logs, "2000 ms after the posts: control submissions read 6 of 6; completion writes 1 0 0"));
+        char line[200];
+        snprintf(line, sizeof(line), "ring 2 item 0: type 0x2 if 0 flags 0 epoch 1 request 0x77 status 0 ring 2; "
+            "0x11 0x22 %#x 0; xor 0\n", 0x01000002u ^ 0x77u ^ 0x00020000u ^ 0x11u ^ 0x22u);
+        assert(strstr(logs, line));
+        assert(strstr(logs, "mode 13: event buffer 2: 0xe1 0xe2 0xe3 0xe4\n"));
+    }
+    puts("Firmware host rings: owned contiguous memory, DHD's ring/scratch/host_cap writes, cache cleans before each doorbell, bus mastering order and its undo, posted buffers, completions read back passed");
 }
 '''
 

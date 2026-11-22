@@ -33,11 +33,21 @@
  * b2l_wifi_diag=12 (S10 port) also reads, while the firmware runs, the whole
  * shared area, its ring_info, the five common rings and their indices and
  * the mailbox words, lets it run 2 s more and reads its console again.
+ * b2l_wifi_diag=13 (S10 port) also does the host half of DHD's start
+ * (dhd_prot_init, dhd_bus_hostready): the five common rings in phone memory
+ * below 4 GiB, the scratch word and host_cap in the shared area, bus
+ * mastering on the root port and the endpoint, the hostready doorbell, then
+ * two ioctl-response and four event buffers on the control submission ring
+ * and its doorbell, and 2 s of polling what the firmware did with them. No
+ * ioctl is sent and no interrupt is enabled. The memory is never freed, so a
+ * late DMA can only land in it; bus mastering is off again once the R4 is
+ * halted, before the power-off.
  * A powered PHY alone does not establish that DBI/ELBI accesses are safe.
  * All addresses/offsets are sourced in docs/wifi-bringup.md.
  */
 #include <arm64/b2l_early.h>
 #include <arm64/b2l_wifi_phy_data.h>
+#include <arm/caches_internal.h>
 #include <kern/clock.h>
 #include <kern/misc_protos.h>
 #include <kern/thread.h>
@@ -46,8 +56,11 @@
 #include <pexpert/pexpert.h>
 #include <pexpert/device_tree.h>
 #include <pexpert/arm64/boot.h>
+#include <pexpert/arm64/b2l_ram.h>
 #include <libsa/string.h>
 #include <vm/pmap.h>
+#include <vm/vm_kern.h>
+#include <vm/vm_kern_xnu.h>
 
 #define wlog(...) b2l_early_trace("B2L WIFI: " __VA_ARGS__)
 #define WIFI_FIRMWARE_BYTES 1297036u
@@ -58,6 +71,30 @@
 #define WIFI_RAM_END 0x300000u
 #define WIFI_R4_WRAPPER 0x18102000u
 #define WIFI_DEFER_S 360u
+/* S10 port, mode 13: the PCIe2 core (EROM: core 0x83c rev 64, slave port 0),
+ * its doorbells (pcie_core.h PCIH2D_MailBox, PCIH2D_DB1; the firmware does
+ * not set PCIE_SHARED_DAR, so not the DAR copies) and PCIMailBoxInt (rev 64). */
+#define WIFI_PCIE_CORE 0x18003000u
+#define WIFI_H2D_DB0 0x140u
+#define WIFI_H2D_DB1 0x144u
+#define WIFI_MAILBOX_INT 0xc30u
+#define WIFI_HOST_BYTES 0x18000u
+#define WIFI_HOST_SCRATCH 0x11000u      /* DMA_D2H_SCRATCH_BUF_LEN 8 */
+#define WIFI_HOST_IOCTL 0x12000u        /* two 8 KiB ioctl-response buffers */
+#define WIFI_HOST_EVENT 0x16000u        /* four 2 KiB event buffers */
+extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
+/* bcmmsgbuf.h sizes for IPC revision 7 (the default, not DHD_HTPUT_TUNABLES). */
+static const struct { uint32_t offset; uint16_t items, size; } wifi_rings[5] = {
+    { 0x00000, 64, 40 },        /* H2D control submission */
+    { 0x01000, 512, 32 },       /* H2D rx post */
+    { 0x05000, 64, 24 },        /* D2H control completion */
+    { 0x06000, 1024, 24 },      /* D2H tx completion */
+    { 0x0c000, 512, 40 },       /* D2H rx completion */
+};
+static uint8_t *wifi_host;      /* KMA_PERMANENT: never freed, never reused */
+static uint64_t wifi_host_pa;
+/* 4 while bus mastering is on: the guards then expect it on both sides. */
+static uint32_t wifi_master;
 static const uint8_t *wifi_firmware;
 static const uint8_t *wifi_nvram;
 static unsigned wifi_nvram_bytes;
@@ -276,7 +313,7 @@ wifi_cfg_ready(struct wifi_region *regions, uint64_t deadline)
     if (mach_absolute_time() >= deadline || link == UINT32_MAX ||
         (link & 31u) < 0x0d || (link & 31u) > 0x14 || status == UINT32_MAX ||
         ((status >> 16) & 15u) != 1 || ((status >> 20) & 63u) != 1 ||
-        command == UINT32_MAX || (command & 0x147u) != 2 || viewport != 1) return 0;
+        command == UINT32_MAX || (command & 0x147u) != (2u | wifi_master) || viewport != 1) return 0;
     return wifi_read(dbi, 0x908) == 0x80000000;
 }
 
@@ -301,11 +338,13 @@ wifi_ep_memory_command(struct wifi_region *regions, uint32_t value, uint64_t dea
     const struct wifi_region *cfg = &regions[9];
     uint32_t before = wifi_read(cfg, 0x2004);
     if (before == UINT32_MAX || (value != 0 && value != 2)) return -1;
+    value |= wifi_master;   /* S10 port, mode 13: bus mastering stays as it was set */
     wifi_write(cfg, 0x2004, ((before & 0xffffu) & ~7u) | value);
     if (!wifi_cfg_ready(regions, deadline)) return -1;
     uint32_t checked = wifi_read(cfg, 0x2004);
     if (checked != UINT32_MAX && (checked & 7u) == value) return 0;
-    wlog("BAR0 memory command mismatch got=%#x want=%#x; BME never requested\n", checked, value);
+    wlog("BAR0 memory command mismatch got=%#x want=%#x; %s\n", checked, value,
+        wifi_master ? "bus mastering was on (mode 13)" : "BME never requested");
     return -1;
 }
 
@@ -326,7 +365,7 @@ wifi_bar_ready(struct wifi_region *regions, uint32_t window, uint64_t deadline)
     if (wifi_bits(dbi, 0x900, UINT32_MAX, 0)) return 0;
     uint32_t control = wifi_read(dbi, 0x908);
     if (wifi_bits(dbi, 0x900, UINT32_MAX, 1) || control != 0x80000000 ||
-        !wifi_cfg_ready(regions, deadline) || (wifi_read(cfg, 0x2004) & 7u) != 2 ||
+        !wifi_cfg_ready(regions, deadline) || (wifi_read(cfg, 0x2004) & 7u) != (2u | wifi_master) ||
         wifi_read(cfg, 0x2010) != 0x14400004 || wifi_read(cfg, 0x2014) != 0 ||
         wifi_read(cfg, 0x2080) != window) return 0;
     return 1;
@@ -819,6 +858,267 @@ wifi_log_rings(struct wifi_region *regions, uint32_t shared, uint64_t deadline)
     }
 }
 
+/* ---- S10 port, mode 13: the host side of the message rings ---- */
+
+/* One dongle RAM word, written and read back. */
+static int
+wifi_tcm_set(struct wifi_region *regions, uint32_t address, uint32_t value, uint64_t deadline)
+{
+    uint32_t got = 0;
+    if (!wifi_in_ram(address, 4) || wifi_bp_write(regions, address, value, deadline) ||
+        wifi_bp_read(regions, address, &got, deadline) || got != value) {
+        wlog("mode 13: RAM word %#x got=%#x want=%#x\n", address, got, value);
+        return -1;
+    }
+    return 0;
+}
+
+/* The rings, scratch word and buffers: one physically contiguous extent of
+ * owned RAM below 4 GiB, zeroed, never freed (as b2l_ufs_transport.c). */
+static int
+wifi_host_memory(void)
+{
+    vm_offset_t va = 0;
+    if (wifi_host) return 0;
+    if (kmem_alloc_contig(kernel_map, &va, WIFI_HOST_BYTES, PAGE_MASK, (ppnum_t)(((1ull << 32) >> PAGE_SHIFT) - 1),
+            0, KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || !va) {
+        wlog("mode 13: no contiguous host memory below 4 GiB; host side not started\n");
+        return -1;
+    }
+    uint64_t pa = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)va));
+    int contiguous = pa != 0 && !(pa & 4095u) && pa + WIFI_HOST_BYTES <= (1ull << 32);
+    for (uint32_t off = PAGE_SIZE; contiguous && off < WIFI_HOST_BYTES; off += PAGE_SIZE)
+        contiguous = ptoa_64(pmap_find_phys(kernel_pmap, (addr64_t)(va + off))) == pa + off;
+    if (!contiguous || !b2l_ram_contains_range(b2l_owned_ram, b2l_owned_ram_count, pa, WIFI_HOST_BYTES)) {
+        wlog("mode 13: host memory at pa %#llx is not contiguous owned RAM below 4 GiB; kept, not used\n",
+            (unsigned long long)pa);
+        return -1;
+    }
+    wifi_host = (uint8_t *)va;
+    wifi_host_pa = pa;
+    wlog("mode 13: host memory %u bytes at pa %#llx: contiguous owned RAM, zeroed, never freed\n",
+        WIFI_HOST_BYTES, (unsigned long long)pa);
+    return 0;
+}
+
+/* Bus mastering on (bits 4: the root port forwards upstream, then the
+ * endpoint masters) or off (0: the endpoint stops, then the root port),
+ * memory decoding kept on both. Off is tried whatever the guards say. */
+static int
+wifi_master_set(struct wifi_region *regions, uint32_t bits, uint64_t deadline)
+{
+    const struct wifi_region *dbi = &regions[8], *cfg = &regions[9];
+    uint32_t rc = wifi_read(dbi, 0x04), ep;
+    if (rc == UINT32_MAX) return -1;
+    rc &= 0xffffu;      /* the status half is write-1-to-clear: written as zero */
+    if (bits) {
+        if (wifi_master || !wifi_cfg_ready(regions, deadline)) return -1;
+        ep = wifi_read(cfg, 0x2004);
+        if (ep == UINT32_MAX || (ep & 7u) != 2u) return -1;
+        wifi_write(dbi, 0x04, rc | 4u);
+        wifi_master = 4;
+        if (!wifi_cfg_ready(regions, deadline)) return -1;
+        wifi_write(cfg, 0x2004, ((ep & 0xffffu) & ~7u) | 6u);
+    } else {
+        wifi_master = rc & 4u;          /* what the root port has now */
+        if (!wifi_cfg_ready(regions, deadline)) {
+            wifi_master = 0;
+            return -1;
+        }
+        ep = wifi_read(cfg, 0x2004);
+        if (ep != UINT32_MAX) wifi_write(cfg, 0x2004, ((ep & 0xffffu) & ~7u) | 2u);
+        wifi_write(dbi, 0x04, rc & ~4u);
+        wifi_master = 0;
+    }
+    if (!wifi_cfg_ready(regions, deadline) || (wifi_read(cfg, 0x2004) & 7u) != (2u | bits)) return -1;
+    return 0;
+}
+
+static void
+wifi_put(uint8_t *p, uint32_t value, unsigned bytes)
+{
+    for (unsigned i = 0; i < bytes; i++) p[i] = (uint8_t)(value >> (8 * i));
+}
+
+/* What the firmware did with the host side. */
+struct wifi_host_view {
+    uint32_t h2d_read, d2h_write[3], mailbox_int, d2h_data;
+};
+
+static int
+wifi_host_view(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb, struct wifi_host_view *v,
+    uint64_t deadline)
+{
+    memset(v, 0, sizeof(*v));
+    if (wifi_bp_read(regions, info[2], &v->h2d_read, deadline)) return -1;
+    for (unsigned i = 0; i < 3; i++)
+        if (wifi_bp_read(regions, info[3] + 4 * i, &v->d2h_write[i], deadline)) return -1;
+    if (wifi_bp_read(regions, WIFI_PCIE_CORE + WIFI_MAILBOX_INT, &v->mailbox_int, deadline)) return -1;
+    if (wifi_in_ram(d2h_mb, 4) && wifi_bp_read(regions, d2h_mb, &v->d2h_data, deadline)) return -1;
+    return 0;
+}
+
+static void
+wifi_log_view(unsigned ms, const struct wifi_host_view *v)
+{
+    char when[32];
+    if (ms) snprintf(when, sizeof(when), "%u ms after the posts", ms);
+    else snprintf(when, sizeof(when), "after hostready");
+    wlog("mode 13: %s: control submissions read %u of 6; completion writes %u %u %u; "
+        "mailbox int %#x; d2h mailbox data %#x\n", when, v->h2d_read, v->d2h_write[0], v->d2h_write[1],
+        v->d2h_write[2], v->mailbox_int, v->d2h_data);
+}
+
+/* The completions the firmware wrote, with dhd_prot_d2h_sync_xorcsum's
+ * check (all words XOR to zero), and anything in the scratch and buffers. */
+static void
+wifi_log_host_writes(const struct wifi_host_view *v)
+{
+    FlushPoC_DcacheRegion((vm_offset_t)wifi_host, WIFI_HOST_BYTES);
+    for (unsigned r = 2; r < 5; r++) {
+        unsigned n = v->d2h_write[r - 2] < wifi_rings[r].items ? v->d2h_write[r - 2] : 0;
+        for (unsigned i = 0; i < n && i < (r == 2 ? 4u : 2u); i++) {
+            const uint8_t *c = wifi_host + wifi_rings[r].offset + wifi_rings[r].size * i;
+            uint32_t x = 0;
+            for (unsigned w = 0; w < wifi_rings[r].size; w += 4) x ^= wifi_le32(c + w);
+            wlog("mode 13: ring %u item %u: type %#x if %u flags %#x epoch %u request %#x status %d ring %u; "
+                "%#x %#x %#x %#x; xor %#x\n", r, i, c[0], c[1], c[2], c[3], wifi_le32(c + 4),
+                (int)(int16_t)(c[8] | c[9] << 8), (unsigned)(c[10] | c[11] << 8), wifi_le32(c + 12),
+                wifi_le32(c + 16), wifi_le32(c + 20), wifi_rings[r].size > 24 ? wifi_le32(c + 24) : 0, x);
+        }
+    }
+    const uint8_t *s = wifi_host + WIFI_HOST_SCRATCH;
+    wlog("mode 13: scratch %#x %#x\n", wifi_le32(s), wifi_le32(s + 4));
+    for (unsigned i = 0; i < 6; i++) {
+        const uint8_t *b = wifi_host + (i < 2 ? WIFI_HOST_IOCTL + 0x2000u * i : WIFI_HOST_EVENT + 0x800u * (i - 2));
+        uint32_t w0 = wifi_le32(b), w1 = wifi_le32(b + 4), w2 = wifi_le32(b + 8), w3 = wifi_le32(b + 12);
+        if (w0 | w1 | w2 | w3)
+            wlog("mode 13: %s buffer %u: %#x %#x %#x %#x\n", i < 2 ? "ioctl-response" : "event", i, w0, w1, w2, w3);
+    }
+}
+
+/*
+ * dhd_prot_init's dongle writes for this firmware (flags: IPC 7, hostready,
+ * xorcsum, no DMA indices, 4-byte indices, no IDMA/IFRM/DAR): per common
+ * ring base, max items and item size, indices zero (dhd_prot_ring_init),
+ * the scratch buffer and its length, host_cap (dhd_set_host_cap: version 7,
+ * HOSTCAP_H2D_ENABLE_HOSTRDY, HOSTCAP_DS_NO_OOB_DW, HOSTCAP_UR_FW_NO_TRAP;
+ * not EXTENDED_TRAP_DATA, which needs a trap buffer), then dhd_bus_hostready
+ * (0x12345678 to DB1). Then dhd_prot_rxbufpost_ctrl twice for ioctl
+ * responses and four times for events, one write index update and one DB0
+ * with DHD_WRPTR_UPDATE_H2D_DB_MAGIC. Bus mastering stays on for the caller
+ * to turn off after the R4 is halted.
+ */
+static void
+wifi_host_start(struct wifi_region *regions, uint32_t shared, uint32_t console, uint32_t *console_index)
+{
+    uint32_t flags = 0, d2h_mb = 0, rings_info = 0, info[5];
+    const uint32_t host_cap = 7u | 0x400u | 0x1000u | 0x800000u;
+    uint64_t deadline, scratch;
+    struct wifi_host_view last, now;
+    clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+    if (wifi_bp_read(regions, shared, &flags, deadline) || wifi_bp_read(regions, shared + 44, &d2h_mb, deadline) ||
+        wifi_bp_read(regions, shared + 48, &rings_info, deadline)) {
+        wlog("mode 13: shared area unreadable; host side not started\n");
+        return;
+    }
+    if ((flags & 0xffu) != 7 || !(flags & 0x10000000u) || !(flags & 0x40000u) ||
+        (flags & (0x10000u | 0x100000u | 0x400000u | 0x1000000u | 0x80000000u))) {
+        wlog("mode 13: flags %#x are not IPC 7 with hostready and xorcsum, without DMA or 2-byte indices, "
+            "IDMA, IFRM or DAR; host side not started\n", flags);
+        return;
+    }
+    for (unsigned i = 0; i < 5; i++) {
+        if (!wifi_in_ram(rings_info, sizeof(info)) || wifi_bp_read(regions, rings_info + 4 * i, &info[i], deadline)) {
+            wlog("mode 13: rings_info %#x unreadable; host side not started\n", rings_info);
+            return;
+        }
+    }
+    if (!wifi_in_ram(info[0], 80) || !wifi_in_ram(info[1], 8) || !wifi_in_ram(info[2], 8) ||
+        !wifi_in_ram(info[3], 12) || !wifi_in_ram(info[4], 12)) {
+        wlog("mode 13: ring_info pointers outside RAM; host side not started\n");
+        return;
+    }
+    if (wifi_host_memory()) return;
+    CleanPoC_DcacheRegion((vm_offset_t)wifi_host, WIFI_HOST_BYTES);
+    for (unsigned r = 0; r < 5; r++) {
+        uint64_t pa = wifi_host_pa + wifi_rings[r].offset;
+        uint32_t at = info[0] + 16 * r;
+        if (wifi_tcm_set(regions, at + 4, wifi_rings[r].items | (uint32_t)wifi_rings[r].size << 16, deadline) ||
+            wifi_tcm_set(regions, at + 8, (uint32_t)pa, deadline) ||
+            wifi_tcm_set(regions, at + 12, (uint32_t)(pa >> 32), deadline)) goto stopped;
+    }
+    for (unsigned i = 0; i < 3; i++) {
+        if ((i < 2 && (wifi_tcm_set(regions, info[1] + 4 * i, 0, deadline) ||
+                       wifi_tcm_set(regions, info[2] + 4 * i, 0, deadline))) ||
+            wifi_tcm_set(regions, info[3] + 4 * i, 0, deadline) ||
+            wifi_tcm_set(regions, info[4] + 4 * i, 0, deadline)) goto stopped;
+    }
+    scratch = wifi_host_pa + WIFI_HOST_SCRATCH;
+    if (wifi_tcm_set(regions, shared + 56, (uint32_t)scratch, deadline) ||
+        wifi_tcm_set(regions, shared + 60, (uint32_t)(scratch >> 32), deadline) ||
+        wifi_tcm_set(regions, shared + 52, 8, deadline) ||
+        wifi_tcm_set(regions, shared + 84, host_cap, deadline)) goto stopped;
+    wlog("mode 13: five common rings at pa %#llx, indices zero, scratch at %#llx (8 bytes), host_cap %#x: "
+        "written and read back\n", (unsigned long long)wifi_host_pa, (unsigned long long)scratch, host_cap);
+    if (wifi_master_set(regions, 4, deadline)) {
+        /* Half on (the root port only) would fail every later guard: off now. */
+        int off = wifi_master_set(regions, 0, deadline);
+        wlog("mode 13: bus mastering did not come on; nothing rung; off again %s\n", off ? "NOT confirmed" : "verified");
+        return;
+    }
+    wlog("mode 13: bus mastering on: root port, then endpoint\n");
+    if (wifi_bp_write(regions, WIFI_PCIE_CORE + WIFI_H2D_DB1, 0x12345678u, deadline)) {
+        wlog("mode 13: hostready doorbell write failed\n");
+        return;
+    }
+    wlog("mode 13: hostready doorbell DB1 rung\n");
+    delay_for_interval(200, NSEC_PER_MSEC);
+    clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+    if (wifi_host_view(regions, info, d2h_mb, &last, deadline)) {
+        wlog("mode 13: state after hostready unreadable\n");
+        return;
+    }
+    wifi_log_view(0, &last);
+    wifi_log_console(regions, console, deadline, console_index);
+    /* dhd_prot_rxbufpost_ctrl: msg_type, if_id 0, flags 0 (no H2D phase),
+     * epoch from seqnum H2D_EPOCH_INIT_VAL (254) modulo 253, a request id,
+     * the buffer length and its address. */
+    for (unsigned i = 0; i < 6; i++) {
+        uint8_t *item = wifi_host + wifi_rings[0].offset + wifi_rings[0].size * i;
+        uint64_t pa = wifi_host_pa + (i < 2 ? WIFI_HOST_IOCTL + 0x2000u * i : WIFI_HOST_EVENT + 0x800u * (i - 2));
+        item[0] = i < 2 ? 0x0b : 0x0d;  /* MSG_TYPE_IOCTLRESP_BUF_POST, MSG_TYPE_EVENT_BUF_POST */
+        item[3] = (uint8_t)((254 + i) % 253);
+        wifi_put(item + 4, 1 + i, 4);
+        wifi_put(item + 8, i < 2 ? 0x2000u : 0x800u, 2);
+        wifi_put(item + 16, (uint32_t)pa, 4);
+        wifi_put(item + 20, (uint32_t)(pa >> 32), 4);
+    }
+    CleanPoC_DcacheRegion((vm_offset_t)wifi_host + wifi_rings[0].offset, 6u * wifi_rings[0].size);
+    if (wifi_tcm_set(regions, info[1], 6, deadline) ||
+        wifi_bp_write(regions, WIFI_PCIE_CORE + WIFI_H2D_DB0, 0xff000006u, deadline)) {
+        wlog("mode 13: control submission write index or DB0 failed\n");
+        return;
+    }
+    wlog("mode 13: 2 ioctl-response and 4 event buffers posted, control submission write index 6, DB0 %#x\n",
+        0xff000006u);
+    for (unsigned i = 1; i <= 10; i++) {
+        delay_for_interval(200, NSEC_PER_MSEC);
+        clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+        if (wifi_host_view(regions, info, d2h_mb, &now, deadline)) {
+            wlog("mode 13: poll %u lost the link/BAR guard\n", i);
+            return;
+        }
+        if (memcmp(&now, &last, sizeof(now)) || i == 10) wifi_log_view(200 * i, &now);
+        last = now;
+    }
+    wifi_log_host_writes(&last);
+    wifi_log_console(regions, console, deadline, console_index);
+    return;
+stopped:
+    wlog("mode 13: host side stopped before bus mastering; nothing rung\n");
+}
+
 static int
 wifi_firmware_boot(struct wifi_region *regions, uint32_t mode)
 {
@@ -831,8 +1131,9 @@ wifi_firmware_boot(struct wifi_region *regions, uint32_t mode)
     unsigned polls = 0, released = 0;
     uint64_t deadline;
     clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
-    wlog("firmware boot begin: NVRAM %u bytes at %#x, token %#x at %#x, seed at %#x; DMA/BME/IRQs stay off\n",
-        varsize, varaddr, token, top, seed_addr);
+    wlog("firmware boot begin: NVRAM %u bytes at %#x, token %#x at %#x, seed at %#x; %s\n",
+        varsize, varaddr, token, top, seed_addr,
+        mode >= 13 ? "IRQs stay off; DMA/BME only for mode 13's rings" : "DMA/BME/IRQs stay off");
     for (unsigned i = 0; i < 4; i++) token_bytes[i] = (uint8_t)(token >> (8 * i));
     for (unsigned i = 0; i < 4; i++) {
         meta[i] = (uint8_t)(0xfeedc0deu >> (8 * i));
@@ -918,10 +1219,24 @@ wifi_firmware_boot(struct wifi_region *regions, uint32_t mode)
                 (flags & 0x200u) ? " ASSERT" : "");
         wifi_log_console(regions, words[5], deadline, &console_index);
     }
+    if (mode >= 13) wifi_host_start(regions, shared, words[5], &console_index);
 halt:
     /* dhdpcie_bus_download_state(enter): halt the ARM and remove reset. */
     clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
-    if (wifi_r4_reset(regions, 0x20, deadline) || !wifi_firmware_halted(regions, deadline)) {
+    int halted = !wifi_r4_reset(regions, 0x20, deadline) && wifi_firmware_halted(regions, deadline);
+    if (wifi_master) {
+        /* S10 port, mode 13: the R4 first, so nothing new is queued, then
+         * bus mastering off; the power-off follows either way. */
+        clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
+        if (wifi_master_set(regions, 0, deadline)) {
+            wlog("mode 13: bus mastering could NOT be confirmed off; power-off follows\n");
+            wifi_master = 0;
+            halted = 0;
+        } else {
+            wlog("mode 13: bus mastering off again (endpoint, then root port); host memory kept, never reused\n");
+        }
+    }
+    if (!halted) {
         wlog("firmware boot end: R4 was %s and could NOT be halted again; power-off follows\n",
             released ? "released" : "not released");
         return -1;
@@ -1054,7 +1369,8 @@ wifi_chipcommon_probe(struct wifi_region *regions, uint32_t mode)
     stage = "complete";
 out:
     /* Disable memory decoding before restoring BARs. PCI status W1C bits are
-     * written as zero; bus mastering was never enabled. If the link is lost,
+     * written as zero; bus mastering was never enabled, or (mode 13) is off
+     * again since the R4 was halted. If the link is lost,
      * do not issue more config requests; caller still asserts PERST/power off. */
     cfg_selected = !wifi_restore_bits(dbi, 0x900, UINT32_MAX, 1);
     if (!cfg_selected) cleanup_failed = -1;
@@ -1507,7 +1823,7 @@ void
 b2l_wifi_diag_start(void)
 {
     uint32_t mode = 0;
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 12) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 13) {
         wlog("diagnostic disabled; no MMIO access\n");
         return;
     }
