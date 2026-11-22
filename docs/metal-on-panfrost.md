@@ -412,3 +412,28 @@ with std_vert0 into an IOSurface and read back.
 QuartzCore's own selector references have no `drawPrimitives` or
 `setVertexBytes`: Core Animation's draws reach the encoder another way, which
 M3's log of unanswered messages will show.
+
+## M2b result (boot 70, build 68)
+
+27 of 31 checks passed, with no GPU fault. Right to the pixel: the triangle
+into the IOSurface, the textured quad (`image_rect_blit`), the indexed
+triangle, two triangles covering the target, the scissor, blending, the
+compute kernel copying a texture (`read_write_surf_compute`, 384 threads),
+the heap, the fence and the sRGB texture view. The uber pipeline took AIR
+332 ms and Panfrost 202 ms.
+
+Failed:
+
+- **Culling, both checks**: culling back faces dropped the clockwise triangle
+  and culling front faces kept it. With the negative-y viewport, Panfrost
+  takes Metal's clockwise as Gallium's clockwise, so `front_ccw` is now set
+  for counter-clockwise winding.
+- **Shared-event listener**: the command buffer set the value to 5, but the
+  block did not run within 1 s. The cause is unknown; the plug-in now logs
+  the registration, the value reaching it, the dispatch and the block's run
+  ("event listener:" lines).
+- **CARenderer**: no command buffer reached the queue and the texture stayed
+  zero. The test attached the layer after its transaction's commit, so the
+  renderer had no committed tree. It now attaches it inside a transaction and
+  flushes. Labelled empty buffers before and after the frame
+  (`test: before/after CARenderer`) count what Core Animation commits.

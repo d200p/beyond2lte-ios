@@ -494,6 +494,19 @@ The first S10 image with mode 11 attaches `nvram.txt_CS01_semco_b1`. The
 console's first lines should name the firmware and may show whether that
 board file suits this module.
 
+Result (boot 70, build 68): the NVRAM checked (324 entries, `boardtype`
+0x088f, `boardrev` 0x1300), the token `0xf6ca0935`, seed and vector read back
+(address 0 held `0xb83ef000`), and 16 polls (about 0.3 s) after the release
+the shared area appeared at `0x24f8bc`: flags `0x30040007` (shared version
+7), no trap or assert, console at `0x2d53a4`, firmware ID `0x1b4772fd`. The
+console's 19 lines:
+`RTE (SDIO-PCIE-MSGBUF) 18.41.117 (B1 Network/rsdb) on BCM4375 r5 @
+37.4/160.0/400.0MHz`, the PCIe message-buffer driver, both radios attached
+(wl0 5 GHz, wl1 2.4 GHz), TCAM and reclaim, and `ThreadX v5.6 initialized`;
+no complaint about the NVRAM. The R4 halted again and every cleanup step
+verified. Next is the host side of the message-buffer protocol (rings, DMA,
+interrupts), which this checkpoint never set up.
+
 ## Recovery evidence
 
 With one rooted beyond2lte in TWRP, collect cached PCI IDs, resources, driver

@@ -689,7 +689,8 @@ events_and_heap(id device, id queue)
 	}
 	uint64_t value = ev != nil ? MSG(uint64_t)(ev, S("signaledValue")) : 0;
 	verdict("shared event signalled by a command buffer, with a listener", ev != nil && status == 4 && value == 5 &&
-	    listener_called == 5, "%s value %llu, listener %d", name_of(ev), (unsigned long long)value, listener_called);
+	    listener_called == 5, "%s value %llu, listener %s called %d", name_of(ev), (unsigned long long)value,
+	    name_of(listener), listener_called);
 
 	id hd = make("MTLHeapDescriptor");
 	MSG(void, unsigned long)(hd, S("setSize:"), 1u << 20);
@@ -793,9 +794,22 @@ carenderer_test(id device, id queue)
 		verdict("CARenderer", false, "rendererWithMTLTexture gave nil");
 		return;
 	}
+	/* Boot 70: set after the commit, the renderer had no committed tree and
+	 * drew nothing (no command buffer). Attach it inside a transaction and
+	 * flush, so the layers reach the renderer's context before the frame. */
+	MSG(void)(transaction, S("begin"));
+	MSG(void, bool)(transaction, S("setDisableActions:"), true);
 	MSG(void, id)(renderer, S("setLayer:"), root);
 	MSG(void, cg_rect)(renderer, S("setBounds:"), bounds);
+	MSG(void)(transaction, S("commit"));
+	MSG(void)(transaction, S("flush"));
 	say("CARenderer: beginFrame, render, endFrame");
+	/* Labelled empty buffers around the frame: the plug-in logs their
+	 * numbers, and the gap is how many buffers Core Animation committed. */
+	id marker = MSG(id)(queue, S("commandBuffer"));
+	MSG(void, id)(marker, S("setLabel:"), nsstr("test: before CARenderer"));
+	MSG(void)(marker, S("commit"));
+	MSG(void)(marker, S("waitUntilCompleted"));
 	t0 = now_ms();
 	MSG(void, double, void *)(renderer, S("beginFrameAtTime:timeStamp:"), media_time(), NULL);
 	MSG(void, cg_rect)(renderer, S("addUpdateRect:"), bounds);
@@ -803,6 +817,10 @@ carenderer_test(id device, id queue)
 	MSG(void)(renderer, S("endFrame"));
 	uint64_t render_ms = now_ms() - t0;
 	usleep(200000);                 /* a command buffer it committed and did not wait for */
+	marker = MSG(id)(queue, S("commandBuffer"));
+	MSG(void, id)(marker, S("setLabel:"), nsstr("test: after CARenderer"));
+	MSG(void)(marker, S("commit"));
+	MSG(void)(marker, S("waitUntilCompleted"));
 	static uint8_t back[ROW * SIDE];
 	region_t whole = { { 0, 0, 0 }, { SIDE, SIDE, 1 } };
 	MSG(void, void *, unsigned long, region_t, unsigned long)(target, S("getBytes:bytesPerRow:fromRegion:mipmapLevel:"),

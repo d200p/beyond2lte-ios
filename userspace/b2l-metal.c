@@ -1782,10 +1782,16 @@ struct listener_call {
 	uint64_t value;
 };
 
+/* S10 port: boot 70's listener was never called; these say where it stops. */
+static unsigned listener_logs;
+
 static void
 listener_run(void *context)
 {
 	struct listener_call *c = context;
+	if (__atomic_fetch_add(&listener_logs, 1, __ATOMIC_RELAXED) < 16) {
+		say("event listener: block runs, value %llu", (unsigned long long)c->value);
+	}
 	void *pool = objc_autoreleasePoolPush();
 	c->block(c->event, c->value);
 	objc_autoreleasePoolPop(pool);
@@ -1804,6 +1810,10 @@ listener_fire(id event, id queue, listener_block_t block, uint64_t value)
 	c->block = Block_copy(block);
 	c->event = objc_retain(event);
 	c->value = value;
+	if (__atomic_fetch_add(&listener_logs, 1, __ATOMIC_RELAXED) < 16) {
+		say("event listener: dispatched for value %llu on %s", (unsigned long long)value,
+		    queue != nil ? "the listener's queue" : "the completion queue");
+	}
 	if (queue != nil) {
 		dispatch_async_f((dispatch_queue_t)queue, c, listener_run);
 	} else {
@@ -1874,6 +1884,9 @@ event_signal(id event, uint64_t value)
 	}
 	pthread_mutex_lock(&s->lock);
 	s->value = value;
+	if (s->num_listeners && __atomic_fetch_add(&listener_logs, 1, __ATOMIC_RELAXED) < 16) {
+		say("event: value %llu, %u listeners waiting", (unsigned long long)value, s->num_listeners);
+	}
 	for (unsigned i = 0; i < s->num_listeners;) {
 		if (s->listeners[i].value <= value) {
 			listener_fire(event, s->listeners[i].queue, s->listeners[i].block, value);
@@ -1915,10 +1928,16 @@ event_notify(id self, SEL _cmd, id listener, uint64_t value, listener_block_t bl
 {
 	(void)_cmd;
 	struct event_state *s = state_of(self);
+	id queue = listener != nil ? msg(listener, "dispatchQueue") : nil;
+	if (__atomic_fetch_add(&listener_logs, 1, __ATOMIC_RELAXED) < 16) {
+		say("event listener: %s at value %llu, state %s, block %s, queue %s",
+		    listener != nil ? class_getName(object_getClass(listener)) : "nil listener",
+		    (unsigned long long)value, s != NULL ? "found" : "MISSING", block != NULL ? "set" : "NULL",
+		    queue != nil ? class_getName(object_getClass(queue)) : "nil");
+	}
 	if (s == NULL || block == NULL) {
 		return;
 	}
-	id queue = listener != nil ? msg(listener, "dispatchQueue") : nil;
 	pthread_mutex_lock(&s->lock);
 	if (value <= s->value) {
 		uint64_t now = s->value;
@@ -2459,8 +2478,16 @@ cmdbuf_commit(id self, SEL _cmd)
 		say("command buffer %lu: error: %s", n, why);
 	} else {
 		s->status = CB_COMPLETED;
+		/* S10 port: labelled buffers too (the test labels markers around
+		 * CARenderer's frame; Core Animation may label its own). */
+		static unsigned labelled_logs;
+		id label = n > 8 ? msg(self, "label") : nil;
 		if (n <= 8) {
 			say("command buffer %lu: done in %llu us", n, (unsigned long long)gpu_us);
+		} else if (label != nil && __atomic_fetch_add(&labelled_logs, 1, __ATOMIC_RELAXED) < 32) {
+			char text[64] = "";
+			CFStringGetCString((CFStringRef)label, text, sizeof(text), kCFStringEncodingUTF8);
+			say("command buffer %lu \"%s\": done in %llu us", n, text, (unsigned long long)gpu_us);
 		}
 	}
 	/* the GPU's work is done: the events this buffer signals take their values */

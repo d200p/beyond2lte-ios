@@ -2466,10 +2466,11 @@ rasterizer(struct b2l_mtl_device *dev, const struct encoder_state *st, const str
 	struct pipe_rasterizer_state r;
 	memset(&r, 0, sizeof(r));
 	r.cull_face = (st->cull & 3) == 1 ? PIPE_FACE_FRONT : (st->cull & 3) == 2 ? PIPE_FACE_BACK : PIPE_FACE_NONE;
-	/* Metal's clockwise is seen on a screen whose y grows downwards, as the
-	 * Mali's rows do: the same turn as Gallium's counter-clockwise, a
-	 * positive area in (x, row). MTLWindingClockwise is 0. */
-	r.front_ccw = (st->winding & 1) == 0;
+	/* MTLWindingClockwise is 0. Boot 70 measured it: with front_ccw set for
+	 * clockwise, culling back faces dropped a clockwise triangle and culling
+	 * front faces kept it, so with this negative-y viewport Panfrost sees
+	 * Metal's clockwise as Gallium's clockwise. */
+	r.front_ccw = (st->winding & 1) != 0;
 	r.fill_front = r.fill_back = (st->fill & 1) ? PIPE_POLYGON_MODE_LINE : PIPE_POLYGON_MODE_FILL;
 	r.scissor = 1;                          /* Metal's scissor is always on */
 	r.half_pixel_center = 1;
