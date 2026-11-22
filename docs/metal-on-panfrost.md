@@ -437,3 +437,21 @@ Failed:
   renderer had no committed tree. It now attaches it inside a transaction and
   flushes. Labelled empty buffers before and after the frame
   (`test: before/after CARenderer`) count what Core Animation commits.
+
+## M2c as written (build 69 + 1)
+
+- **Listener**: boot 71 showed the test's `MTLSharedEventListener` was nil,
+  so the plug-in was never called. The test now says whether the class was
+  found and tries `+sharedListener` and `-initWithDispatchQueue:`.
+- **CARenderer**: boot 71 committed Core Animation's own command buffer
+  (`com.apple.coreanimation.command-buffer`, two draws and a fragment job,
+  23 ms) and the target still read zero. Every pipeline's colour format,
+  blending and write mask and its vertex attributes are logged, and the
+  encoders of Core Animation's command buffers log what they are told
+  (`ca:` lines: the pass with its target, load/store and clear, pipelines,
+  buffers, the first 64 bytes of every `setVertexBytes`/`setFragmentBytes`,
+  textures, viewport, scissor, raster state, draws).
+- **Back to TWRP by itself**: `b2l_recovery_after=480` restarts into
+  recovery 8 minutes after start, synced as the volume-key chord does
+  (B2LPower.cpp), so each test boot's log can be read without anyone at the
+  phone. Holding both volume keys for 3 s still does it at once.

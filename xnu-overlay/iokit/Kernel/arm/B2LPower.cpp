@@ -3,10 +3,12 @@
  * with the phone still on. Panics are untouched and keep their halted screen.
  * Holding both volume buttons for 3 s syncs the disks and restarts into
  * recovery, so no key sequence has to be timed against the bootloader.
+ * S10 port: b2l_recovery_after=<s> does the same by itself after s seconds.
  */
 #include <IOKit/IOLib.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <kern/thread.h>
+#include <pexpert/pexpert.h>
 #include <sys/reboot.h>
 #include <arm64/b2l_diag.h>
 #include "b2l_power.h"
@@ -14,6 +16,7 @@
 extern "C" vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern "C" int reboot_kernel(int, char *);
 extern "C" void b2l_power_request_recovery(void);
+extern "C" void b2l_power_schedule_recovery(void);
 
 #define B2L_POWER_PMU          0x15860000ull
 #define B2L_POWER_GPIO         0x15850000ull
@@ -119,26 +122,69 @@ b2l_power_halt_restart(unsigned int type)
 	}
 }
 
+enum { B2L_RECOVERY_KEYS = 1, B2L_RECOVERY_TIMER = 2 };
+
 static void
-recovery_thread(void *unused __unused, wait_result_t result __unused)
+recovery_thread(void *why, wait_result_t result __unused)
 {
-	char message[] = "B2L volume keys";
+	char message[] = "B2L recovery request";
 
 	b2l_power_to_recovery = true;
-	b2l_diag_record("B2L POWER: volume keys held, syncing for recovery\n");
+	b2l_diag_record("B2L POWER: %s, syncing for recovery\n",
+	    (uintptr_t)why == B2L_RECOVERY_TIMER ? "b2l_recovery_after reached" : "volume keys held");
 	reboot_kernel(RB_AUTOBOOT, message);
 	thread_terminate(current_thread());
 }
 
-/* Called from the input poll, which must not block. One request is enough. */
-extern "C" void
-b2l_power_request_recovery(void)
+/* Must not block. One request is enough, whoever makes it. */
+static void
+request_recovery(uintptr_t why)
 {
 	static volatile SInt32 requested;
 	thread_t thread;
 
 	if (OSCompareAndSwap(0, 1, (volatile UInt32 *)&requested) &&
-	    kernel_thread_start(&recovery_thread, NULL, &thread) == KERN_SUCCESS) {
+	    kernel_thread_start(&recovery_thread, (void *)why, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
+}
+
+/* Called from the input poll. */
+extern "C" void
+b2l_power_request_recovery(void)
+{
+	request_recovery(B2L_RECOVERY_KEYS);
+}
+
+/*
+ * S10 port: b2l_recovery_after=<seconds> restarts into recovery that long
+ * after start, the same synced way as the volume keys, so a test boot comes
+ * back to TWRP for its log with nobody at the phone. Absent or 0: never;
+ * at least 120 s.
+ */
+static uint32_t b2l_recovery_after_s;
+
+static void
+recovery_timer_thread(void *unused __unused, wait_result_t result __unused)
+{
+	b2l_diag_record("B2L POWER: restart into recovery scheduled in %u s (b2l_recovery_after)\n",
+	    b2l_recovery_after_s);
+	IOSleep(b2l_recovery_after_s * 1000u);
+	request_recovery(B2L_RECOVERY_TIMER);
+	thread_terminate(current_thread());
+}
+
+extern "C" void
+b2l_power_schedule_recovery(void)
+{
+	uint32_t seconds = 0;
+	thread_t thread;
+
+	if (!PE_parse_boot_argn("b2l_recovery_after", &seconds, sizeof(seconds)) || seconds == 0) {
+		return;
+	}
+	b2l_recovery_after_s = seconds < 120 ? 120 : seconds;
+	if (kernel_thread_start(&recovery_timer_thread, NULL, &thread) == KERN_SUCCESS) {
 		thread_deallocate(thread);
 	}
 }

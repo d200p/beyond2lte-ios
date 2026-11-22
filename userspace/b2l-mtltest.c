@@ -28,6 +28,7 @@
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurfaceRef.h>
+#include <dispatch/dispatch.h>
 #include <dlfcn.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
@@ -673,7 +674,23 @@ events_and_heap(id device, id queue)
 	char why[200];
 	uint64_t ms = 0;
 	id ev = MSG(id)(device, S("newSharedEvent"));
+	/* Boot 71: make() gave nil here. Say why, then try the other ways in:
+	 * +sharedListener, -initWithDispatchQueue:. */
+	id listener_class = cls("MTLSharedEventListener");
 	id listener = make("MTLSharedEventListener");
+	const char *how = "alloc/init";
+	if (listener == nil && listener_class != nil &&
+	    MSG(bool, SEL)(listener_class, S("respondsToSelector:"), S("sharedListener"))) {
+		listener = MSG(id)(listener_class, S("sharedListener"));
+		how = "+sharedListener";
+	}
+	if (listener == nil && listener_class != nil) {
+		dispatch_queue_t q = dispatch_queue_create("dev.b2l.mtltest.listener", NULL);
+		listener = MSG(id, dispatch_queue_t)(MSG(id)(listener_class, S("alloc")), S("initWithDispatchQueue:"), q);
+		how = "-initWithDispatchQueue:";
+	}
+	say("shared event listener: class %s, %s gave %s", listener_class != nil ? "found" : "MISSING", how,
+	    name_of(listener));
 	listener_called = 0;
 	if (ev != nil && listener != nil) {
 		MSG(void, id, uint64_t, void (^)(id, uint64_t))(ev, S("notifyListener:atValue:block:"), listener, 5,
@@ -788,6 +805,7 @@ carenderer_test(id device, id queue)
 	}
 	say("CARenderer: rendererWithMTLTexture:options: (%s queue)", options != nil ? "our" : "its own");
 	uint64_t t0 = now_ms();
+	say("CARenderer: target texture %p", (void *)target);   /* to match the "ca: render pass" lines */
 	id renderer = MSG(id, id, id)(cls("CARenderer"), S("rendererWithMTLTexture:options:"), target, options);
 	say("CARenderer: %s in %llu ms", name_of(renderer), (unsigned long long)(now_ms() - t0));
 	if (renderer == nil) {

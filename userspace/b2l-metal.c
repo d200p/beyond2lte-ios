@@ -1638,6 +1638,7 @@ mesa_function(id function)
 struct pipeline_state {
 	struct base b;
 	struct b2l_mtl_render_pipeline *mp;
+	char names[96];                 /* S10 port: "vertex + fragment", for the trace */
 };
 
 static void
@@ -1732,6 +1733,26 @@ device_new_render_pipeline_options(id self, SEL _cmd, id d, unsigned long option
 		return nil;
 	}
 	s->mp = mp;
+	snprintf(s->names, sizeof(s->names), "%s + %s", vname, fname);
+	/* S10 port: what each pipeline writes (boot 71: Core Animation's left
+	 * the target zero); the first 24 of a process. */
+	static unsigned described;
+	if (__atomic_fetch_add(&described, 1, __ATOMIC_RELAXED) < 24) {
+		const struct b2l_mtl_color_desc *c0 = &desc.color[0];
+		say("pipeline %s: colour 0 format %u blend %d (rgb %u: %u,%u; alpha %u: %u,%u) write mask 0x%x; "
+		    "depth %u stencil %u samples %u", s->names, c0->pixel_format, c0->blend, c0->rgb_op, c0->src_rgb,
+		    c0->dst_rgb, c0->alpha_op, c0->src_alpha, c0->dst_alpha, c0->write_mask, desc.depth_format,
+		    desc.stencil_format, desc.sample_count);
+		for (unsigned i = 0; desc.vertex_descriptor && i < B2L_MTL_MAX_ATTRIBUTES; i++) {
+			if (desc.attribute[i].format != 0) {
+				unsigned b = desc.attribute[i].buffer;
+				say("pipeline %s: attribute %u format %u offset %u buffer %u (stride %u, step %u)", s->names, i,
+				    desc.attribute[i].format, desc.attribute[i].offset, b,
+				    b < B2L_MTL_MAX_BUFFERS ? desc.layout[b].stride : 0,
+				    b < B2L_MTL_MAX_BUFFERS ? desc.layout[b].step_function : 0);
+			}
+		}
+	}
 	return make_object(gRenderPipelineClass, s);
 }
 
@@ -2627,6 +2648,7 @@ struct encoder_state {
 	struct base b;
 	id cmdbuf;                      /* retained */
 	bool ended;
+	bool trace;                     /* S10 port: Core Animation's, logged ("ca:" lines) */
 };
 
 static void
@@ -2652,6 +2674,44 @@ recording(id encoder)
 	struct encoder_state *e = state_of(encoder);
 	struct cmdbuf_state *c = e != NULL && !e->ended ? state_of(e->cmdbuf) : NULL;
 	return c != NULL && !c->committed ? c->mc : NULL;
+}
+
+/*
+ * S10 port: boot 71's CARenderer frame ran two draws and a fragment job but
+ * left its target zero. The encoders of command buffers labelled
+ * com.apple.coreanimation log what they are told ("ca:" lines, 600 of them
+ * a process): the pass, pipelines, buffers and bytes, textures, viewport,
+ * scissor, raster state and draws.
+ */
+static unsigned trace_lines;
+
+static bool
+tracing(id encoder)
+{
+	struct encoder_state *e = state_of(encoder);
+	return e != NULL && e->trace && __atomic_fetch_add(&trace_lines, 1, __ATOMIC_RELAXED) < 600;
+}
+
+static bool
+traced_cmdbuf(id cmdbuf)
+{
+	char label[64] = "";
+	cstring(msg(cmdbuf, "label"), label, sizeof(label));
+	return strncmp(label, "com.apple.coreanimation", 23) == 0;
+}
+
+/* "WxH format F" of a texture, or what it is when it is not ours. */
+static void
+texture_text(id texture, char *out, size_t size)
+{
+	if (texture == nil) {
+		snprintf(out, size, "nil");
+	} else if (mesa_texture(texture) == NULL) {
+		snprintf(out, size, "%s (not ours)", class_getName(object_getClass(texture)));
+	} else {
+		snprintf(out, size, "%p %lux%lu format %lu", (void *)texture, msg_u(texture, "width"),
+		    msg_u(texture, "height"), msg_u(texture, "pixelFormat"));
+	}
 }
 
 static id
@@ -2725,7 +2785,29 @@ cmdbuf_render_encoder(id self, SEL _cmd, id pass)
 	desc.width = (uint32_t)msg_u(pass, "renderTargetWidth");
 	desc.height = (uint32_t)msg_u(pass, "renderTargetHeight");
 	mtl->cmdbuf_pass_begin(c->mc, &desc);
-	return encoder_make(gRenderEncoderClass, self);
+	id encoder = encoder_make(gRenderEncoderClass, self);
+	struct encoder_state *e = encoder != nil ? state_of(encoder) : NULL;
+	if (e != NULL && traced_cmdbuf(self)) {
+		e->trace = true;
+		for (unsigned i = 0; i < B2L_MTL_MAX_COLORS; i++) {
+			id a = msg_at(colors, i);
+			id t = msg(a, "texture");
+			if (t == nil || !tracing(encoder)) {
+				continue;
+			}
+			char text[96];
+			texture_text(t, text, sizeof(text));
+			say("ca: render pass colour %u: %s level %u slice %u load %u store %u clear %g %g %g %g", i, text,
+			    desc.color[i].level, desc.color[i].slice, desc.color[i].load, desc.color[i].store,
+			    desc.color[i].clear[0], desc.color[i].clear[1], desc.color[i].clear[2], desc.color[i].clear[3]);
+		}
+		if (tracing(encoder)) {
+			char text[96];
+			texture_text(msg(depth, "texture"), text, sizeof(text));
+			say("ca: render pass depth %s, target %ux%u", text, desc.width, desc.height);
+		}
+	}
+	return encoder;
 }
 
 static id
@@ -2733,7 +2815,15 @@ cmdbuf_blit_encoder(id self, SEL _cmd)
 {
 	(void)_cmd;
 	struct cmdbuf_state *c = state_of(self);
-	return c != NULL && !c->committed ? encoder_make(gBlitEncoderClass, self) : nil;
+	id encoder = c != NULL && !c->committed ? encoder_make(gBlitEncoderClass, self) : nil;
+	struct encoder_state *e = encoder != nil ? state_of(encoder) : NULL;
+	if (e != NULL && traced_cmdbuf(self)) {
+		e->trace = true;
+		if (tracing(encoder)) {
+			say("ca: blit encoder");
+		}
+	}
+	return encoder;
 }
 
 static id
@@ -2752,7 +2842,15 @@ cmdbuf_compute_encoder(id self, SEL _cmd)
 		return nil;
 	}
 	mtl->cmdbuf_compute_begin(c->mc);
-	return encoder_make(gComputeEncoderClass, self);
+	id encoder = encoder_make(gComputeEncoderClass, self);
+	struct encoder_state *e = encoder != nil ? state_of(encoder) : NULL;
+	if (e != NULL && traced_cmdbuf(self)) {
+		e->trace = true;
+		if (tracing(encoder)) {
+			say("ca: compute encoder");
+		}
+	}
+	return encoder;
 }
 
 static id
@@ -2775,6 +2873,9 @@ render_end(id self, SEL _cmd)
 	(void)_cmd;
 	struct b2l_mtl_cmdbuf *mc = recording(self);
 	if (mc != NULL) {
+		if (tracing(self)) {
+			say("ca: end of the render pass");
+		}
 		mtl->cmdbuf_pass_end(mc);
 	}
 	struct encoder_state *e = state_of(self);
@@ -2847,6 +2948,9 @@ render_set_pipeline(id self, SEL _cmd, id state)
 		foreign(mc, _cmd, state);
 		return;
 	}
+	if (tracing(self)) {
+		say("ca: pipeline %s", state != nil ? ((struct pipeline_state *)state_of(state))->names : "nil");
+	}
 	mtl->cmdbuf_set_pipeline(mc, mp);
 }
 
@@ -2862,7 +2966,28 @@ set_buffer(id self, SEL _cmd, uint32_t stage, id buffer, unsigned long offset, u
 		foreign(mc, _cmd, buffer);
 		return;
 	}
+	if (tracing(self)) {
+		say("ca: %s buffer %lu: %p offset %lu of %lu bytes", stage == B2L_MTL_VERTEX ? "vertex" : "fragment", index,
+		    (void *)buffer, offset, buffer != nil ? msg_u(buffer, "length") : 0ul);
+	}
 	mtl->cmdbuf_set_buffer(mc, stage, (uint32_t)index, mb, offset);
+}
+
+/* The first 64 bytes as 32-bit words: floats, matrices, colours. */
+static void
+trace_bytes(id self, const char *stage, const void *bytes, unsigned long length, unsigned long index)
+{
+	if (!tracing(self)) {
+		return;
+	}
+	char text[16 * 11 + 1] = "";
+	const uint8_t *p = bytes;
+	for (unsigned long i = 0; p != NULL && i + 4 <= length && i < 64; i += 4) {
+		uint32_t w = (uint32_t)p[i] | (uint32_t)p[i + 1] << 8 | (uint32_t)p[i + 2] << 16 | (uint32_t)p[i + 3] << 24;
+		size_t at = strlen(text);
+		snprintf(text + at, sizeof(text) - at, " %08x", w);
+	}
+	say("ca: %s bytes %lu: %lu bytes:%s", stage, index, length, text);
 }
 
 static void
@@ -2924,6 +3049,7 @@ render_vertex_bytes(id self, SEL _cmd, const void *bytes, unsigned long length, 
 	(void)_cmd;
 	struct b2l_mtl_cmdbuf *mc = recording(self);
 	if (mc != NULL) {
+		trace_bytes(self, "vertex", bytes, length, index);
 		mtl->cmdbuf_set_bytes(mc, B2L_MTL_VERTEX, (uint32_t)index, bytes, length);
 	}
 }
@@ -2934,6 +3060,7 @@ render_fragment_bytes(id self, SEL _cmd, const void *bytes, unsigned long length
 	(void)_cmd;
 	struct b2l_mtl_cmdbuf *mc = recording(self);
 	if (mc != NULL) {
+		trace_bytes(self, "fragment", bytes, length, index);
 		mtl->cmdbuf_set_bytes(mc, B2L_MTL_FRAGMENT, (uint32_t)index, bytes, length);
 	}
 }
@@ -2949,6 +3076,11 @@ set_texture(id self, SEL _cmd, uint32_t stage, id texture, unsigned long index)
 	if (mt == NULL && texture != nil) {
 		foreign(mc, _cmd, texture);
 		return;
+	}
+	if (tracing(self)) {
+		char text[96];
+		texture_text(texture, text, sizeof(text));
+		say("ca: %s texture %lu: %s", stage == B2L_MTL_VERTEX ? "vertex" : "fragment", index, text);
 	}
 	mtl->cmdbuf_set_texture(mc, stage, (uint32_t)index, mt);
 }
@@ -3048,6 +3180,9 @@ render_viewport(id self, SEL _cmd, mtl_viewport v)
 	(void)_cmd;
 	struct b2l_mtl_cmdbuf *mc = recording(self);
 	if (mc != NULL) {
+		if (tracing(self)) {
+			say("ca: viewport %g %g %g x %g, depth %g..%g", v.x, v.y, v.width, v.height, v.znear, v.zfar);
+		}
 		struct b2l_mtl_viewport viewport = { v.x, v.y, v.width, v.height, v.znear, v.zfar };
 		mtl->cmdbuf_set_viewport(mc, &viewport);
 	}
@@ -3068,6 +3203,9 @@ render_scissor(id self, SEL _cmd, mtl_scissor r)
 	(void)_cmd;
 	struct b2l_mtl_cmdbuf *mc = recording(self);
 	if (mc != NULL) {
+		if (tracing(self)) {
+			say("ca: scissor %lu %lu %lu x %lu", r.x, r.y, r.width, r.height);
+		}
 		mtl->cmdbuf_set_scissor(mc, (uint32_t)r.x, (uint32_t)r.y, (uint32_t)r.width, (uint32_t)r.height);
 	}
 }
@@ -3077,6 +3215,10 @@ set_raster(id self, uint32_t which, unsigned long value)
 {
 	struct b2l_mtl_cmdbuf *mc = recording(self);
 	if (mc != NULL) {
+		if (tracing(self)) {
+			static const char *const names[] = { "cull", "winding", "fill", "depth clip" };
+			say("ca: %s %lu", which < 4 ? names[which] : "raster", value);
+		}
 		mtl->cmdbuf_set_raster(mc, which, (uint32_t)value);
 	}
 }
@@ -3230,6 +3372,10 @@ draw(id self, SEL _cmd, unsigned long type, unsigned long start, unsigned long c
 		}
 		d.index_type = (uint32_t)index_type;
 		d.index_offset = index_offset;
+	}
+	if (tracing(self)) {
+		say("ca: draw primitive %lu start %lu count %lu instances %lu base %lu%s%s", type, start, count, instances,
+		    base_instance, index_buffer != nil ? ", indexed" : "", d.index_type ? " (32-bit)" : "");
 	}
 	mtl->cmdbuf_draw(mc, &d);
 }

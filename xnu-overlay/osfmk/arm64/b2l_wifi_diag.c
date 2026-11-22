@@ -30,6 +30,9 @@
  * Bus mastering, DMA rings, mailboxes and IRQs stay off; nothing is sent to
  * the firmware. It runs in a kernel thread 360 s after start, after the
  * Metal test window, so a wedge here cannot cost that boot's other results.
+ * b2l_wifi_diag=12 (S10 port) also reads, while the firmware runs, the whole
+ * shared area, its ring_info, the five common rings and their indices and
+ * the mailbox words, lets it run 2 s more and reads its console again.
  * A powered PHY alone does not establish that DBI/ELBI accesses are safe.
  * All addresses/offsets are sourced in docs/wifi-bringup.md.
  */
@@ -657,9 +660,10 @@ done:
     wlog("firmware %s: %s\n", what, text);
 }
 
-/* The text before the console's write index, one log line per firmware line. */
+/* The text before the console's write index, one log line per firmware line;
+ * from *last on (mode 12's second read), at most 4 KiB. *last becomes the index. */
 static void
-wifi_log_console(struct wifi_region *regions, uint32_t console, uint64_t deadline)
+wifi_log_console(struct wifi_region *regions, uint32_t console, uint64_t deadline, uint32_t *last)
 {
     static char text[4096 + 4];
     uint32_t buffer = 0, size = 0, index = 0;
@@ -676,6 +680,12 @@ wifi_log_console(struct wifi_region *regions, uint32_t console, uint64_t deadlin
         return;
     }
     unsigned count = index > 4096 ? 4096 : index, from = index - count, length = 0;
+    if (*last <= index && *last > from) from = *last;
+    if (*last == index && index != 0) {
+        wlog("console: no new text since index %u\n", index);
+        return;
+    }
+    *last = index;
     for (uint32_t at = (buffer + from) & ~3u; at < buffer + index; at += 4) {
         uint32_t word;
         if (wifi_bp_read(regions, at, &word, deadline)) {
@@ -707,14 +717,117 @@ wifi_log_console(struct wifi_region *regions, uint32_t console, uint64_t deadlin
 }
 
 static int
-wifi_firmware_boot(struct wifi_region *regions)
+wifi_in_ram(uint32_t address, uint32_t bytes)
+{
+    return !(address & 3u) && address >= WIFI_RAM_BASE && address <= WIFI_RAM_END - bytes;
+}
+
+/*
+ * S10 port, mode 12, read only: what the running firmware set up for the
+ * host (bcmpcie.h): the whole pciedev_shared_t (32 words, IPC revision 7),
+ * its ring_info_t (19 words), the five common rings' ring_mem_t and the
+ * read/write indices of those rings in dongle memory, and the two mailbox
+ * data words. This is what Linux DHD reads in dhdpcie_readshared before it
+ * sets up any ring; nothing is written.
+ */
+static void
+wifi_log_rings(struct wifi_region *regions, uint32_t shared, uint64_t deadline)
+{
+    static const struct { uint32_t bit; const char *name; } names[] = {
+        { 0x100, "assert_built" }, { 0x200, "assert" }, { 0x400, "trap" }, { 0x8000, "evt_seqnum" },
+        { 0x10000, "dma_index" }, { 0x20000, "d2h_sync_seqnum" }, { 0x40000, "d2h_sync_xorcsum" },
+        { 0x80000, "idle_flow_ring" }, { 0x100000, "2byte_indices" }, { 0x200000, "fatal_logbuf" },
+        { 0x400000, "idma" }, { 0x800000, "msi_multi" }, { 0x1000000, "ifrm" }, { 0x2000000, "use_mailbox" },
+        { 0x4000000, "mfgbuild" }, { 0x8000000, "timestamp_db0" }, { 0x10000000, "hostrdy" },
+        { 0x20000000, "no_oob_dw" }, { 0x40000000, "inband_ds" }, { 0x80000000u, "dar" },
+    };
+    uint32_t w[32], info[19], mem[5][4], value;
+    char text[320];
+    unsigned length = 0;
+    if (!wifi_in_ram(shared, sizeof(w))) {
+        wlog("rings: shared area at %#x too close to the end of RAM\n", shared);
+        return;
+    }
+    for (unsigned i = 0; i < 32; i++) {
+        if (wifi_bp_read(regions, shared + 4 * i, &w[i], deadline)) {
+            wlog("rings: shared word %u unreadable\n", i);
+            return;
+        }
+    }
+    text[0] = 0;
+    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]) && length < sizeof(text) - 24; i++) {
+        if (w[0] & names[i].bit) {
+            int n = snprintf(text + length, sizeof(text) - length, " %s", names[i].name);
+            if (n > 0) length += (unsigned)n;
+        }
+    }
+    wlog("shared flags %#x (IPC revision %u):%s\n", w[0], w[0] & 0xffu, length ? text : " none");
+    wlog("shared: lfrag_pkts=%u max_host_rxbufs=%u dma_rxoffset=%#x h2d_mb=%#x d2h_mb=%#x rings_info=%#x "
+        "scratch_len=%u buzz/trap_len=%#x flags2=%#x host_cap=%#x fatal_logbuf=%#x flags3=%#x etd=%#x "
+        "txpost_ext_tags=%#x\n", w[8] & 0xffffu, w[8] >> 16, w[9], w[10], w[11], w[12], w[13], w[19], w[20],
+        w[21], w[24], w[27], w[30], w[31]);
+    for (unsigned i = 0; i < 2; i++) {
+        uint32_t box = w[10 + i];
+        if (wifi_in_ram(box, 4) && !wifi_bp_read(regions, box, &value, deadline))
+            wlog("%s mailbox data at %#x: %#x\n", i ? "d2h" : "h2d", box, value);
+    }
+    if (!wifi_in_ram(w[12], sizeof(info))) {
+        wlog("rings: rings_info %#x outside RAM\n", w[12]);
+        return;
+    }
+    for (unsigned i = 0; i < 19; i++) {
+        if (wifi_bp_read(regions, w[12] + 4 * i, &info[i], deadline)) {
+            wlog("rings: ring_info word %u unreadable\n", i);
+            return;
+        }
+    }
+    wlog("rings info at %#x: ringmem=%#x h2d_w=%#x h2d_r=%#x d2h_w=%#x d2h_r=%#x max_tx_flowrings=%u "
+        "submission=%u completion=%u vdevs=%u hwa_db=%#x/%#x\n", w[12], info[0], info[1], info[2], info[3],
+        info[4], info[13] & 0xffffu, info[13] >> 16, info[14] & 0xffffu, info[14] >> 16, info[17], info[18]);
+    wlog("rings host addresses (unset by us): h2d_w %#x:%#x h2d_r %#x:%#x d2h_w %#x:%#x d2h_r %#x:%#x ifrm %#x:%#x\n",
+        info[6], info[5], info[8], info[7], info[10], info[9], info[12], info[11], info[16], info[15]);
+    if (!wifi_in_ram(info[0], sizeof(mem))) {
+        wlog("rings: ringmem %#x outside RAM\n", info[0]);
+        return;
+    }
+    for (unsigned r = 0; r < 5; r++) {
+        for (unsigned i = 0; i < 4; i++) {
+            if (wifi_bp_read(regions, info[0] + 16 * r + 4 * i, &mem[r][i], deadline)) {
+                wlog("rings: ring_mem %u unreadable\n", r);
+                return;
+            }
+        }
+        wlog("ring %u: id %u type %u max_item %u item %u bytes base %#x:%#x\n", r, mem[r][0] & 0xffffu,
+            (mem[r][0] >> 16) & 0xffu, mem[r][1] & 0xffffu, mem[r][1] >> 16, mem[r][3], mem[r][2]);
+    }
+    /* 4-byte indices unless the firmware says 2 (PCIE_SHARED_2BYTE_INDICES). */
+    const unsigned size = (w[0] & 0x100000u) ? 2 : 4;
+    static const char *const arrays[] = { "h2d write", "h2d read", "d2h write", "d2h read" };
+    for (unsigned a = 0; a < 4; a++) {
+        unsigned count = a < 2 ? 2 : 3;
+        uint32_t base = info[1 + a], idx[3] = { 0 };
+        if (!wifi_in_ram(base & ~3u, 12)) {
+            wlog("rings: %s indices at %#x outside RAM\n", arrays[a], base);
+            continue;
+        }
+        for (unsigned i = 0; i < count; i++) {
+            uint32_t at = base + i * size, word = 0;
+            if (wifi_bp_read(regions, at & ~3u, &word, deadline)) break;
+            idx[i] = size == 4 ? word : (word >> (8 * (at & 2u))) & 0xffffu;
+        }
+        wlog("rings: %s indices at %#x: %u %u %u\n", arrays[a], base, idx[0], idx[1], count == 3 ? idx[2] : 0);
+    }
+}
+
+static int
+wifi_firmware_boot(struct wifi_region *regions, uint32_t mode)
 {
     const uint32_t top = WIFI_RAM_END - 4, varsize = wifi_nvram_bytes, varaddr = top - varsize;
     const uint32_t token = (~(varsize / 4) << 16) | ((varsize / 4) & 0xffffu);
     const uint32_t seed_meta = varaddr - 8, seed_addr = seed_meta - 128;
     const uint32_t vector = wifi_firmware_word(0);
     uint8_t seed[128], meta[8], token_bytes[4];
-    uint32_t before = 0, got = 0, shared = 0, words[8] = { 0 };
+    uint32_t before = 0, got = 0, shared = 0, words[8] = { 0 }, console_index = 0;
     unsigned polls = 0, released = 0;
     uint64_t deadline;
     clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
@@ -778,7 +891,7 @@ wifi_firmware_boot(struct wifi_region *regions)
     wlog("shared at %#x after %u polls: flags=%#x version=%u trap=%#x assert_exp=%#x assert_file=%#x "
         "assert_line=%u console=%#x msgtrace=%#x fwid=%#x\n", shared, polls, words[0], words[0] & 0xffu,
         words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
-    wifi_log_console(regions, words[5], deadline);
+    wifi_log_console(regions, words[5], deadline, &console_index);
     if (words[0] & 0x200u) {
         wifi_log_string(regions, "assert file", words[3], deadline);
         wifi_log_string(regions, "assert expression", words[2], deadline);
@@ -791,6 +904,19 @@ wifi_firmware_boot(struct wifi_region *regions)
         for (unsigned i = 0; i < 16; i += 4)
             wlog("firmware trap: r%u=%#x r%u=%#x r%u=%#x r%u=%#x\n", i, trap[4 + i], i + 1, trap[5 + i],
                 i + 2, trap[6 + i], i + 3, trap[7 + i]);
+    }
+    if (mode >= 12) {
+        /* S10 port, mode 12: the host-side layout, then 2 s more of the
+         * firmware on its own and what it printed meanwhile. */
+        clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+        wifi_log_rings(regions, shared, deadline);
+        for (unsigned i = 0; i < 10; i++) delay_for_interval(200, NSEC_PER_MSEC);
+        clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+        uint32_t flags = 0;
+        if (!wifi_bp_read(regions, shared, &flags, deadline))
+            wlog("after 2 s more: shared flags %#x%s%s\n", flags, (flags & 0x400u) ? " TRAP" : "",
+                (flags & 0x200u) ? " ASSERT" : "");
+        wifi_log_console(regions, words[5], deadline, &console_index);
     }
 halt:
     /* dhdpcie_bus_download_state(enter): halt the ARM and remove reset. */
@@ -908,15 +1034,15 @@ wifi_chipcommon_probe(struct wifi_region *regions, uint32_t mode)
                 if (wifi_tcm_inventory(regions, &cleanup_failed, &measured_tcm)) goto out;
                 if (mode >= 10) {
                     stage = "firmware-prerequisites";
-                    if (!measured_tcm || !wifi_firmware || (mode == 11 && !wifi_nvram)) {
+                    if (!measured_tcm || !wifi_firmware || (mode >= 11 && !wifi_nvram)) {
                         wlog("firmware download skipped: measured TCM/input prerequisites absent\n");
                         goto out;
                     }
                     stage = "firmware-download";
                     if (wifi_firmware_download(regions)) goto out;
-                    if (mode == 11) {
+                    if (mode >= 11) {
                         stage = "firmware-boot";
-                        if (wifi_firmware_boot(regions)) {
+                        if (wifi_firmware_boot(regions, mode)) {
                             cleanup_failed = -1;
                             goto out;
                         }
@@ -1363,23 +1489,25 @@ out:
     }
 }
 
-/* S10 port, mode 11: the same sequence later, in its own kernel thread. */
+/* S10 port, modes 11 and 12: the same sequence later, in its own kernel thread. */
+static uint32_t wifi_deferred_mode;
+
 static void
 wifi_deferred(void *argument, wait_result_t result)
 {
     (void)argument;
     (void)result;
     delay_for_interval(WIFI_DEFER_S, NSEC_PER_SEC);
-    wlog("mode 11: deferred run begins\n");
-    wifi_diag_run(11);
-    wlog("mode 11: deferred run finished\n");
+    wlog("mode %u: deferred run begins\n", wifi_deferred_mode);
+    wifi_diag_run(wifi_deferred_mode);
+    wlog("mode %u: deferred run finished\n", wifi_deferred_mode);
 }
 
 void
 b2l_wifi_diag_start(void)
 {
     uint32_t mode = 0;
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 11) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 12) {
         wlog("diagnostic disabled; no MMIO access\n");
         return;
     }
@@ -1387,14 +1515,16 @@ b2l_wifi_diag_start(void)
         wlog("firmware input absent/invalid; no MMIO access\n");
         return;
     }
-    if (mode == 11) {
+    if (mode >= 11) {
         thread_t thread;
+        wifi_deferred_mode = mode;
         if (kernel_thread_start(wifi_deferred, NULL, &thread) != KERN_SUCCESS) {
-            wlog("mode 11: thread start failed; no MMIO access\n");
+            wlog("mode %u: thread start failed; no MMIO access\n", mode);
             return;
         }
         thread_deallocate(thread);
-        wlog("mode 11: firmware download and boot deferred %u s, after the Metal test window\n", WIFI_DEFER_S);
+        wlog("mode %u: firmware download and boot deferred %u s, after the Metal test window\n", mode,
+            WIFI_DEFER_S);
         return;
     }
     wifi_diag_run(mode);

@@ -656,3 +656,19 @@ Reusable integration references:
 - [HakiOS XNU packet interface](https://github.com/oosexgang/hakios-xnu-kernel/blob/63fc2b4633bac3af8e57dadab9f5a8d4cb940438/drivers/net/hakios.net.c)
 - [HakiOS Wi-Fi service](https://github.com/oosexgang/hakios-xnu-kernel/blob/63fc2b4633bac3af8e57dadab9f5a8d4cb940438/drivers/wifi/hakios.wlan.cpp)
 - [BCM4375 on Exynos 990 bring-up report](https://github.com/Bentlybro/z3s-mainline-linux/blob/main/docs/WIFI_BRINGUP.md)
+
+## S10: the firmware's host-side layout (mode 12)
+
+`b2l_wifi_diag=12` repeats mode 11 and, once the shared area is up, reads
+(nothing is written) what Linux DHD reads in `dhdpcie_readshared` before it
+sets up a ring: all 32 words of `pciedev_shared_t` with its flags decoded
+(boot 70: `0x30040007` = IPC revision 7, `d2h_sync_xorcsum`, `hostrdy`,
+`no_oob_dw`; no `dma_index`, so the ring indices live in dongle memory and
+need no host DMA), the mailbox data words, `ring_info_t` (ring memory, the
+four index arrays, the flow-ring and completion-ring counts), the five
+common rings' `ring_mem_t` (id, type, item count and size, base) and their
+read/write indices. Then the firmware runs 2 s more on its own, and the
+console is read again from where the first read stopped.
+
+The next step after this one is the host side itself: rings in host
+memory, bus mastering, the doorbell and interrupts, which no mode does yet.

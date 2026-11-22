@@ -433,8 +433,14 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * S10 port, mode 11 (docs/wifi-bringup.md): 360 s after start,
                  * the same download, then the firmware booted with the board
                  * NVRAM from the attachment (B2LFW002) for about 3 s, its shared
-                 * area and console read, and the R4 halted again. */
-                "b2l_wifi_diag=11 "
+                 * area and console read, and the R4 halted again. Mode 12 (boot
+                 * 70 booted it in mode 11): also the ring layout it set up for
+                 * the host, read only, 2 s more and its console again. */
+                "b2l_wifi_diag=12 "
+                /* S10 port: test boots come back to TWRP by themselves 8 min
+                 * after start (after Metal's test and Wi-Fi's deferred run),
+                 * synced like the volume-key chord (B2LPower.cpp). */
+                "b2l_recovery_after=480 "
                 /* Metal M1 (docs/metal-on-panfrost.md): B2LMali publishes an
                  * IOAcceleratorES naming the B2LMetal plug-in, and backboardd's
                  * library asks Metal for its device in a child process 60 s

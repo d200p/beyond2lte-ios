@@ -290,6 +290,7 @@ static void b2l_keyboard_cache_before_init(vfs_context_t ctx)
 #ifndef B2L_PERSONA_HOST_TEST
 extern void b2l_acpm_dvfs_start(void);
 extern void b2l_wifi_diag_start(void);
+extern void b2l_power_schedule_recovery(void);   /* S10 port: B2LPower.cpp */
 #endif
 void b2l_persona_before_init(void)
 {
@@ -297,6 +298,7 @@ void b2l_persona_before_init(void)
     b2l_userspace_before_init();
     b2l_acpm_dvfs_start();
     b2l_wifi_diag_start();
+    b2l_power_schedule_recovery();
     if(rootvnode&&!vfs_isrdonly(vnode_mount(rootvnode))&&
        !strcmp(vfs_statfs(vnode_mount(rootvnode))->f_fstypename,"hfs")){
         b2l_accessibility_before_init(vfs_context_current());

@@ -76,7 +76,7 @@ static int PE_parse_boot_argn(const char *name, void *value, unsigned size) {
 }
 static uint64_t mach_absolute_time(void) { return now_us; }
 static void clock_interval_to_deadline(unsigned n, unsigned unit, uint64_t *at) {
-    assert((n == 500 || (mode >= 5 && n == 100) || (mode >= 10 && n == 5000) || (mode == 11 && n == 2000)) &&
+    assert((n == 500 || (mode >= 5 && n == 100) || (mode >= 10 && n == 5000) || (mode >= 11 && n == 2000)) &&
         unit == NSEC_PER_MSEC); *at = now_us + n * 1000;
 }
 static void delay(unsigned us) { assert(us == 10 || us == 20 || us == 100); now_us += us; }
@@ -91,13 +91,13 @@ static unsigned thread_starts, thread_fail, threads_released, deferred_s;
 static void delay_for_interval(unsigned n, unsigned unit) {
     if (unit == NSEC_PER_SEC) {
         /* The deferral sleeps before any mapping; it is not part of the probe's time. */
-        assert(mode == 11 && n == 360 && !deferred_s && !maps); deferred_s = n; return;
+        assert(mode >= 11 && n == 360 && !deferred_s && !maps); deferred_s = n; return;
     }
     assert(unit == NSEC_PER_MSEC && (n == 1 || n == 20 || n == 200 ||
-        (mode >= 5 && (n == 9 || n == 100)) || (mode == 11 && n == 6000))); now_us += n * 1000;
+        (mode >= 5 && (n == 9 || n == 100)) || (mode >= 11 && n == 6000))); now_us += n * 1000;
 }
 static kern_return_t kernel_thread_start(thread_continue_t fn, void *arg, thread_t *out) {
-    assert(mode == 11 && !thread_starts++ && !maps);
+    assert(mode >= 11 && !thread_starts++ && !maps);
     if (thread_fail) return 5;
     *out = (thread_t)&thread_starts;
     fn(arg, 0); /* The thread's whole run, synchronously. */
@@ -105,7 +105,7 @@ static kern_return_t kernel_thread_start(thread_continue_t fn, void *arg, thread
 }
 static void thread_deallocate(thread_t thread) { assert(thread == (thread_t)&thread_starts); threads_released++; }
 void read_frandom(void *p, unsigned n) {
-    assert(mode == 11 && n == 128);
+    assert(mode >= 11 && n == 128);
     for (unsigned i = 0; i < n; i++) ((uint8_t *)p)[i] = (uint8_t)(0xa5u ^ i);
 }
 #define TCM11_TOP ((0x2ffffcu - 0x170000u) / 4)
@@ -132,6 +132,23 @@ static void start_firmware(void) {
     tcm11_put(0x2f0110, sizeof(console_text) - 1);
     memcpy((uint8_t *)tcm11 + (0x2f1000 - 0x170000), console_text, sizeof(console_text) - 1);
     for (unsigned i = 0; i < 20; i++) tcm11_put(0x2f0200 + 4 * i, 0x100 + i);
+    /* Mode 12: the rest of pciedev_shared_t, ring_info_t, ring_mem_t, indices. */
+    tcm11_put(0x2f0020, 0x00400010);        /* lfrag 16, host rx buffers 64 */
+    tcm11_put(0x2f0028, 0x2f0500);          /* h2d mailbox data */
+    tcm11_put(0x2f002c, 0x2f0504);          /* d2h mailbox data */
+    tcm11_put(0x2f0030, 0x2f0400);          /* rings_info */
+    tcm11_put(0x2f0050, 0x12);              /* flags2 */
+    static const uint32_t info[5] = { 0x2f0600, 0x2f0700, 0x2f0710, 0x2f0720, 0x2f0730 };
+    for (unsigned i = 0; i < 5; i++) tcm11_put(0x2f0400 + 4 * i, info[i]);
+    tcm11_put(0x2f0434, (42u << 16) | 40u); /* submission queues, tx flow rings */
+    tcm11_put(0x2f0438, (8u << 16) | 3u);   /* vdevs, completion rings */
+    static const uint32_t rings[5][2] = { { 1, 64 | 40u << 16 }, { 3, 512 | 32u << 16 }, { 1, 64 | 24u << 16 },
+                                          { 2, 1024 | 16u << 16 }, { 3, 512 | 32u << 16 } };
+    for (unsigned r = 0; r < 5; r++) {
+        tcm11_put(0x2f0600 + 16 * r, r | rings[r][0] << 16);
+        tcm11_put(0x2f0604 + 16 * r, rings[r][1]);
+    }
+    tcm11_put(0x2f0720, 1);                 /* the firmware wrote one control completion */
 }
 static uintptr_t ml_io_map_unmappable(uintptr_t pa, unsigned long size, unsigned flags) {
     assert(maps < (mode >= 6 ? 11u : mode + 5) && pa == physical[maps] && size == 0x4000 && flags == VM_WIMG_IO);
@@ -175,7 +192,7 @@ static int valid_link_setup(void) {
 }
 /* Mode 11 after the TCM inventory: address 0, the R4 wrapper and all of RAM. */
 static int boot11_window(uint32_t window) {
-    return mode == 11 && bank_reads == 13 &&
+    return mode >= 11 && bank_reads == 13 &&
         (window == 0 || window == 0x18102000 || (window >= 0x170000 && window < 0x300000));
 }
 static uint32_t host_read(uintptr_t address, unsigned off) {
@@ -431,7 +448,7 @@ static void host_write(uintptr_t address, unsigned off, uint32_t value) {
         if (off == 0x2080) assert(value == 0x18000000 || value == 0x18001000 || (mode >= 7 && value == 0x18111000) ||
             (mode >= 8 && (value == 0x18103000 || value == 0x18102000 || value == 0x18002000)) ||
             (mode == 10 && value >= 0x170000 && value <= 0x2ac000 && !(value & 4095)) ||
-            (mode == 11 && (value == 0 || (value >= 0x170000 && value < 0x300000 && !(value & 4095)))));
+            (mode >= 11 && (value == 0 || (value >= 0x170000 && value < 0x300000 && !(value & 4095)))));
         writes++; config_writes++;
         if (mode == 10 && bank_reads == 13 && off == 0x2080 &&
             (value == 0x18102000 || (value >= 0x170000 && value <= 0x2ac000))) {
@@ -603,8 +620,8 @@ static void verify_quiet(void) {
     if (strstr(logs, "Gen1 probe begin:"))
         assert(!(memory[4][0xc/4] | memory[4][0x10/4] | memory[4][0x14/4]));
     assert(unmaps == (mode >= 6 ? 11u : mode + 5) && link_polls <= 500 &&
-        now_us < (mode == 11 ? 20000000u : mode == 10 ? 7000000u : 1000000u));
-    if (mode == 11) assert(!r4_running && !r4_reset && r4_io == 0x21); /* Halted before power-off. */
+        now_us < (mode >= 11 ? 20000000u : mode == 10 ? 7000000u : 1000000u));
+    if (mode >= 11) assert(!r4_running && !r4_reset && r4_io == 0x21); /* Halted before power-off. */
     if (mode >= 5) {
         uint32_t expected_control = endpoint_fault == 7 || endpoint_fault == 10 ? 0x80000000 : 0;
         if (endpoint_fault == 16) expected_control = UINT32_MAX;
@@ -994,6 +1011,36 @@ int main(void) {
             strstr(logs, "firmware boot end: R4 never ran, halted again"));
     }
     puts("Firmware boot: NVRAM layout guard, deferred thread, DHD NVRAM/token/seed/vector order, release and re-halt, shared/console/trap reads, read-only RAM while running passed");
+    /* S10 port, mode 12: the host-side layout, read only, then 2 s more. */
+    mode = 12;
+    for (unsigned fault = 0; fault <= 1; fault++) {
+        reset(8, 0); firmware_fixture_nvram(good, sizeof(good)); nvram_fixture_bytes = sizeof(good);
+        boot_fault = fault ? 1 : 0;
+        b2l_wifi_diag_start(); verify_quiet();
+        assert(thread_starts == 1 && threads_released == 1 && deferred_s == 360 && r4_runs == 1);
+        assert(strstr(logs, "mode 12: deferred run finished") && strstr(logs, "cleanup=verified"));
+        assert(strstr(logs, "firmware boot end: R4 ran, halted again"));
+        if (fault) {
+            /* no shared area: nothing of mode 12 is read */
+            assert(strstr(logs, "shared area not published") && !strstr(logs, "rings info at"));
+            continue;
+        }
+        assert(strstr(logs, "shared flags 0x7 (IPC revision 7): none"));
+        assert(strstr(logs, "lfrag_pkts=16 max_host_rxbufs=64 dma_rxoffset=0 h2d_mb=0x2f0500 d2h_mb=0x2f0504 "
+            "rings_info=0x2f0400"));
+        assert(strstr(logs, "flags2=0x12"));
+        assert(strstr(logs, "h2d mailbox data at 0x2f0500: 0\n") && strstr(logs, "d2h mailbox data at 0x2f0504: 0\n"));
+        assert(strstr(logs, "rings info at 0x2f0400: ringmem=0x2f0600 h2d_w=0x2f0700 h2d_r=0x2f0710 "
+            "d2h_w=0x2f0720 d2h_r=0x2f0730 max_tx_flowrings=40 submission=42 completion=3 vdevs=8"));
+        assert(strstr(logs, "ring 0: id 0 type 1 max_item 64 item 40 bytes base 0:0"));
+        assert(strstr(logs, "ring 2: id 2 type 1 max_item 64 item 24 bytes base 0:0"));
+        assert(strstr(logs, "ring 4: id 4 type 3 max_item 512 item 32 bytes base 0:0"));
+        assert(strstr(logs, "rings: d2h write indices at 0x2f0720: 1 0 0"));
+        assert(strstr(logs, "rings: h2d read indices at 0x2f0710: 0 0 0"));
+        assert(strstr(logs, "after 2 s more: shared flags 0x7\n"));
+        assert(strstr(logs, "console: no new text since index"));
+    }
+    puts("Firmware host layout: whole shared area, ring info, common rings and indices, mailboxes, a second console read, all read only, passed");
 }
 '''
 
