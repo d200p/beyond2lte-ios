@@ -646,7 +646,8 @@ static const struct {
  * bytes in scratch; b2l_mtl.c now forwards those bytes and widens such
  * varyings to 32-bit. `perspective` sets fc_perspective in both stages (the
  * smooth color_per instead); `tag` is the pipeline label: "b2l:raw-scratch"
- * leaves the scratch as it was, "b2l:narrow" the varyings 16-bit (controls,
+ * leaves the scratch as it was, "b2l:narrow" the varyings 16-bit,
+ * "b2l:all-targets" the stores to colours without an attachment (controls,
  * logged, not counted). */
 static void
 ca_uber_draw(id device, id queue, id library, bool fetch, bool clear_fs, bool perspective, const char *tag)
@@ -1369,6 +1370,10 @@ b2l_mtl_test_run(void)
 		ca_uber_draw(device, queue, library, false, false, true, NULL);
 		ca_uber_draw(device, queue, library, false, false, false, "b2l:raw-scratch");
 		ca_uber_draw(device, queue, library, false, false, false, "b2l:narrow");
+		/* M2c (boot 79): still 00000000 with the shader down to color0 =
+		 * color_lin and NaN to colours 1 and 2, which have no attachment;
+		 * b2l_mtl.c now drops those stores. The control keeps them. */
+		ca_uber_draw(device, queue, library, false, false, false, "b2l:all-targets");
 		/* M2c (boot 76): one change at a time from that vertex-shader draw;
 		 * boot 77: only std_vert0 drew. With b2l_mtl.c's output fixes now
 		 * on, the same probes, then the control without them (b2l:keep)

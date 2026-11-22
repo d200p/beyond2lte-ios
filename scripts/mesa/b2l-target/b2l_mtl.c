@@ -1769,6 +1769,56 @@ fix_outputs(nir_shader *nir, bool no_psiz, const char *name)
 }
 
 /*
+ * S10 port, M2c (boot 79): with the scratch forwarded, Core Animation's
+ * fragment shader is three stores: color0 = color_lin, and NaN to color1 and
+ * color2 -- and the red layer still came out 00000000, NaN as unorm8. The
+ * pipeline has one colour attachment. Bifrost writes each colour output with
+ * a BLEND instruction that reads the blend descriptor of its render target
+ * (FAU BLEND_0 + rt), and Panfrost lays out descriptors for the bound
+ * targets only, so a store to colour 1 or 2 does not land nowhere. In Metal
+ * a colour output with no attachment is simply not written: here such
+ * outputs and their stores go before Panfrost sees the shader. The tests'
+ * label "b2l:all-targets" skips this (their control). Returns the mask of
+ * the colour outputs removed.
+ */
+static uint32_t
+drop_missing_targets(nir_shader *fs, const struct b2l_mtl_render_pipeline_desc *desc)
+{
+	struct set *gone = _mesa_pointer_set_create(NULL);
+	uint32_t mask = 0;
+	nir_foreach_shader_out_variable_safe(var, fs) {
+		const int rt = var->data.location - FRAG_RESULT_DATA0;
+		if (rt < 0 || rt >= B2L_MTL_MAX_COLORS || desc->color[rt].pixel_format != 0) {
+			continue;
+		}
+		exec_node_remove(&var->node);
+		_mesa_set_add(gone, var);
+		mask |= 1u << rt;
+	}
+	if (mask != 0) {
+		nir_foreach_function_impl(impl, fs) {
+			nir_foreach_block(block, impl) {
+				nir_foreach_instr_safe(instr, block) {
+					if (instr->type != nir_instr_type_intrinsic ||
+					    nir_instr_as_intrinsic(instr)->intrinsic != nir_intrinsic_store_deref) {
+						continue;
+					}
+					nir_deref_instr *d = nir_src_as_deref(nir_instr_as_intrinsic(instr)->src[0]);
+					nir_variable *var = d != NULL ? nir_deref_instr_get_variable(d) : NULL;
+					if (var != NULL && _mesa_set_search(gone, var) != NULL) {
+						nir_instr_remove(instr);
+					}
+				}
+			}
+			nir_metadata_preserve(impl, nir_metadata_control_flow);
+		}
+		nir_opt_dce(fs);
+	}
+	_mesa_set_destroy(gone, NULL);
+	return mask;
+}
+
+/*
  * S10 port, M2c (boot 78): with its output fixes Core Animation's vertex
  * shader draws, and its fragment shader writes zero. In NIR that shader is a
  * single block: air.static_init stores the function constants, as constants,
@@ -2121,6 +2171,14 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 		fix_outputs(vs, strstr(desc->label, "b2l:no-psiz") != NULL, function_name(desc->vertex));
 		if (fs != NULL) {
 			fix_outputs(fs, false, function_name(desc->fragment));
+		}
+	}
+	if (fs != NULL && strstr(desc->label, "b2l:all-targets") == NULL) {
+		static unsigned noted;
+		const uint32_t dropped = drop_missing_targets(fs, desc);
+		if (dropped != 0 && __atomic_fetch_add(&noted, 1, __ATOMIC_RELAXED) < 40) {
+			b2l_drm_note("mtl M2: %s: colour outputs 0x%x have no attachment; their stores dropped",
+			    function_name(desc->fragment), dropped);
 		}
 	}
 	if (fs != NULL && strstr(desc->label, "b2l:narrow") == NULL) {

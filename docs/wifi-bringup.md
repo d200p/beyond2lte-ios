@@ -899,3 +899,14 @@ network twice, on 2.4 and 5 GHz) and the final event through the event
 buffers it holds, newest first. The cases are with the MAC set and already
 right, the escan refused, and a scan that never finishes; the test checks
 that no name or address reaches the log.
+
+Result (boot 79, build 77): everything before the scan worked, and the
+escan was refused with status -37 (`BCME_VERSION`). `"scan_ver"` answered
+version 1, length 6, `scan_ver_major` 2: this firmware wants
+`wl_escan_params_v2_t` (`ESCAN_REQ_VERSION_V2`, then `wl_scan_params_v2_t`,
+which has its own version 2 and length 76 first and a 32-bit `scan_type`).
+`ESCAN_RESULT` was already on in `"event_msgs"`. Mode 18 now sends the
+layout `"scan_ver"` asks for, version 2 when its major is 2 (version 1 when
+it is not given). The test's firmware answers `scan_ver` as the chip did and
+checks every field of both layouts. A new case, `scan_ver` unsupported,
+covers version 1.

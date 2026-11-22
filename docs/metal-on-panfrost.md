@@ -666,3 +666,26 @@ The red layer runs again: with `fc_perspective` set (the smooth
 the 32-bit varyings. Each can say which of the two was at fault. The
 `CARenderer` frame was still all zero in boot 78, which fits the same
 fragment shader.
+
+### Boot 79 (build 77) and what was added after it
+
+39 of 43 passed. The zero slot works: the probes with the vertices in
+buffer 0 now draw. The scratch forwarding works too: every scratch load of
+both shaders is forwarded, the scratch goes from 148 and 35 bytes to 0, and
+the framebuffer fetch is no longer asked for. Core Animation's fragment
+shader is now three stores: `color0 = color_lin`, and NaN to `color1` and
+`color2`. Yet the red layer, and every variant of it (with
+`fc_perspective`, and both controls), still came out `00000000`, which is
+NaN as unorm8.
+
+The pipeline has one colour attachment. Bifrost writes each colour output
+with a `BLEND` instruction that reads the blend descriptor of its render
+target from FAU (`BIR_FAU_BLEND_0 + rt`, `bifrost_compile.c`), and Panfrost
+lays out descriptors only for the targets that are bound. So a store to
+colour 1 or 2 does not land nowhere, and the last one written, NaN, is what
+target 0 shows. In Metal a colour output with no attachment is simply not
+written. `b2l_mtl.c` now removes such outputs and their stores before
+Panfrost sees the shader, and logs the mask. The label `b2l:all-targets`
+skips this, as the control. The `b2l:raw-scratch` and `b2l:narrow` controls
+stay, and with this fix in place they now say whether those two fixes are
+needed as well.

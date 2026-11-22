@@ -1430,9 +1430,13 @@ wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
     r = wifi_host_var(regions, info, d2h_mb, last, "mode 18", (*next)++, 262, "scan_ver", NULL, 0, 32,
         WIFI_HOST_IOVAR_IN + 0xc00u, &answer, &bytes, &status);
     if (r) return r < 0 ? -1 : 0;
+    /* wl_scan_version_t: version, length, scan_ver_major. Boot 79: 1, 6, 2,
+     * and escan version 1 was refused with BCME_VERSION (-37). */
+    const unsigned major = status == 0 && bytes >= 6 ? (unsigned)(answer[4] | answer[5] << 8) : 0;
+    const int v2 = major >= 2;
     if (status == 0 && bytes >= 6)
-        wlog("mode 18: scan_ver (status 0, %u bytes): version %u, length %u, major %u\n", bytes,
-            answer[0] | answer[1] << 8, answer[2] | answer[3] << 8, answer[4] | answer[5] << 8);
+        wlog("mode 18: scan_ver (status 0, %u bytes): version %u, length %u, major %u; escan version %u sent\n", bytes,
+            answer[0] | answer[1] << 8, answer[2] | answer[3] << 8, major, v2 ? 2u : 1u);
     else
         wlog("mode 18: scan_ver (status %d, %u bytes): not given; escan version 1 sent\n", status, bytes);
     r = wifi_host_var(regions, info, d2h_mb, last, "mode 18", (*next)++, 262, "event_msgs", NULL, 0, 32,
@@ -1450,23 +1454,36 @@ wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
     } else {
         wlog("mode 18: event_msgs (status %d, %u bytes): mask not read, left as it is\n", status, bytes);
     }
-    uint8_t params[72];
+    /* wl_escan_params_t (ESCAN_REQ_VERSION 1) or wl_escan_params_v2_t (2):
+     * version, action, sync_id, then the scan parameters at 8. Version 1's
+     * wl_scan_params_t: SSID at 0, BSSID at 36, bss_type at 42, scan_type
+     * (a byte) at 43, nprobes, active, passive and home times at 44 to 56,
+     * channel_num at 60. wl_scan_params_v2_t: its own version (2) and length
+     * (sizeof, 76) first, SSID at 4, BSSID at 40, bss_type at 46, scan_type
+     * (a word) at 48, the times at 52 to 64, channel_num at 68. */
+    uint8_t params[80];
+    const unsigned q = 8, ssid = v2 ? q + 4 : q, times = v2 ? q + 52 : q + 44, size = v2 ? 80u : 72u;
     memset(params, 0, sizeof(params));
-    wifi_put(params, 1, 4);                     /* ESCAN_REQ_VERSION */
+    wifi_put(params, v2 ? 2u : 1u, 4);          /* ESCAN_REQ_VERSION(_V2) */
     wifi_put(params + 4, 1, 2);                 /* WL_SCAN_ACTION_START */
     wifi_put(params + 6, 0x5318, 2);            /* sync_id */
-    memset(params + 8 + 36, 0xff, 6);           /* wl_scan_params_t: no SSID, the broadcast BSSID */
-    params[8 + 42] = 2;                         /* DOT11_BSSTYPE_ANY */
-    params[8 + 43] = 1;                         /* WL_SCANFLAGS_PASSIVE */
-    wifi_put(params + 8 + 44, 0xffffffffu, 4);  /* nprobes: the firmware's */
-    wifi_put(params + 8 + 48, 0xffffffffu, 4);  /* active_time: the firmware's */
-    wifi_put(params + 8 + 52, 110, 4);          /* passive_time, ms per channel */
-    wifi_put(params + 8 + 56, 0xffffffffu, 4);  /* home_time: the firmware's */
-    wifi_put(params + 8 + 60, 0, 4);            /* no channel list: every channel it has */
-    r = wifi_host_var(regions, info, d2h_mb, last, "mode 18", (*next)++, 263, "escan", params, sizeof(params), 78,
+    if (v2) {
+        wifi_put(params + q, 2, 2);             /* WL_SCAN_PARAMS_VERSION_V2 */
+        wifi_put(params + q + 2, 76, 2);        /* sizeof(wl_scan_params_v2_t) */
+    }
+    memset(params + ssid + 36, 0xff, 6);        /* no SSID, the broadcast BSSID */
+    params[ssid + 42] = 2;                      /* DOT11_BSSTYPE_ANY */
+    if (v2) wifi_put(params + q + 48, 1, 4);    /* WL_SCANFLAGS_PASSIVE */
+    else params[q + 43] = 1;
+    wifi_put(params + times, 0xffffffffu, 4);   /* nprobes: the firmware's */
+    wifi_put(params + times + 4, 0xffffffffu, 4);       /* active_time: the firmware's */
+    wifi_put(params + times + 8, 110, 4);       /* passive_time, ms per channel */
+    wifi_put(params + times + 12, 0xffffffffu, 4);      /* home_time: the firmware's */
+    wifi_put(params + times + 16, 0, 4);        /* no channel list: every channel it has */
+    r = wifi_host_var(regions, info, d2h_mb, last, "mode 18", (*next)++, 263, "escan", params, size, size + 6,
         WIFI_HOST_IOVAR_IN + 0x200u, &answer, &bytes, &status);
     if (r) return r < 0 ? -1 : 0;
-    wlog("mode 18: escan (passive, every channel, 110 ms each) set: status %d\n", status);
+    wlog("mode 18: escan v%u (passive, every channel, 110 ms each) set: status %d\n", v2 ? 2u : 1u, status);
     if (status) return 0;
     struct wifi_scan s;
     memset(&s, 0, sizeof(s));
