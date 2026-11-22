@@ -10,6 +10,11 @@ static unsigned firmware_nvram_bytes;
 static boot_args firmware_args;
 static struct { void *bootArgs; } PE_state = { &firmware_args };
 static unsigned firmware_fault;
+/* S10 port, Wi-Fi mode 16: /chosen mac-address-wifi0 (the loader's, from the
+ * private attachment): 0 present, 1 absent, 2 the same as the chip's. */
+static unsigned firmware_mac_mode;
+static const uint8_t firmware_chosen_mac[6] = { 0x02, 0xb2, 0x1c, 0x5e, 0x10, 0x16 };
+static const uint8_t firmware_chip_mac[6] = { 0x00, 0x90, 0x4c, 0xc5, 0x12, 0x38 };
 #define kSuccess 0
 static inline void firmware_fixture_setup(void) {
     firmware_fault=0;firmware_nvram_bytes=0;
@@ -27,7 +32,11 @@ static int SecureDTLookupEntry(const void *start,const char *name,DTEntry *dt) {
     assert(!start&&!strcmp(name,"/chosen"));*dt=NULL;return firmware_fault==1 ? -1:0;
 }
 static int SecureDTGetProperty(DTEntry dt,const char *name,const void **prop,unsigned *n) {
-    static uint64_t range[2];(void)dt;assert(!strcmp(name,"b2l,wifi-firmware"));
+    static uint64_t range[2];(void)dt;
+    if(!strcmp(name,"mac-address-wifi0")){
+        *prop=firmware_mac_mode==2 ? firmware_chip_mac:firmware_chosen_mac;*n=6;return firmware_mac_mode==1 ? -1:0;
+    }
+    assert(!strcmp(name,"b2l,wifi-firmware"));
     range[0]=(uintptr_t)firmware_fixture;range[1]=FIXTURE_FIRMWARE_BYTES+firmware_nvram_bytes;
     if(firmware_fault==4)range[1]--;
     if(firmware_fault==5)range[0]++;

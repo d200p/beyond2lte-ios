@@ -766,6 +766,144 @@ ca_uber_draw(id device, id queue, id library, bool fetch, bool clear_fs)
 	    31u * SIDE, clear_fs ? "zero" : "red", wrong_right, 31u * SIDE, (unsigned long long)ms, probes, why);
 }
 
+/*
+ * M2c (boot 76): Core Animation's vertex shader with attachment_clear left
+ * the target untouched, so nothing it emits is rasterised. Each probe changes
+ * one thing from that draw, all with attachment_clear (a zero left half means
+ * the triangles were drawn):
+ *   PROBE_STD      std_vert0_lph (proven) instead of fixed_vert_lph_spc,
+ *                  with Core Animation's buffer layout and data
+ *   PROBE_NDC      the vertices already in NDC, an identity matrix
+ *   PROBE_BUFFER0  the vertices in buffer 0, not 1
+ *   PROBE_FLAT     six vertices and no index buffer
+ *   PROBE_PLAIN    fixed_vert_lph_spc without constant values
+ */
+enum { PROBE_STD = 1, PROBE_NDC = 2, PROBE_BUFFER0 = 4, PROBE_FLAT = 8, PROBE_PLAIN = 16 };
+
+static void
+vs_probe(id device, id queue, id library, unsigned flags, const char *what)
+{
+	char label[120], why[200], probes[120] = "";
+	snprintf(label, sizeof(label), "draw: Core Animation's vertex data with attachment_clear, %s", what);
+	id error = nil, v = nil;
+	if (flags & (PROBE_STD | PROBE_PLAIN)) {
+		v = MSG(id, id)(library, S("newFunctionWithName:"),
+		    nsstr((flags & PROBE_STD) ? "std_vert0_lph" : "fixed_vert_lph_spc"));
+	} else {
+		id vvalues = make("MTLFunctionConstantValues");
+		static const char *const vnames[5] = { "fc_generic", "fc_perspective", "fc_texcoord_count0",
+			"fc_texcoord_count1", "fc_vertex_layout" };
+		static const unsigned char vtypes[5] = { CA_B, CA_B, CA_U, CA_U, CA_U };
+		for (unsigned i = 0; i < 5; i++) {
+			uint8_t zero = 0;
+			MSG(void, const void *, unsigned long, id)(vvalues, S("setConstantValue:type:withName:"), &zero,
+			    vtypes[i], nsstr(vnames[i]));
+		}
+		v = MSG(id, id, id, id *)(library, S("newFunctionWithName:constantValues:error:"),
+		    nsstr("fixed_vert_lph_spc"), vvalues, &error);
+	}
+	id f = MSG(id, id)(library, S("newFunctionWithName:"), nsstr("attachment_clear_frag_lph"));
+	if (v == nil || f == nil) {
+		verdict(label, false, "functions %s and %s %s", name_of(v), name_of(f), error_text(error, why, sizeof(why)));
+		return;
+	}
+	const unsigned long buffer = (flags & PROBE_BUFFER0) ? 0 : 1;
+	id d = make("MTLRenderPipelineDescriptor");
+	MSG(void, id)(d, S("setVertexFunction:"), v);
+	MSG(void, id)(d, S("setFragmentFunction:"), f);
+	MSG(void, unsigned long)(at(MSG(id)(d, S("colorAttachments")), 0), S("setPixelFormat:"), 80);
+	id vd = MSG(id)(cls("MTLVertexDescriptor"), S("vertexDescriptor"));
+	id attributes = MSG(id)(vd, S("attributes"));
+	/* std_vert0: position (0), texcoord (1), colour (3); fixed_vert: 0 to 3 */
+	static const unsigned long std_slot[] = { 0, 1, 3 }, std_format[] = { 31, 29, 27 }, std_offset[] = { 0, 16, 32 };
+	static const unsigned long ca_slot[] = { 0, 1, 2, 3 }, ca_format[] = { 31, 29, 29, 27 }, ca_offset[] = { 0, 16, 24, 32 };
+	const bool std = (flags & PROBE_STD) != 0;
+	for (unsigned i = 0; i < (std ? 3u : 4u); i++) {
+		id a = at(attributes, std ? std_slot[i] : ca_slot[i]);
+		MSG(void, unsigned long)(a, S("setFormat:"), std ? std_format[i] : ca_format[i]);
+		MSG(void, unsigned long)(a, S("setOffset:"), std ? std_offset[i] : ca_offset[i]);
+		MSG(void, unsigned long)(a, S("setBufferIndex:"), buffer);
+	}
+	MSG(void, unsigned long)(at(MSG(id)(vd, S("layouts")), buffer), S("setStride:"), 48);
+	MSG(void, id)(d, S("setVertexDescriptor:"), vd);
+	error = nil;
+	id p = MSG(id, id, id *)(device, S("newRenderPipelineStateWithDescriptor:error:"), d, &error);
+	id td = MSG(id, unsigned long, unsigned long, unsigned long, bool)(cls("MTLTextureDescriptor"),
+	    S("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), 80, SIDE, SIDE, false);
+	MSG(void, unsigned long)(td, S("setUsage:"), 5);
+	id target = MSG(id, id)(device, S("newTextureWithDescriptor:"), td);
+	if (p == nil || target == nil) {
+		verdict(label, false, "pipeline %s, target %s %s", name_of(p), name_of(target),
+		    error_text(error, why, sizeof(why)));
+		return;
+	}
+	struct vertex {
+		float position[4], st0[2], st1[2];
+		uint16_t colour[4];
+		uint32_t pad[2];
+	} corners[4], flat[6];
+	static const float pixels[4][2] = { { 0, 0 }, { 32, 0 }, { 32, 64 }, { 0, 64 } };
+	static const float ndc[4][2] = { { -1, 1 }, { 0, 1 }, { 0, -1 }, { -1, -1 } };
+	memset(corners, 0, sizeof(corners));
+	for (unsigned i = 0; i < 4; i++) {
+		corners[i].position[0] = (flags & PROBE_NDC) ? ndc[i][0] : pixels[i][0];
+		corners[i].position[1] = (flags & PROBE_NDC) ? ndc[i][1] : pixels[i][1];
+		corners[i].position[3] = 1;
+		corners[i].colour[0] = corners[i].colour[3] = 0x3c00;
+	}
+	static const uint16_t indices[6] = { 0, 1, 2, 2, 3, 0 };
+	for (unsigned i = 0; i < 6; i++) {
+		flat[i] = corners[indices[i]];
+	}
+	static const float mvp[16] = { 1.0f / 32, 0, 0, 0, 0, -1.0f / 32, 0, 0, 0, 0, 0, 0, -1, 1, 0, 1 };
+	static const uint8_t uniforms[256];
+	const bool unindexed = (flags & PROBE_FLAT) != 0;
+	id vb = MSG(id, const void *, unsigned long, unsigned long)(device, S("newBufferWithBytes:length:options:"),
+	    unindexed ? (const void *)flat : (const void *)corners, unindexed ? sizeof(flat) : sizeof(corners), 0);
+	id ib = MSG(id, const void *, unsigned long, unsigned long)(device, S("newBufferWithBytes:length:options:"),
+	    indices, sizeof(indices), 0);
+	uint64_t ms = 0;
+	id cb = MSG(id)(queue, S("commandBuffer"));
+	id e = begin_pass(cb, target, (clear_color){ 0.25, 0.5, 0.75, 1.0 });
+	MSG(void, id)(e, S("setRenderPipelineState:"), p);
+	MSG(void, id, unsigned long, unsigned long)(e, S("setVertexBuffer:offset:atIndex:"), vb, 0, buffer);
+	MSG(void, const void *, unsigned long, unsigned long)(e, S("setVertexBytes:length:atIndex:"),
+	    (flags & PROBE_NDC) ? identity4 : mvp, sizeof(mvp), 2);
+	MSG(void, const void *, unsigned long, unsigned long)(e, S("setFragmentBytes:length:atIndex:"), uniforms,
+	    sizeof(uniforms), 1);
+	if (unindexed) {
+		MSG(void, unsigned long, unsigned long, unsigned long)(e, S("drawPrimitives:vertexStart:vertexCount:"), 3, 0, 6);
+	} else {
+		MSG(void, unsigned long, unsigned long, unsigned long, id, unsigned long)(e,
+		    S("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:"), 3, 6, 0, ib, 0);
+	}
+	MSG(void)(e, S("endEncoding"));
+	unsigned long status = run(cb, why, sizeof(why), &ms);
+	static uint8_t back[ROW * SIDE];
+	region_t whole = { { 0, 0, 0 }, { SIDE, SIDE, 1 } };
+	MSG(void, void *, unsigned long, region_t, unsigned long)(target, S("getBytes:bytesPerRow:fromRegion:mipmapLevel:"),
+	    back, ROW, whole, 0);
+	static const uint8_t zero[4] = { 0, 0, 0, 0 }, blue[4] = { 191, 128, 64, 255 };
+	unsigned wrong_left = 0, wrong_right = 0;
+	for (unsigned y = 0; y < SIDE; y++) {
+		for (unsigned x = 0; x < SIDE; x++) {
+			if (x == 31 || x == 32) {
+				continue;
+			}
+			if (x < 31) {
+				wrong_left += !near(back + y * ROW + x * 4, zero, 2);
+			} else {
+				wrong_right += !near(back + y * ROW + x * 4, blue, 2);
+			}
+		}
+	}
+	pixel_text(back, ROW, 16, 32, probes, sizeof(probes));
+	pixel_text(back, ROW, 48, 32, probes, sizeof(probes));
+	verdict(label, vb != nil && ib != nil && status == 4 && wrong_left == 0 && wrong_right == 0,
+	    "status %lu, %u of %u left pixels not zero, %u right not blue, %llu ms;%s %s", status, wrong_left, 31u * SIDE,
+	    wrong_right, (unsigned long long)ms, probes, why);
+}
+
 static id
 texture_rgba(id device, unsigned long usage)
 {
@@ -1195,6 +1333,13 @@ b2l_mtl_test_run(void)
 		ca_uber_draw(device, queue, library, true, false);
 		ca_uber_draw(device, queue, library, false, false);
 		ca_uber_draw(device, queue, library, false, true);
+		/* M2c (boot 76): one change at a time from that vertex-shader draw */
+		vs_probe(device, queue, library, PROBE_STD, "std_vert0 (proven) as its vertex shader");
+		vs_probe(device, queue, library, PROBE_NDC, "vertices in NDC, identity matrix");
+		vs_probe(device, queue, library, PROBE_BUFFER0, "vertices in buffer 0");
+		vs_probe(device, queue, library, PROBE_FLAT, "six vertices, no index buffer");
+		vs_probe(device, queue, library, PROBE_PLAIN, "no constant values");
+		vs_probe(device, queue, library, PROBE_NDC | PROBE_BUFFER0 | PROBE_FLAT, "NDC, buffer 0 and no indices");
 	}
 	events_and_heap(device, queue);
 	if (t != nil) {

@@ -814,3 +814,25 @@ The test's firmware checks both requests and answers each with an ack, a
 completion and the value. Its faults are the ioctl never answered (no
 iovar is sent) and `"ver"` never answered (`"cur_etheraddr"` is not sent).
 The test also checks that the MAC never reaches the log.
+
+Result (boot 76, build 74): mode 15 worked. With the completion read index
+given back (2) and two more buffers posted, `"ver"` came back with status 0
+and 256 bytes: `wl0: Jul 19 2022 10:52:21 version 18.41.117 (B1
+Network/rsdb) FWID 01-1b4772fd`. `"cur_etheraddr"` came back with status 0
+and 32 bytes, and the address differs from the NVRAM's `macaddr`; neither
+address was logged. Each answer used the buffer whose request id the
+completion names (2 for the magic, then 8 and 7).
+
+## S10: the attachment's MAC (mode 16)
+
+`b2l_wifi_diag=16` repeats mode 15. If the chip's `cur_etheraddr` is not
+the address in the private attachment (`/chosen` `mac-address-wifi0`, which
+the loader publishes), it does what Samsung's DHD does with its own copy.
+It gives back the completion read index, posts two more 4 KiB
+ioctl-response buffers, sends `WLC_SET_VAR` (263) `"cur_etheraddr"` with the
+attachment's six bytes after the name (20 bytes), and reads
+`"cur_etheraddr"` back. Only verdicts are logged: set (status), and read
+back (now the attachment's, or still not). The iovar code is now one
+generic `WLC_GET_VAR`/`WLC_SET_VAR` sender. The tests cover the set and its
+read-back, a set never answered, a chip that keeps its own address, no
+`/chosen` address, an address already right, and no address ever in the log.

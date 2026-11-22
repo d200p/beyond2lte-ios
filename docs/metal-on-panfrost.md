@@ -568,3 +568,29 @@ Added to the next build:
 - A third draw by hand: Core Animation's vertex shader and data with
   `attachment_clear_frag_lph`, which the other tests prove. A zero left
   half clears the vertex shader, and blue there puts it in question too.
+
+### Boot 76 (build 74) and what was added after it
+
+The vertex-shader check failed too: Core Animation's vertex shader with
+`attachment_clear` (a fragment shader the other tests prove) left the
+target blue. So nothing `fixed_vert_lph_spc` emits gets rasterised. The
+fragment shader's specialisation (122 scratch stores, 2 or 4 scratch loads)
+is a second problem behind this one. The dumped NIR of the vertex shader
+reads correctly: the position is the four `buffer(2)` columns (UBO 2 at 0,
+16, 32, 48) times the position input. Its other outputs are ten varyings,
+two of them `f16vec4` colours, and a point size (PSIZ, written as 0 for
+triangles). It also keeps 35 bytes of scratch for the constructor's
+variables, read twice. No GPU fault was reported, and the vertex and tiler
+jobs completed as for every other draw.
+
+Added to the next build: six probes, each one change from that failing
+draw, all with `attachment_clear`, so a zero left half means the
+triangles were drawn:
+
+- `std_vert0_lph`, a proven vertex shader, with Core Animation's buffer
+  layout and data;
+- the vertices in NDC with an identity matrix;
+- the vertices in buffer 0;
+- six vertices and no index buffer;
+- `fixed_vert_lph_spc` without constant values;
+- NDC, buffer 0 and no indices together.
