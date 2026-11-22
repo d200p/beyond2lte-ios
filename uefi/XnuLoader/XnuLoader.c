@@ -446,8 +446,11 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * (boot 76: the chip's address is not the NVRAM's): also
                  * the attachment's MAC set on the chip and read back.
                  * Mode 17 (boot 77: the chip's MAC already was it): also
-                 * WLC_UP, "isup" and the first events; no scan or join. */
-                "b2l_wifi_diag=17 "
+                 * WLC_UP, "isup" and the first events; no scan or join.
+                 * Mode 18 (boot 78: WLC_UP answered 0, the interface event
+                 * came): also one passive scan (listening only, nothing
+                 * transmitted), logged as counts, channels and levels. */
+                "b2l_wifi_diag=18 "
                 /* S10 port: test boots come back to TWRP by themselves 8 min
                  * after start (after Metal's test and Wi-Fi's deferred run),
                  * synced like the volume-key chord (B2LPower.cpp). */

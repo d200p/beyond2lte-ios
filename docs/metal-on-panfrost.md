@@ -622,3 +622,47 @@ struct so an older library still reads the rest) turns this off with
 removes every point size instead. The six probes run again with the fix on,
 plus the control and the no-psiz case, and Core Animation's own frame runs
 with the fix too.
+
+### Boot 78 (build 76) and what was added after it
+
+The output fixes work. With them, `fixed_vert_lph_spc` draws Core
+Animation's data in every probe that keeps the vertices in buffer 1, and the
+control without them (`b2l:keep`) still draws nothing. 37 of 42 tests
+passed, against 31 of 40. Three things remain.
+
+Core Animation's red layer comes out `00000000`: the triangles are drawn,
+with a zero colour. Its fragment shader, as Panfrost gets it, is one block.
+`air.static_init` stores the function constants as constants into a struct
+in scratch (148 bytes), and four byte loads of that struct choose the
+outputs. For colour 0 the choice is `color_per`, `color_lin`, or zero.
+The stores before those loads make it `color_lin`, and the frame is what a
+zero load gives. No pass forwarded a scratch store to a later load (the
+frontend's field folding sees only values that are already constant while
+it translates). `b2l_mtl.c` now does that before Panfrost: in the entry
+block, in order, a scratch load whose bytes earlier stores set to constants
+becomes those constants. In a later block it does the same for bytes that
+no store outside the entry block touches. Then it folds, and with no scratch
+load left it drops the stores and the scratch size. A fragment shader with
+no framebuffer fetch left no longer asks for one. That was the other
+leftover of the unfolded constants: fbfetch on even with
+`fc_framebuffer_fetch` 0. It logs what it forwarded. The label
+`b2l:raw-scratch` skips it, as the control.
+
+`color_lin` is a 16-bit noperspective varying. Panfrost has no
+noperspective interpolation of its own: it keys a vertex shader variant on
+the fragment shader's noperspective inputs and corrects by w in both
+stages, code written for GL, where such varyings are 32-bit. Such inputs
+are now made 32-bit in both stages, converted around the store and the
+load. The label `b2l:narrow` skips that.
+
+With the vertices in buffer 0 nothing was drawn. The attribute the
+descriptor does not describe (the vertex shader's `point_size`) read buffer
+0 with stride 0, and Panfrost keeps one stride per vertex buffer, so every
+vertex became the first. Undescribed attributes now read a slot of their
+own, where the zero buffer is always bound.
+
+The red layer runs again: with `fc_perspective` set (the smooth
+`color_per`), and as controls without the scratch forwarding and without
+the 32-bit varyings. Each can say which of the two was at fault. The
+`CARenderer` frame was still all zero in boot 78, which fits the same
+fragment shader.

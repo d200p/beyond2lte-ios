@@ -1327,6 +1327,7 @@ struct b2l_mtl_render_pipeline {
 	unsigned num_elements;
 	uint32_t vb_mask;                       /* vertex buffer slots the elements read */
 	unsigned vb_count;                      /* the highest of them + 1 */
+	int zero_slot;                          /* the slot of the attributes not described, -1: none */
 	bool point_size;                        /* the vertex function writes [[point_size]] */
 	struct stage_bindings bind[2];          /* B2L_MTL_VERTEX, B2L_MTL_FRAGMENT */
 	struct b2l_mtl_render_pipeline_desc desc;
@@ -1767,6 +1768,308 @@ fix_outputs(nir_shader *nir, bool no_psiz, const char *name)
 	}
 }
 
+/*
+ * S10 port, M2c (boot 78): with its output fixes Core Animation's vertex
+ * shader draws, and its fragment shader writes zero. In NIR that shader is a
+ * single block: air.static_init stores the function constants, as constants,
+ * into a struct in scratch, and four byte loads of that struct choose the
+ * colour (color_lin when byte 0x48 is 1, which the stores before it set) --
+ * and the frame is what the choice gives when those loads read 0. No pass
+ * forwards a scratch store to a later load (the frontend's field folding only
+ * sees values that are already constant while it translates). Here: in the
+ * entry block, in order, a load_scratch whose bytes the stores before it set
+ * to constants becomes those constants; in a later block, the same for bytes
+ * no store outside the entry block touches (the entry block runs once, before
+ * every other). Then the usual folding; with no scratch load left the stores
+ * go and the shader needs no scratch, and a fragment shader with no
+ * framebuffer fetch left no longer asks for one. The tests' pipeline label
+ * "b2l:raw-scratch" skips this (their control).
+ */
+struct scratch_fold {
+	unsigned loads, forwarded, stores_dropped, bytes_before, bytes_after;
+	bool fbfetch_before, fbfetch_after;
+};
+
+static bool
+scratch_offset(nir_src src, unsigned size, unsigned bytes, unsigned *off)
+{
+	if (!nir_src_is_const(src) || src.ssa->num_components != 1) {
+		return false;
+	}
+	uint64_t o = nir_src_as_uint(src);
+	if (o > size || bytes > size - o) {
+		return false;
+	}
+	*off = (unsigned)o;
+	return true;
+}
+
+static unsigned
+count_intrinsics(nir_shader *nir, nir_intrinsic_op op)
+{
+	unsigned n = 0;
+	nir_foreach_function_impl(impl, nir) {
+		nir_foreach_block(block, impl) {
+			nir_foreach_instr(instr, block) {
+				n += instr->type == nir_instr_type_intrinsic && nir_instr_as_intrinsic(instr)->intrinsic == op;
+			}
+		}
+	}
+	return n;
+}
+
+static void
+forward_scratch(nir_shader *nir, struct scratch_fold *r)
+{
+	memset(r, 0, sizeof(*r));
+	const bool fs = nir->info.stage == MESA_SHADER_FRAGMENT;
+	r->fbfetch_before = r->fbfetch_after = fs && nir->info.fs.uses_fbfetch_output;
+	r->bytes_before = r->bytes_after = nir->scratch_size;
+	nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+	const unsigned size = nir->scratch_size;
+	if (impl == NULL || size == 0) {
+		return;
+	}
+	uint8_t *value = calloc(size, 1), *known = calloc(size, 1), *later = calloc(size, 1);
+	if (value == NULL || known == NULL || later == NULL) {
+		free(value);
+		free(known);
+		free(later);
+		return;
+	}
+	nir_block *entry = nir_start_block(impl);
+	bool wild = false;      /* a store outside the entry block at an offset that is not a constant */
+	nir_foreach_block(block, impl) {
+		if (block == entry) {
+			continue;
+		}
+		nir_foreach_instr(instr, block) {
+			if (instr->type != nir_instr_type_intrinsic ||
+			    nir_instr_as_intrinsic(instr)->intrinsic != nir_intrinsic_store_scratch) {
+				continue;
+			}
+			nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+			const nir_def *v = in->src[0].ssa;
+			unsigned off;
+			if (v->bit_size < 8 || !scratch_offset(in->src[1], size, v->bit_size / 8 * v->num_components, &off)) {
+				wild = true;
+			} else {
+				memset(later + off, 1, v->bit_size / 8 * v->num_components);
+			}
+		}
+	}
+	nir_builder b = nir_builder_at(nir_before_impl(impl));
+	nir_foreach_block(block, impl) {
+		const bool in_entry = block == entry;
+		nir_foreach_instr_safe(instr, block) {
+			if (instr->type != nir_instr_type_intrinsic) {
+				continue;
+			}
+			nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+			if (in->intrinsic == nir_intrinsic_store_scratch && in_entry) {
+				const nir_def *v = in->src[0].ssa;
+				const unsigned per = v->bit_size / 8;
+				unsigned off;
+				if (v->bit_size < 8 || !scratch_offset(in->src[1], size, per * v->num_components, &off)) {
+					memset(known, 0, size);
+					continue;
+				}
+				const nir_const_value *cv = nir_src_is_const(in->src[0]) ? nir_src_as_const_value(in->src[0]) : NULL;
+				const unsigned mask = nir_intrinsic_write_mask(in);
+				for (unsigned c = 0; c < v->num_components; c++) {
+					if ((mask & (1u << c)) == 0) {
+						continue;
+					}
+					const uint64_t u = cv != NULL ? nir_const_value_as_uint(cv[c], v->bit_size) : 0;
+					for (unsigned k = 0; k < per; k++) {
+						value[off + c * per + k] = (uint8_t)(u >> (8 * k));      /* little-endian */
+						known[off + c * per + k] = cv != NULL;
+					}
+				}
+			} else if (in->intrinsic == nir_intrinsic_load_scratch) {
+				r->loads++;
+				nir_def *d = &in->def;
+				const unsigned per = d->bit_size / 8;
+				unsigned off;
+				if (d->bit_size < 8 || (wild && !in_entry) ||
+				    !scratch_offset(in->src[0], size, per * d->num_components, &off)) {
+					continue;
+				}
+				bool all = true;
+				for (unsigned k = 0; all && k < per * d->num_components; k++) {
+					all = known[off + k] && (in_entry || !later[off + k]);
+				}
+				if (!all) {
+					continue;
+				}
+				nir_const_value cv[NIR_MAX_VEC_COMPONENTS];
+				for (unsigned c = 0; c < d->num_components; c++) {
+					uint64_t u = 0;
+					for (unsigned k = 0; k < per; k++) {
+						u |= (uint64_t)value[off + c * per + k] << (8 * k);
+					}
+					cv[c] = nir_const_value_for_raw_uint(u, d->bit_size);
+				}
+				b.cursor = nir_before_instr(instr);
+				nir_def *imm = nir_build_imm(&b, d->num_components, d->bit_size, cv);
+				nir_def_rewrite_uses(d, imm);
+				nir_instr_remove(instr);
+				r->forwarded++;
+			}
+		}
+	}
+	nir_metadata_preserve(impl, nir_metadata_control_flow);
+	free(value);
+	free(known);
+	free(later);
+	if (r->forwarded == 0) {
+		return;
+	}
+	bool progress = true;
+	for (unsigned i = 0; progress && i < 16; i++) {
+		progress = false;
+		progress |= nir_copy_prop(nir);
+		progress |= nir_opt_constant_folding(nir);
+		progress |= nir_opt_algebraic(nir);
+		progress |= nir_opt_dce(nir);
+		progress |= nir_opt_dead_cf(nir);
+		progress |= nir_opt_cse(nir);
+	}
+	if (count_intrinsics(nir, nir_intrinsic_load_scratch) == 0) {
+		nir_foreach_function_impl(fi, nir) {
+			nir_foreach_block(block, fi) {
+				nir_foreach_instr_safe(instr, block) {
+					if (instr->type == nir_instr_type_intrinsic &&
+					    nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_store_scratch) {
+						nir_instr_remove(instr);
+						r->stores_dropped++;
+					}
+				}
+			}
+			nir_metadata_preserve(fi, nir_metadata_control_flow);
+		}
+		nir_opt_dce(nir);
+		nir->scratch_size = 0;
+	}
+	if (fs && nir->info.fs.uses_fbfetch_output && count_intrinsics(nir, nir_intrinsic_load_output) == 0) {
+		nir->info.fs.uses_fbfetch_output = false;
+		nir->info.fs.fbfetch_coherent = false;
+		nir->info.outputs_read = 0;
+	}
+	r->bytes_after = nir->scratch_size;
+	r->fbfetch_after = fs && nir->info.fs.uses_fbfetch_output;
+}
+
+/*
+ * S10 port, M2c (boot 78): with the scratch choice settled, Core Animation's
+ * 2D colour is color_lin, a 16-bit (f16vec4) noperspective varying. Panfrost
+ * has no noperspective interpolation of its own: it keys a vertex shader
+ * variant on the fragment shader's noperspective inputs and corrects the
+ * values by w in both stages (pan_nir_lower_static_noperspective and
+ * pan_nir_lower_noperspective_fs), code written for GL, where such a varying
+ * is 32-bit. Here a 16-bit float noperspective input becomes 32-bit in both
+ * stages: the vertex shader converts before its store, the fragment shader
+ * converts back after its load. The tests' label "b2l:narrow" skips this
+ * (their control). Returns how many fragment inputs were widened.
+ */
+static bool
+is_f16_value(const struct glsl_type *t)
+{
+	return glsl_type_is_vector_or_scalar(t) && glsl_get_base_type(t) == GLSL_TYPE_FLOAT16;
+}
+
+static void
+widen_derefs(nir_shader *nir, struct set *vars, bool fragment)
+{
+	nir_function_impl *impl = nir_shader_get_entrypoint(nir);
+	nir_builder b = nir_builder_at(nir_before_impl(impl));
+	nir_foreach_block(block, impl) {
+		nir_foreach_instr_safe(instr, block) {
+			if (instr->type == nir_instr_type_deref) {
+				nir_deref_instr *d = nir_instr_as_deref(instr);
+				if (d->deref_type == nir_deref_type_var && _mesa_set_search(vars, d->var) != NULL) {
+					d->type = d->var->type;
+				}
+				continue;
+			}
+			if (instr->type != nir_instr_type_intrinsic) {
+				continue;
+			}
+			nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+			const bool load = in->intrinsic == nir_intrinsic_load_deref ||
+			    in->intrinsic == nir_intrinsic_interp_deref_at_centroid ||
+			    in->intrinsic == nir_intrinsic_interp_deref_at_sample ||
+			    in->intrinsic == nir_intrinsic_interp_deref_at_offset ||
+			    in->intrinsic == nir_intrinsic_interp_deref_at_vertex;
+			if (!load && in->intrinsic != nir_intrinsic_store_deref) {
+				continue;
+			}
+			nir_variable *var = nir_deref_instr_get_variable(nir_src_as_deref(in->src[0]));
+			if (var == NULL || _mesa_set_search(vars, var) == NULL) {
+				continue;
+			}
+			if (fragment && load && in->def.bit_size == 16) {
+				in->def.bit_size = 32;
+				b.cursor = nir_after_instr(instr);
+				nir_def *narrow = nir_f2f16(&b, &in->def);
+				nir_def_rewrite_uses_after(&in->def, narrow, narrow->parent_instr);
+			} else if (!fragment && in->intrinsic == nir_intrinsic_store_deref && in->src[1].ssa->bit_size == 16) {
+				b.cursor = nir_before_instr(instr);
+				nir_src_rewrite(&in->src[1], nir_f2f32(&b, in->src[1].ssa));
+			}
+		}
+	}
+	nir_metadata_preserve(impl, nir_metadata_control_flow);
+}
+
+static unsigned
+widen_noperspective(nir_shader *vs, nir_shader *fs)
+{
+	struct set *fvars = _mesa_pointer_set_create(NULL), *vvars = _mesa_pointer_set_create(NULL);
+	uint64_t slots = 0;
+	nir_foreach_shader_in_variable(var, fs) {
+		if (var->data.interpolation == INTERP_MODE_NOPERSPECTIVE && is_f16_value(var->type) &&
+		    var->data.location >= 0 && var->data.location < 64) {
+			slots |= BITFIELD64_BIT(var->data.location);
+			var->type = glsl_vector_type(GLSL_TYPE_FLOAT, glsl_get_components(var->type));
+			_mesa_set_add(fvars, var);
+		}
+	}
+	nir_foreach_shader_out_variable(var, vs) {
+		if (var->data.location >= 0 && var->data.location < 64 && (slots & BITFIELD64_BIT(var->data.location)) &&
+		    is_f16_value(var->type)) {
+			var->type = glsl_vector_type(GLSL_TYPE_FLOAT, glsl_get_components(var->type));
+			_mesa_set_add(vvars, var);
+		}
+	}
+	const unsigned n = fvars->entries;
+	if (n != 0) {
+		widen_derefs(fs, fvars, true);
+		widen_derefs(vs, vvars, false);
+	}
+	_mesa_set_destroy(fvars, NULL);
+	_mesa_set_destroy(vvars, NULL);
+	return n;
+}
+
+/* forward_scratch, and one line about it (the first 60 of a process). */
+static void
+fold_scratch(nir_shader *nir, const char *name, const char *label)
+{
+	static unsigned noted;
+	if (label != NULL && strstr(label, "b2l:raw-scratch") != NULL) {
+		b2l_drm_note("mtl M2: %s: scratch left as it is (%u bytes), b2l:raw-scratch", name, nir->scratch_size);
+		return;
+	}
+	struct scratch_fold r;
+	forward_scratch(nir, &r);
+	if (r.loads != 0 && __atomic_fetch_add(&noted, 1, __ATOMIC_RELAXED) < 60) {
+		b2l_drm_note("mtl M2: %s: scratch %u of %u loads forwarded, %u stores dropped, %u -> %u bytes%s", name,
+		    r.forwarded, r.loads, r.stores_dropped, r.bytes_before, r.bytes_after,
+		    r.fbfetch_before && !r.fbfetch_after ? ", framebuffer fetch no longer needed" : "");
+	}
+}
+
 static struct b2l_mtl_render_pipeline *
 render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipeline_desc *desc,
     struct b2l_mtl_pipeline_report *report, char *why, size_t why_size)
@@ -1820,6 +2123,18 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 			fix_outputs(fs, false, function_name(desc->fragment));
 		}
 	}
+	if (fs != NULL && strstr(desc->label, "b2l:narrow") == NULL) {
+		static unsigned noted;
+		const unsigned widened = widen_noperspective(vs, fs);
+		if (widened != 0 && __atomic_fetch_add(&noted, 1, __ATOMIC_RELAXED) < 40) {
+			b2l_drm_note("mtl M2: %s + %s: %u 16-bit noperspective varyings made 32-bit", function_name(desc->vertex),
+			    function_name(desc->fragment), widened);
+		}
+	}
+	fold_scratch(vs, function_name(desc->vertex), desc->label);
+	if (fs != NULL) {
+		fold_scratch(fs, function_name(desc->fragment), desc->label);
+	}
 	prepare_for_gallium(vs);
 	if (fs != NULL) {
 		prepare_for_gallium(fs);
@@ -1833,10 +2148,28 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 		}
 	}
 
-	/* Vertex elements in driver-location order, from the descriptor. */
+	/* Vertex elements in driver-location order, from the descriptor.
+	 *
+	 * S10 port, M2c (boot 78): an attribute the descriptor does not describe
+	 * (fixed_vert_lph_spc's point_size) read buffer 0 with stride 0, and with
+	 * the vertices in buffer 0 too nothing was drawn: Panfrost keeps one
+	 * stride per vertex buffer, so the last element's 0 made every vertex the
+	 * first. Those attributes now read a slot of their own, one no described
+	 * attribute uses, where bind_vertex always puts the zero buffer. */
 	struct pipe_vertex_element elements[PIPE_MAX_ATTRIBS];
 	memset(elements, 0, sizeof(elements));
 	unsigned num_elements = 0;
+	uint32_t described = 0;
+	nir_foreach_shader_in_variable(var, vs) {
+		int index = var->data.location - VERT_ATTRIB_GENERIC0;
+		if (index >= 0 && index < B2L_MTL_MAX_ATTRIBUTES &&
+		    vertex_format(desc->attribute[index].format) != PIPE_FORMAT_NONE &&
+		    desc->attribute[index].buffer < B2L_MTL_MAX_BUFFERS) {
+			described |= 1u << desc->attribute[index].buffer;
+		}
+	}
+	const unsigned zero_slot = described == 0xffffffffu ? 32u : (unsigned)__builtin_ctz(~described);
+	p->zero_slot = -1;
 	nir_foreach_shader_in_variable(var, vs) {
 		unsigned slot = var->data.driver_location;
 		int index = var->data.location - VERT_ATTRIB_GENERIC0;
@@ -1847,8 +2180,12 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 		enum pipe_format format = index >= 0 && index < B2L_MTL_MAX_ATTRIBUTES ?
 		    vertex_format(desc->attribute[index].format) : PIPE_FORMAT_NONE;
 		if (format == PIPE_FORMAT_NONE) {
-			/* not described: a zero read from buffer 0 */
+			/* not described: a zero read from the zero slot */
 			e->src_format = PIPE_FORMAT_R32G32B32A32_FLOAT;
+			if (zero_slot < B2L_MTL_MAX_BUFFERS) {
+				e->vertex_buffer_index = zero_slot;
+				p->zero_slot = (int)zero_slot;
+			}
 		} else {
 			uint32_t buffer = desc->attribute[index].buffer;
 			e->src_format = format;
@@ -1942,10 +2279,10 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 	    report->varyings_linked, report->varyings_unmatched, report->attributes);
 	const struct stage_bindings *bv = &p->bind[B2L_MTL_VERTEX], *bf = &p->bind[B2L_MTL_FRAGMENT];
 	b2l_drm_note("mtl M2: pipeline %s binds: UBOs %u + %u, SSBOs 0x%x + 0x%x, textures 0x%x + 0x%x (null 0x%x), "
-	    "images 0x%x + 0x%x, samplers 0x%x + 0x%x (%u inline), vertex buffers 0x%x%s",
+	    "images 0x%x + 0x%x, samplers 0x%x + 0x%x (%u inline), vertex buffers 0x%x (zero slot %d)%s",
 	    function_name(desc->vertex), bv->ubos, bf->ubos, bv->ssbo_mask, bf->ssbo_mask, bv->texture_mask,
 	    bf->texture_mask, bv->null_texture_mask | bf->null_texture_mask, bv->image_mask, bf->image_mask,
-	    bv->sampler_mask, bf->sampler_mask, inline_count, p->vb_mask,
+	    bv->sampler_mask, bf->sampler_mask, inline_count, p->vb_mask, p->zero_slot,
 	    bv->argument_members + bf->argument_members != 0 ? "; argument buffers NOT bound" : "");
 	return p;
 }
@@ -2016,6 +2353,7 @@ compute_pipeline_new(struct b2l_mtl_device *dev, struct b2l_mtl_function *functi
 	p->dev = dev;
 	p->function = obj_ref(function);
 	nir_shader *nir = nir_shader_clone(NULL, function->nir);
+	fold_scratch(nir, function_name(function), NULL);
 	prepare_for_gallium(nir);
 	collect_bindings(&function->info, nir->info.num_ubos, &p->bind);
 	p->threadgroup_bytes = nir->info.shared_size;
@@ -2712,7 +3050,11 @@ bind_vertex(struct b2l_mtl_device *dev, const struct encoder_state *st, const st
 			continue;
 		}
 		const struct bound *b = &st->buffers[B2L_MTL_VERTEX][i];
-		if (b->bytes != NULL) {
+		if (p->velems != NULL && p->zero_slot == (int)i) {
+			/* the attributes the descriptor does not describe read zero,
+			 * whatever the encoder bound at this index for the shader */
+			pipe_resource_reference(&vb[i].buffer.resource, dev->zero_buffer);
+		} else if (b->bytes != NULL) {
 			u_upload_data(pipe->stream_uploader, 0, b->length, 16, b->bytes, &vb[i].buffer_offset,
 			    &vb[i].buffer.resource);
 		} else if (b->buffer != NULL && b->offset < b->buffer->length) {

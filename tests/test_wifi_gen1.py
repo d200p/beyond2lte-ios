@@ -274,6 +274,18 @@ static void ioctl14(uint32_t value) {
  * 9 the set unanswered, 10 the chip keeps its address, 11 WLC_UP unanswered. */
 static uint8_t chip16[6];
 static unsigned have16, up17, posted15[16], nposted15;
+/* Mode 18: the event buffers the chip holds (newest last), the event mask,
+ * and the scan: five results (one network twice), then the final event.
+ * Faults: 12 the escan refused, 15 the final event never comes. */
+static unsigned ev18[8], nev18, escan18, scan18_next;
+static uint8_t mask18[16];
+static const struct { uint8_t bssid[6]; uint16_t chanspec; int16_t rssi; } scan18[5] = {
+    { { 0x00, 0x11, 0x22, 0xaa, 0xbb, 0x01 }, 0x1001, -40 },
+    { { 0x00, 0x11, 0x22, 0xaa, 0xbb, 0x02 }, 0x1006, -67 },
+    { { 0x00, 0x11, 0x22, 0xaa, 0xbb, 0x01 }, 0x1001, -42 },
+    { { 0x00, 0x11, 0x22, 0xaa, 0xbb, 0x03 }, 0xd024, -71 },
+    { { 0x00, 0x11, 0x22, 0xaa, 0xbb, 0x04 }, 0xd095, -80 },
+};
 static unsigned buffer13(unsigned id) {
     return id <= 2 ? 0x12000 + 0x2000 * (id - 1) : id <= 6 ? 0x16000 + 0x800 * (id - 3) :
         id <= 8 ? 0x18000 + 0x2000 * (id - 7) : id <= 10 ? 0x1e000 + 0x1000 * (id - 9) : 0x1d000 + 0x800 * (id - 11);
@@ -287,18 +299,58 @@ static void d2h13(const uint32_t words[6]) {
     memcpy(host_dram + 0x5000 + 24 * at, w, sizeof(w)); memset(host_dev + 0x5000 + 24 * at, 1, sizeof(w));
     tcm11[(0x2f0720 - 0x170000) / 4] = at + 1;
 }
+static void scan18_deliver(void) {
+    while (escan18 && scan18_next <= 5 && nev18) {
+        if (scan18_next == 5 && host13_fault == 15) return;
+        const unsigned id = ev18[--nev18], last = scan18_next == 5, datalen = last ? 12 : 140;
+        uint8_t packet[212] = { 0 };
+        memcpy(packet, firmware_chip_mac, 6); memcpy(packet + 6, firmware_chip_mac, 6);
+        uint8_t *m = packet + 24;          /* wl_event_msg_t, big-endian */
+        m[7] = 69; m[11] = last ? 0 : 8; m[23] = (uint8_t)datalen;
+        uint8_t *e = m + 48;               /* wl_escan_result_t, little-endian */
+        e[0] = (uint8_t)datalen; e[4] = 1; e[8] = 0x18; e[9] = 0x53;
+        if (!last) {
+            uint8_t *bi = e + 12;
+            e[10] = 1; bi[0] = 109; bi[4] = 128;
+            memcpy(bi + 8, scan18[scan18_next].bssid, 6);
+            bi[18] = 8; memcpy(bi + 19, "ModelNet", 8);
+            bi[72] = (uint8_t)scan18[scan18_next].chanspec; bi[73] = (uint8_t)(scan18[scan18_next].chanspec >> 8);
+            bi[78] = (uint8_t)scan18[scan18_next].rssi; bi[79] = (uint8_t)((uint16_t)scan18[scan18_next].rssi >> 8);
+        }
+        const unsigned length = 72 + datalen;
+        memcpy(host_dram + buffer13(id), packet, length); memset(host_dev + buffer13(id), 1, length);
+        const uint32_t event[6] = { 0x0eu, id, 0x00020000u, length, 0, 0 };
+        d2h13(event);
+        scan18_next++;
+    }
+}
 static void iovar15(uint32_t value) {
     const unsigned w = tcm13(0x2f0700), r = tcm13(0x2f0710);
     assert(mode >= 15 && value == (0xff000000u | w) && w > r);
     db0_13++; iovar15_db++;
-    for (unsigned item = r; item + 1 < w; item++) {     /* the reposts */
+    const unsigned posts_only = host_dram[40 * (w - 1)] != 9;
+    for (unsigned item = r; item + 1 < w + posts_only; item++) {     /* the reposts */
         const uint8_t *b = host_dram + 40 * item;
         uint32_t request, low, high;
         memcpy(&request, b + 4, 4); memcpy(&low, b + 16, 4); memcpy(&high, b + 20, 4);
+        if (b[0] == 0x0d) {         /* mode 18: an event buffer given back */
+            assert(mode >= 18 && (unsigned)b[3] == (254 + item) % 253 && request >= 3 && request <= 6);
+            assert((unsigned)(b[8] | b[9] << 8) == 0x800u && low == HOST13_PA + buffer13(request) && !high);
+            assert(tcm13(0x2f0730) == tcm13(0x2f0720) && nev18 < 8);
+            for (unsigned k = 0; k < nev18; k++) assert(ev18[k] != request);    /* never posted twice */
+            ev18[nev18++] = request;
+            continue;
+        }
         assert(b[0] == 0x0b && (unsigned)b[3] == item + 1 && request >= 7 && request <= 12);
         assert((unsigned)(b[8] | b[9] << 8) == (request < 9 ? 0x2000u : request < 11 ? 0x1000u : 0x800u));
         assert(low == HOST13_PA + buffer13(request) && !high && tcm13(0x2f0730) == tcm13(0x2f0720));
         assert(nposted15 < 16); posted15[nposted15++] = request;
+    }
+    if (posts_only) {
+        assert(mode >= 18 && escan18);
+        tcm11[(0x2f0710 - 0x170000) / 4] = w;
+        scan18_deliver();
+        return;
     }
     const unsigned item = w - 1;
     const uint8_t *e = host_dram + 40 * item;
@@ -310,7 +362,8 @@ static void iovar15(uint32_t value) {
     const char *input = (const char *)host_dram + (low - HOST13_PA);
     static const char version[32] = "wl0: test version 18.41.117";
     const void *data = NULL;
-    unsigned resp = 0, answer = 1;
+    unsigned resp = 0, answer = 1, start_scan = 0;
+    int status = 0;
     if (cmd == 262 && !strcmp(input, "ver")) {
         assert(length == 256); data = version; resp = 32; answer = host13_fault != 8;
     } else if (cmd == 262 && !strcmp(input, "cur_etheraddr")) {
@@ -323,6 +376,26 @@ static void iovar15(uint32_t value) {
         assert(mode >= 17 && length == 4 && !memcmp(input, zero, 4)); up17 = 1; answer = host13_fault != 11;
     } else if (cmd == 262 && !strcmp(input, "isup")) {
         assert(mode >= 17 && length == 32 && up17); data = &up17; resp = 4;
+    } else if (cmd == 262 && !strcmp(input, "scan_ver")) {
+        assert(mode >= 18 && length == 32 && up17); status = -23;     /* BCME_UNSUPPORTED */
+    } else if (cmd == 262 && !strcmp(input, "event_msgs")) {
+        assert(mode >= 18 && length == 32); data = mask18; resp = 16;
+    } else if (cmd == 263 && !strcmp(input, "event_msgs")) {
+        assert(mode >= 18 && length == 27 && (uint8_t)input[11 + 8] == 0x20);
+        for (unsigned b = 0; b < 16; b++) assert(b == 8 || !input[11 + b]);
+        memcpy(mask18, input + 11, 16);
+    } else if (cmd == 263 && !strcmp(input, "escan")) {
+        const uint8_t *q = (const uint8_t *)input + 6;
+        uint32_t version, nprobes, active, passive, home, channels;
+        memcpy(&version, q, 4); memcpy(&nprobes, q + 52, 4); memcpy(&active, q + 56, 4);
+        memcpy(&passive, q + 60, 4); memcpy(&home, q + 64, 4); memcpy(&channels, q + 68, 4);
+        assert(mode >= 18 && length == 78 && (mask18[8] & 0x20) && !escan18);
+        assert(version == 1 && q[4] == 1 && !q[5] && q[6] == 0x18 && q[7] == 0x53);
+        for (unsigned b = 8; b < 44; b++) assert(!q[b]);              /* no SSID */
+        for (unsigned b = 44; b < 50; b++) assert(q[b] == 0xff);      /* the broadcast BSSID */
+        assert(q[50] == 2 && q[51] == 1);                             /* any BSS type, passive */
+        assert(nprobes == UINT32_MAX && active == UINT32_MAX && passive == 110 && home == UINT32_MAX && !channels);
+        if (host13_fault == 12) status = -2; else start_scan = 1;
     } else {
         assert(0);
     }
@@ -331,7 +404,7 @@ static void iovar15(uint32_t value) {
     assert(nposted15);
     const unsigned id = posted15[--nposted15];  /* the newest posted buffer, as the chip did */
     const uint32_t ack[6] = { 0x0au, 0xfffe, 0x00020000u, 0, 0, 0 };
-    const uint32_t cpl[6] = { 0x0cu, id, 0x00020000u, resp | (item - 7) << 16, cmd, 0 };
+    const uint32_t cpl[6] = { 0x0cu, id, 0x00020000u | (uint16_t)status, resp | (item - 7) << 16, cmd, 0 };
     d2h13(ack); d2h13(cpl);
     if (resp) {
         memcpy(host_dram + buffer13(id), data, resp); memset(host_dev + buffer13(id), 1, resp);
@@ -342,9 +415,15 @@ static void iovar15(uint32_t value) {
         uint8_t packet[48] = { 0 };
         memcpy(packet, firmware_chip_mac, 6); memcpy(packet + 6, firmware_chip_mac, 6);
         packet[24 + 7] = 54;
-        memcpy(host_dram + buffer13(4), packet, sizeof(packet)); memset(host_dev + buffer13(4), 1, sizeof(packet));
-        const uint32_t event[6] = { 0x0eu, 4, 0x00020000u, 48, 0, 0 };
+        assert(nev18);
+        const unsigned eid = ev18[--nev18];
+        memcpy(host_dram + buffer13(eid), packet, sizeof(packet)); memset(host_dev + buffer13(eid), 1, sizeof(packet));
+        const uint32_t event[6] = { 0x0eu, eid, 0x00020000u, 48, 0, 0 };
         d2h13(event);
+    }
+    if (start_scan) {
+        escan18 = 1;
+        scan18_deliver();
     }
 }
 static void pcie13_write(unsigned off, uint32_t value) {
@@ -819,6 +898,7 @@ static void reset(unsigned which, unsigned failure) {
     host13_fault = host_allocs = cleans = flushes = bme_ever = hostready13 = db0_13 = ioctl14_db = iovar15_db = 0; mailbox13 = 0;
     firmware_mac_mode = 0; memset(chip16, 0, sizeof(chip16)); have16 = up17 = 0;
     nposted15 = 1; posted15[0] = 2;     /* the first ioctl's answer takes buffer 1 */
+    nev18 = 4; ev18[0] = 3; ev18[1] = 4; ev18[2] = 5; ev18[3] = 6; escan18 = scan18_next = 0; memset(mask18, 0, 16);
     memset(host_cpu, 0, sizeof(host_cpu)); memset(host_dram, 0, sizeof(host_dram)); memset(host_dev, 0, sizeof(host_dev));
     wifi_host = NULL; wifi_host_pa = 0; wifi_master = 0;
     memset(tcm11, 0, sizeof(tcm11)); vector0 = 0; r4_io = 0x21; r4_reset = 0;
@@ -879,7 +959,8 @@ static void verify_quiet(void) {
     if (strstr(logs, "Gen1 probe begin:"))
         assert(!(memory[4][0xc/4] | memory[4][0x10/4] | memory[4][0x14/4]));
     assert(unmaps == (mode >= 6 ? 11u : mode + 5) && link_polls <= 500 &&
-        now_us < (mode >= 16 ? 40000000u : mode >= 11 ? 20000000u : mode == 10 ? 7000000u : 1000000u));
+        now_us < (mode >= 18 ? 60000000u : mode >= 16 ? 40000000u : mode >= 11 ? 20000000u : mode == 10 ? 7000000u :
+                  1000000u));
     if (mode >= 11) assert(!r4_running && !r4_reset && r4_io == 0x21); /* Halted before power-off. */
     if (mode >= 5) {
         uint32_t expected_control = endpoint_fault == 7 || endpoint_fault == 10 ? 0x80000000 : 0;
@@ -1486,6 +1567,55 @@ int main(void) {
         assert(strstr(logs, "mode 17: 1 firmware events so far\n"));
     }
     puts("Firmware up: WLC_UP and isup one at a time, the first event by type only, no address in the log passed");
+    /* S10 port, mode 18: one passive scan. With the address already right
+     * (2) and after the set (0); the escan refused (12); never finished (15). */
+    mode = 18;
+    static const unsigned faults18[][2] = { { 0, 2 }, { 0, 0 }, { 12, 2 }, { 15, 2 } };
+    for (unsigned k = 0; k < 4; k++) {
+        reset(8, 0); firmware_fixture_nvram(good, sizeof(good)); nvram_fixture_bytes = sizeof(good);
+        host13_fault = faults18[k][0]; firmware_mac_mode = faults18[k][1];
+        b2l_wifi_diag_start(); verify_quiet();
+        assert(strstr(logs, "mode 18: deferred run finished") && strstr(logs, "cleanup=verified"));
+        assert(strstr(logs, "bus mastering off again (endpoint, then root port)"));
+        assert(!strstr(logs, "ModelNet") && !strstr(logs, "aa:bb") && !strstr(logs, "0xaa2211") &&
+            !strstr(logs, "0xbbaa") && !strstr(logs, "0x5e1cb202") && !strstr(logs, "0xc54c9000"));
+        assert(strstr(logs, "mode 17: WLC_UP: status 0\n"));
+        assert(strstr(logs, "ioctl-response buffers 9 to 12 posted again, 1 used event buffers given back\n"));
+        const unsigned first = firmware_mac_mode == 2 ? 20 : 24;    /* scan_ver's item */
+        char line[200];
+        snprintf(line, sizeof(line), "mode 18: WLC_GET_VAR scan_ver sent (32 bytes in and out), write index %u, DB0 %#x",
+            first + 1, 0xff000000u | (first + 1));
+        assert(strstr(logs, line));
+        assert(strstr(logs, "mode 18: scan_ver (status -23, 0 bytes): not given; escan version 1 sent\n"));
+        assert(strstr(logs, "mode 18: event_msgs (status 0, 16 bytes): ESCAN_RESULT off\n"));
+        assert(strstr(logs, "mode 18: event_msgs set with ESCAN_RESULT: status 0\n"));
+        snprintf(line, sizeof(line), "mode 18: WLC_SET_VAR escan sent (78 bytes in and out), write index %u, DB0 %#x",
+            first + 4, 0xff000000u | (first + 4));
+        assert(strstr(logs, line));
+        if (host13_fault == 12) {
+            assert(strstr(logs, "mode 18: escan (passive, every channel, 110 ms each) set: status -2\n"));
+            assert(!strstr(logs, "results,") && !escan18);
+            continue;
+        }
+        assert(strstr(logs, "mode 18: escan (passive, every channel, 110 ms each) set: status 0\n"));
+        assert(strstr(logs, "mode 18: result 1: channel 1 (2.4 GHz), RSSI -40 dBm\n"));
+        assert(strstr(logs, "mode 18: result 2: channel 6 (2.4 GHz), RSSI -67 dBm\n"));
+        assert(strstr(logs, "mode 18: result 3: channel 1 (2.4 GHz), RSSI -42 dBm, a network heard before\n"));
+        assert(strstr(logs, "mode 18: result 4: channel 36 (5 GHz), RSSI -71 dBm\n"));
+        assert(strstr(logs, "mode 18: result 5: channel 149 (5 GHz), RSSI -80 dBm\n"));
+        assert(strstr(logs, "mode 18: channels heard: 1 6 36 149\n"));
+        if (host13_fault == 15) {
+            assert(strstr(logs, "mode 18: escan not finished after about 8000 ms\n"));
+            assert(strstr(logs, "mode 18: 5 results, 4 networks (2 on 2.4 GHz, 2 on 5/6 GHz), RSSI -80 to -40 dBm; "
+                "0 other events, 0 malformed; 5 event buffers given back, 0 not (ring limits)\n"));
+            continue;
+        }
+        assert(strstr(logs, "mode 18: escan finished after about 2100 ms, final status 0\n"));
+        assert(strstr(logs, "mode 18: 5 results, 4 networks (2 on 2.4 GHz, 2 on 5/6 GHz), RSSI -80 to -40 dBm; "
+            "0 other events, 0 malformed; 6 event buffers given back, 0 not (ring limits)\n"));
+        assert(scan18_next == 6 && nev18 == 4);
+    }
+    puts("Firmware scan: one passive escan, event buffers given back, results by channel and level, no name or address in the log passed");
 }
 '''
 

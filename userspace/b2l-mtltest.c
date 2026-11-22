@@ -639,16 +639,24 @@ static const struct {
 /* `clear_fs` (boot 75: both draws left the target untouched): Core
  * Animation's vertex shader with attachment_clear_frag_lph, a fragment
  * shader the other tests prove, which writes zero. A zero left half clears
- * the vertex shader, blue there means the vertex shader is at fault too. */
+ * the vertex shader, blue there means the vertex shader is at fault too.
+ *
+ * M2c (boot 78: the vertex shader draws, the red layer came out 00000000).
+ * Its fragment shader picks color_lin (a 16-bit noperspective varying) by
+ * bytes in scratch; b2l_mtl.c now forwards those bytes and widens such
+ * varyings to 32-bit. `perspective` sets fc_perspective in both stages (the
+ * smooth color_per instead); `tag` is the pipeline label: "b2l:raw-scratch"
+ * leaves the scratch as it was, "b2l:narrow" the varyings 16-bit (controls,
+ * logged, not counted). */
 static void
-ca_uber_draw(id device, id queue, id library, bool fetch, bool clear_fs)
+ca_uber_draw(id device, id queue, id library, bool fetch, bool clear_fs, bool perspective, const char *tag)
 {
-	char label[112], why[200], probes[160] = "";
+	char label[160], why[200], probes[160] = "";
 	if (clear_fs) {
 		snprintf(label, sizeof(label), "draw: Core Animation's vertex shader and data with attachment_clear");
 	} else {
 		snprintf(label, sizeof(label), "draw: Core Animation's red layer with its pipeline and data "
-		    "(framebuffer fetch %s)", fetch ? "on, blend 0x3e" : "off, blend 0");
+		    "(framebuffer fetch %s%s)", fetch ? "on, blend 0x3e" : "off, blend 0", perspective ? ", perspective" : "");
 	}
 	id values = make("MTLFunctionConstantValues");
 	for (unsigned i = 0; i < 60; i++) {
@@ -662,6 +670,9 @@ ca_uber_draw(id device, id queue, id library, bool fetch, bool clear_fs)
 		if (fetch && !strcmp(ca_constants[i].name, "fc_blend_function")) {
 			v[0] = 0x3e;
 		}
+		if (perspective && !strcmp(ca_constants[i].name, "fc_perspective")) {
+			v[0] = 1;
+		}
 		MSG(void, const void *, unsigned long, id)(values, S("setConstantValue:type:withName:"), v,
 		    ca_constants[i].type, nsstr(ca_constants[i].name));
 	}
@@ -670,8 +681,8 @@ ca_uber_draw(id device, id queue, id library, bool fetch, bool clear_fs)
 		"fc_vertex_layout" };
 	static const unsigned char vtypes[5] = { CA_B, CA_B, CA_U, CA_U, CA_U };
 	for (unsigned i = 0; i < 5; i++) {
-		uint8_t zero = 0;
-		MSG(void, const void *, unsigned long, id)(vvalues, S("setConstantValue:type:withName:"), &zero, vtypes[i],
+		uint8_t value = perspective && !strcmp(vnames[i], "fc_perspective");
+		MSG(void, const void *, unsigned long, id)(vvalues, S("setConstantValue:type:withName:"), &value, vtypes[i],
 		    nsstr(vnames[i]));
 	}
 	id error = nil;
@@ -687,6 +698,9 @@ ca_uber_draw(id device, id queue, id library, bool fetch, bool clear_fs)
 	id d = make("MTLRenderPipelineDescriptor");
 	MSG(void, id)(d, S("setVertexFunction:"), v);
 	MSG(void, id)(d, S("setFragmentFunction:"), f);
+	if (tag != NULL) {
+		MSG(void, id)(d, S("setLabel:"), nsstr(tag));
+	}
 	MSG(void, unsigned long)(at(MSG(id)(d, S("colorAttachments")), 0), S("setPixelFormat:"), 80);
 	id vd = MSG(id)(cls("MTLVertexDescriptor"), S("vertexDescriptor"));
 	id attributes = MSG(id)(vd, S("attributes"));
@@ -761,6 +775,11 @@ ca_uber_draw(id device, id queue, id library, bool fetch, bool clear_fs)
 	pixel_text(back, ROW, 16, 32, probes, sizeof(probes));
 	pixel_text(back, ROW, 48, 32, probes, sizeof(probes));
 	pixel_text(back, ROW, 2, 2, probes, sizeof(probes));
+	if (tag != NULL) {
+		say("control (%s, not counted): %s: status %lu, %u of %u left pixels not %s, %u right not blue;%s", tag,
+		    label, status, wrong_left, 31u * SIDE, clear_fs ? "zero" : "red", wrong_right, probes);
+		return;
+	}
 	verdict(label, vb != nil && ib != nil && status == 4 && wrong_left == 0 && wrong_right == 0,
 	    "status %lu, %u of %u left pixels not %s, %u of %u right ones not blue, %llu ms;%s %s", status, wrong_left,
 	    31u * SIDE, clear_fs ? "zero" : "red", wrong_right, 31u * SIDE, (unsigned long long)ms, probes, why);
@@ -1341,9 +1360,15 @@ b2l_mtl_test_run(void)
 		}
 		compute_copy(device, queue, library);
 		/* M2c: Core Animation's draw by hand, with and without its blending */
-		ca_uber_draw(device, queue, library, true, false);
-		ca_uber_draw(device, queue, library, false, false);
-		ca_uber_draw(device, queue, library, false, true);
+		ca_uber_draw(device, queue, library, true, false, false, NULL);
+		ca_uber_draw(device, queue, library, false, false, false, NULL);
+		ca_uber_draw(device, queue, library, false, true, false, NULL);
+		/* M2c (boot 78): the red layer was 00000000. The smooth colour
+		 * (fc_perspective), then the controls without the scratch
+		 * forwarding and without the 32-bit varyings. */
+		ca_uber_draw(device, queue, library, false, false, true, NULL);
+		ca_uber_draw(device, queue, library, false, false, false, "b2l:raw-scratch");
+		ca_uber_draw(device, queue, library, false, false, false, "b2l:narrow");
 		/* M2c (boot 76): one change at a time from that vertex-shader draw;
 		 * boot 77: only std_vert0 drew. With b2l_mtl.c's output fixes now
 		 * on, the same probes, then the control without them (b2l:keep)

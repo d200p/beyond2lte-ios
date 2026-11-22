@@ -864,3 +864,38 @@ real chip did), and sends one event, whose packet carries an address, after
 `WLC_UP`. The mode-17 cases are after a MAC set, with the MAC already right,
 and with `WLC_UP` unanswered, and the test checks that no address reaches
 the log.
+
+Result (boot 78, build 76): `WLC_UP` answered with status 0, and the
+firmware sent one event, type 54 (`WLC_E_IF`, its interface made), 79
+bytes. `"isup"` is not an iovar of this firmware: status -23
+(`BCME_UNSUPPORTED`), and the buffer holds the name back. The radio is up.
+
+## S10: one passive scan (mode 18)
+
+`b2l_wifi_diag=18` repeats mode 17 and, when `WLC_UP` was answered with
+status 0, runs one scan that only listens:
+
+1. It posts ioctl-response buffers 9 to 12 again (consumed by now, or never
+   posted) and gives the firmware back the event buffers it has used (the
+   interface event's), as `MSG_TYPE_EVENT_BUF_POST`.
+2. It reads `"scan_ver"` (which `wl_scan_params` layout the firmware wants;
+   logged for the next step, version 1 is sent here), then reads
+   `"event_msgs"` and sets it again with `WLC_E_ESCAN_RESULT` (69).
+3. It sets `"escan"`: version 1, `WL_SCAN_ACTION_START`, any SSID, the
+   broadcast BSSID, any BSS type, the passive scan type (no probe request
+   is sent, so nothing is transmitted), the firmware's own channel list,
+   110 ms per channel.
+4. For up to 8 s it reads every `MSG_TYPE_WL_EVENT` and posts its buffer
+   again, as DHD refills event buffers, until the escan's final status.
+
+The log has only counts, channel numbers, bands and signal levels: results,
+networks (counted once by address, which is never logged), RSSI range, and
+the channels heard. Never a network's name or address. The rings are never
+wrapped: once the control submission ring reaches 60 items or the
+completion ring 56, no more buffers are posted, and the count of those not
+posted is logged. The test's firmware answers `scan_ver` as unsupported,
+checks the event mask and every escan field, and sends five results (one
+network twice, on 2.4 and 5 GHz) and the final event through the event
+buffers it holds, newest first. The cases are with the MAC set and already
+right, the escan refused, and a scan that never finishes; the test checks
+that no name or address reaches the log.
