@@ -692,7 +692,9 @@ events_and_heap(id device, id queue)
 	say("shared event listener: class %s, %s gave %s", listener_class != nil ? "found" : "MISSING", how,
 	    name_of(listener));
 	listener_called = 0;
-	if (ev != nil && listener != nil) {
+	/* Boot 72: every way in gave nil (Apple's listener needs Apple's device).
+	 * Then try ours without one: the plug-in calls the block on its own queue. */
+	if (ev != nil) {
 		MSG(void, id, uint64_t, void (^)(id, uint64_t))(ev, S("notifyListener:atValue:block:"), listener, 5,
 		    ^(id event, uint64_t value) {
 			    listener_block_body(event, value);

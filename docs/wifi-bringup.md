@@ -672,3 +672,22 @@ console is read again from where the first read stopped.
 
 The next step after this one is the host side itself: rings in host
 memory, bus mastering, the doorbell and interrupts, which no mode does yet.
+
+Result (boot 72, build 70): flags `0x30040007` (IPC revision 7,
+`d2h_sync_xorcsum`, `hostrdy`, `no_oob_dw`; indices in dongle memory),
+225 lfrags, 511 host rx buffers, mailbox data at `0x2f400c`/`0x2f4010`,
+`ring_info` at `0x2f3b40` (ring memory `0x2f3b8c`, index arrays
+`0x2f3e8c`/`0x2f3f38`/`0x2f3fe4`/`0x2f3ff8`, 40 flow rings, 43 submission
+and 5 completion rings), `flags2` `0x40801001`. All five common
+`ring_mem_t` are zero and every index is 0: the firmware leaves the rings
+to the host and waits; it printed nothing more in the 2 s after.
+
+What the host side (mode 13) has to respect, from Samsung's own device tree
+(`pcie0@13ED0000`) and `pcie-exynos-host-v0.c` (LineageOS
+`android_kernel_samsung_exynos9820` at `a412cfaf`): `use-sysmmu = "false"`
+(the chip's DMA addresses are physical; SysMMU `0x13070000` is left in
+bypass), `use-cache-coherency = "false"` (rings and buffers uncached, or
+cleaned/invalidated around each use), `use-msi = "false"` (the legacy
+interrupt, SPI 0xfd, or polling); `use-ia` only drives a PHY CDR-reset
+sequencer. Bus mastering is still off on both sides, so until mode 13 the
+chip cannot reach host memory at all.

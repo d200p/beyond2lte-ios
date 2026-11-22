@@ -1478,6 +1478,13 @@ constants_of(id values, struct b2l_mtl_constant *out, char (*names)[64])
 		}
 		id array = msg(values, arrays[a]);
 		unsigned long count = msg_u(array, "count");
+		/* S10 port: boot 72's Core Animation shaders came out as with no
+		 * constants at all; say what each array held. */
+		static unsigned array_logs;
+		if (__atomic_fetch_add(&array_logs, 1, __ATOMIC_RELAXED) < 80) {
+			say("constant values %s: -%s gave %s with %lu", class_getName(object_getClass(values)), arrays[a],
+			    array != nil ? class_getName(object_getClass(array)) : "nil", count);
+		}
 		for (unsigned long i = 0; i < count && n < MAX_CONSTANTS; i++) {
 			id v = msg_at(array, i);
 			unsigned long type = msg_u(v, "dataType");
@@ -1548,10 +1555,29 @@ library_function(id self, id name, id values, id *error)
 	unsigned count = names != NULL ? constants_of(values, constants, names) : 0;
 	char why[160] = "";
 	struct b2l_mtl_function *mf = mtl->function_new(s->ml, (uint32_t)index, constants, count, why, sizeof(why));
-	free(names);
-	if (why[0] != 0) {
+	/* S10 port: every function made, with the constants it was given (the
+	 * first 40 of a process), and what function_new said about them. */
+	static unsigned described;
+	if (__atomic_fetch_add(&described, 1, __ATOMIC_RELAXED) < 40) {
+		char list[600] = "";
+		size_t at = 0;
+		for (unsigned i = 0; i < count && at < sizeof(list) - 64; i++) {
+			uint64_t bits = 0;
+			memcpy(&bits, constants[i].bytes, constants[i].size < sizeof(bits) ? constants[i].size : sizeof(bits));
+			int n = constants[i].index >= 0 ?
+			    snprintf(list + at, sizeof(list) - at, " #%d=%llx", (int)constants[i].index, (unsigned long long)bits) :
+			    snprintf(list + at, sizeof(list) - at, " %s=%llx", constants[i].name != NULL ? constants[i].name : "?",
+			    (unsigned long long)bits);
+			if (n > 0) {
+				at += (size_t)n;
+			}
+		}
+		say("function %s: %s, %u constants given:%s%s%s", text, values == nil ? "no constant values" :
+		    class_getName(object_getClass(values)), count, list[0] != 0 ? list : " none", why[0] != 0 ? "; " : "", why);
+	} else if (strstr(why, "not this function") != NULL) {
 		say("function %s (%u constants given): %s", text, count, why);
 	}
+	free(names);
 	struct function_state *f = mf != NULL ? calloc(1, sizeof(*f)) : NULL;
 	if (f == NULL) {
 		if (mf != NULL) {
@@ -2954,6 +2980,8 @@ render_set_pipeline(id self, SEL _cmd, id state)
 	mtl->cmdbuf_set_pipeline(mc, mp);
 }
 
+static void trace_bytes(id self, const char *stage, const void *bytes, unsigned long length, unsigned long index);
+
 static void
 set_buffer(id self, SEL _cmd, uint32_t stage, id buffer, unsigned long offset, unsigned long index)
 {
@@ -2967,8 +2995,19 @@ set_buffer(id self, SEL _cmd, uint32_t stage, id buffer, unsigned long offset, u
 		return;
 	}
 	if (tracing(self)) {
+		unsigned long length = buffer != nil ? msg_u(buffer, "length") : 0ul;
 		say("ca: %s buffer %lu: %p offset %lu of %lu bytes", stage == B2L_MTL_VERTEX ? "vertex" : "fragment", index,
-		    (void *)buffer, offset, buffer != nil ? msg_u(buffer, "length") : 0ul);
+		    (void *)buffer, offset, length);
+		/* What is there now (Core Animation writes before it encodes). */
+		const uint8_t *p = buffer != nil ? ((const uint8_t *(*)(id, SEL))objc_msgSend)(buffer, S("contents")) : NULL;
+		if (p != NULL && offset < length) {
+			trace_bytes(self, stage == B2L_MTL_VERTEX ? "vertex buffer data" : "fragment buffer data", p + offset,
+			    length - offset < 64 ? length - offset : 64, index);
+			if (stage == B2L_MTL_VERTEX && length - offset > 64) {
+				trace_bytes(self, "vertex buffer data +64", p + offset + 64, length - offset - 64 < 64 ?
+				    length - offset - 64 : 64, index);
+			}
+		}
 	}
 	mtl->cmdbuf_set_buffer(mc, stage, (uint32_t)index, mb, offset);
 }
@@ -3029,6 +3068,9 @@ render_vertex_buffer_offset(id self, SEL _cmd, unsigned long offset, unsigned lo
 	(void)_cmd;
 	struct b2l_mtl_cmdbuf *mc = recording(self);
 	if (mc != NULL) {
+		if (tracing(self)) {
+			say("ca: vertex buffer %lu offset now %lu", index, offset);
+		}
 		mtl->cmdbuf_set_buffer_offset(mc, B2L_MTL_VERTEX, (uint32_t)index, offset);
 	}
 }
@@ -3039,6 +3081,9 @@ render_fragment_buffer_offset(id self, SEL _cmd, unsigned long offset, unsigned 
 	(void)_cmd;
 	struct b2l_mtl_cmdbuf *mc = recording(self);
 	if (mc != NULL) {
+		if (tracing(self)) {
+			say("ca: fragment buffer %lu offset now %lu", index, offset);
+		}
 		mtl->cmdbuf_set_buffer_offset(mc, B2L_MTL_FRAGMENT, (uint32_t)index, offset);
 	}
 }
@@ -3376,6 +3421,14 @@ draw(id self, SEL _cmd, unsigned long type, unsigned long start, unsigned long c
 	if (tracing(self)) {
 		say("ca: draw primitive %lu start %lu count %lu instances %lu base %lu%s%s", type, start, count, instances,
 		    base_instance, index_buffer != nil ? ", indexed" : "", d.index_type ? " (32-bit)" : "");
+		const uint8_t *p = index_buffer != nil ?
+		    ((const uint8_t *(*)(id, SEL))objc_msgSend)(index_buffer, S("contents")) : NULL;
+		unsigned long length = index_buffer != nil ? msg_u(index_buffer, "length") : 0ul;
+		if (p != NULL && index_offset < length) {
+			unsigned long bytes = count * (d.index_type ? 4u : 2u);
+			trace_bytes(self, "index", p + index_offset, bytes < length - index_offset ? bytes : length - index_offset,
+			    index_offset);
+		}
 	}
 	mtl->cmdbuf_draw(mc, &d);
 }

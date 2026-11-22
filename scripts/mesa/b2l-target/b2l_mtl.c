@@ -1212,9 +1212,18 @@ function_new(struct b2l_mtl_library *l, uint32_t index, const struct b2l_mtl_con
 		}
 		unmatched += !found;
 	}
+	unsigned supplied = 0;
+	for (unsigned k = 0; k < f->num_constants; k++) {
+		supplied += f->constants[k].supplied;
+	}
 	if (unmatched != 0) {
 		/* Metal ignores a constant the function does not declare. */
-		say(why, why_size, "%u of %u constants given are not this function's", unmatched, count);
+		say(why, why_size, "%u of %u constants given are not this function's; %u of %u declared supplied",
+		    unmatched, count, supplied, f->num_constants);
+	} else {
+		/* S10 port: the plug-in logs this for the first functions (boot 72). */
+		say(why, why_size, "%u of %u declared constants supplied (%u named decls)", supplied, f->num_constants,
+		    num_decls);
 	}
 	return f;
 }

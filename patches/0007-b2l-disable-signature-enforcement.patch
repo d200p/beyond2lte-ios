@@ -1,14 +1,19 @@
 --- a/bsd/kern/mach_loader.c
 +++ b/bsd/kern/mach_loader.c
-@@ -1754,6 +1754,15 @@
+@@ -1754,6 +1754,20 @@
  					break;
  				}
  
 +#if defined(ARM64_BOARD_CONFIG_B2L)
 +				/* Development-only unsigned execution. Do not attach an
-+				 * unverified cs_blob or mark its VM object signed. */
++				 * unverified cs_blob or mark its VM object signed.
++				 * S10 port: the first 64 are logged, then one in 1000 with
++				 * the count, so they no longer push the rest out of the log. */
 +				if (!cs_process_global_enforcement()) {
-+					printf("B2L CS: signature verification bypassed for %s\n", vp->v_name);
++					static uint32_t b2l_cs_bypasses;
++					uint32_t b2l_cs_n = ++b2l_cs_bypasses;
++					if (b2l_cs_n <= 64 || b2l_cs_n % 1000 == 0)
++						printf("B2L CS: signature verification bypassed for %s (%u so far)\n", vp->v_name, b2l_cs_n);
 +					ret = LOAD_SUCCESS;
 +					break;
 +				}
@@ -16,7 +21,7 @@
  				/* pager -> uip ->
  				 *  load signatures & store in uip
  				 *  set VM object "signed_pages"
-@@ -1979,7 +1988,11 @@
+@@ -1979,7 +1993,11 @@
  				ret = LOAD_FAILURE;
  			}
  #if CONFIG_ENFORCE_SIGNED_CODE

@@ -455,3 +455,24 @@ Failed:
   recovery 8 minutes after start, synced as the volume-key chord does
   (B2LPower.cpp), so each test boot's log can be read without anyone at the
   phone. Holding both volume keys for 3 s still does it at once.
+
+### Added after boot 72 (build 70 + 1)
+
+Boot 72's trace: Core Animation's pass loads and stores our 64 x 64 BGRA8
+target; its pipeline (`fixed_vert_lph_spc` + `fixed_frag_lph_cph`, no
+blending, write mask 0xf; attributes Float4 at 0, Float2 at 16 and 24, Half4
+at 32, stride 48, buffer 1) draws two indexed triangle pairs with the
+matrix in vertex buffer 2 and uniforms in fragment buffer 1 (one 256 KiB
+buffer), no bytes, no textures, and the target stays zero. Both shaders came
+out exactly as the test's built with default constants (130 + 278 NIR
+instructions), though the fragment shader declares about 60 function
+constants (`fc_texture_function`, `fc_color_inputs0`, `fc_color_opcodes0`,
+`fc_image_count`...) and the vertex shader's inputs and outputs depend on
+five: so Core Animation's constants may not arrive. Logged now: every
+function made (name, the constant-values class, each array's count, every
+constant with its value, how many of the declared ones were supplied), the
+contents of each buffer at its offset, the indices of each draw and buffer
+offset changes. The listener test, Apple's `MTLSharedEventListener` being nil
+whichever way, now calls our `notifyListener` without one. The `B2L CS`
+lines (17,000 a session, which pushed everything else out of the log ring)
+are kept for the first 64, then one in 1000 with the count.
