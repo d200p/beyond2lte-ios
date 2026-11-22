@@ -1737,6 +1737,9 @@ device_new_render_pipeline_options(id self, SEL _cmd, id d, unsigned long option
 	desc.topology_class = (uint32_t)msg_u(d, "inputPrimitiveTopology");
 	desc.alpha_to_coverage = msg_b(d, "isAlphaToCoverageEnabled");
 	desc.rasterization = !responds(d, "isRasterizationEnabled") || msg_b(d, "isRasterizationEnabled");
+	/* S10 port, M2c: the label, which b2l_mtl.c reads for the tests'
+	 * "b2l:keep" and "b2l:no-psiz" probes. */
+	cstring(msg(d, "label"), desc.label, sizeof(desc.label));
 	id vd = msg(d, "vertexDescriptor");
 	if (vd != nil) {
 		desc.vertex_descriptor = true;

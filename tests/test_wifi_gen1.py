@@ -234,11 +234,9 @@ static void tcm13_write(uint32_t address, uint32_t value) {
     assert(mode >= 13 && host_allocs == 1 && (ring_mem || index || shared));
     if (address == 0x2f0700 && value)
         assert(master13_on() && hostready13 && ((value == 6 && !db0_13) || (mode >= 14 && value == 7 && db0_13 == 1) ||
-            (mode >= 15 && value == 10 && db0_13 == 2) || (mode >= 15 && value == 11 && db0_13 == 3) ||
-            (mode >= 16 && value == 14 && db0_13 == 4) || (mode >= 16 && value == 15 && db0_13 == 5)));
+            (mode >= 15 && db0_13 >= 2 && value > tcm13(0x2f0700) && value < 64)));
     else if (address == 0x2f0730 && value)     /* the read index given back, before each repost */
-        assert(mode >= 15 && master13_on() && (db0_13 == 2 || (mode >= 16 && db0_13 == 4)) &&
-            value == tcm13(0x2f0720));
+        assert(mode >= 15 && master13_on() && db0_13 >= 2 && value == tcm13(0x2f0720));
     else assert(!bme_ever && !hostready13 && (index ? !value : 1));
     tcm11[(address - 0x170000) / 4] = value;
 }
@@ -269,72 +267,85 @@ static void ioctl14(uint32_t value) {
     tcm11[(0x2f0720 - 0x170000) / 4] = 3;
     mailbox13 = 0x200;
 }
-/* Mode 15: two more ioctl-response buffers with "ver", then
- * "cur_etheraddr"; each answered (unless fault 8) with an ack, a completion
- * and the value in the next buffer. */
+/* Modes 15 to 17: whatever the host posted since the firmware's read index
+ * (ioctl-response buffers, then one ioctl), checked and answered as the
+ * chip does: an ack, a completion naming the newest posted buffer, the
+ * value in it; WLC_UP also brings one event. Faults: 8 "ver" unanswered,
+ * 9 the set unanswered, 10 the chip keeps its address, 11 WLC_UP unanswered. */
 static uint8_t chip16[6];
+static unsigned have16, up17, posted15[16], nposted15;
+static unsigned buffer13(unsigned id) {
+    return id <= 2 ? 0x12000 + 0x2000 * (id - 1) : id <= 6 ? 0x16000 + 0x800 * (id - 3) :
+        id <= 8 ? 0x18000 + 0x2000 * (id - 7) : id <= 10 ? 0x1e000 + 0x1000 * (id - 9) : 0x1d000 + 0x800 * (id - 11);
+}
+static void d2h13(const uint32_t words[6]) {
+    const unsigned at = tcm13(0x2f0720);
+    uint32_t w[6];
+    memcpy(w, words, sizeof(w));
+    w[0] |= (uint32_t)(at + 1) << 24;   /* the epoch */
+    w[5] = w[0] ^ w[1] ^ w[2] ^ w[3] ^ w[4];
+    memcpy(host_dram + 0x5000 + 24 * at, w, sizeof(w)); memset(host_dev + 0x5000 + 24 * at, 1, sizeof(w));
+    tcm11[(0x2f0720 - 0x170000) / 4] = at + 1;
+}
 static void iovar15(uint32_t value) {
-    assert(mode >= 15 && (db0_13 == 2 || db0_13 == 3 || (mode >= 16 && (db0_13 == 4 || db0_13 == 5))));
-    static const unsigned items[] = { 9, 10, 13, 14 };
-    const unsigned item = items[db0_13 - 2];
-    assert(value == (0xff000000u | (item + 1)) && tcm13(0x2f0700) == item + 1);
+    const unsigned w = tcm13(0x2f0700), r = tcm13(0x2f0710);
+    assert(mode >= 15 && value == (0xff000000u | w) && w > r);
     db0_13++; iovar15_db++;
-    if (item == 9) {
-        assert(tcm13(0x2f0730) == 3);
-        for (unsigned i = 0; i < 2; i++) {
-            const uint8_t *b = host_dram + 40 * (7 + i);
-            uint32_t request, low, high;
-            memcpy(&request, b + 4, 4); memcpy(&low, b + 16, 4); memcpy(&high, b + 20, 4);
-            assert(b[0] == 0x0b && (unsigned)b[3] == 8 + i && request == 7 + i && (b[8] | b[9] << 8) == 0x2000);
-            assert(low == HOST13_PA + 0x18000 + 0x2000 * i && !high);
-        }
+    for (unsigned item = r; item + 1 < w; item++) {     /* the reposts */
+        const uint8_t *b = host_dram + 40 * item;
+        uint32_t request, low, high;
+        memcpy(&request, b + 4, 4); memcpy(&low, b + 16, 4); memcpy(&high, b + 20, 4);
+        assert(b[0] == 0x0b && (unsigned)b[3] == item + 1 && request >= 7 && request <= 12);
+        assert((unsigned)(b[8] | b[9] << 8) == (request < 9 ? 0x2000u : request < 11 ? 0x1000u : 0x800u));
+        assert(low == HOST13_PA + buffer13(request) && !high && tcm13(0x2f0730) == tcm13(0x2f0720));
+        assert(nposted15 < 16); posted15[nposted15++] = request;
     }
-    if (item == 13) {
-        assert(tcm13(0x2f0730) == 7);
-        for (unsigned i = 0; i < 2; i++) {
-            const uint8_t *b = host_dram + 40 * (11 + i);
-            uint32_t request, low, high;
-            memcpy(&request, b + 4, 4); memcpy(&low, b + 16, 4); memcpy(&high, b + 20, 4);
-            assert(b[0] == 0x0b && (unsigned)b[3] == 12 + i && request == 9 + i && (b[8] | b[9] << 8) == 0x1000);
-            assert(low == HOST13_PA + 0x1e000 + 0x1000 * i && !high);
-        }
-    }
+    const unsigned item = w - 1;
     const uint8_t *e = host_dram + 40 * item;
     uint32_t request, cmd, low, high;
     memcpy(&request, e + 4, 4); memcpy(&cmd, e + 8, 4); memcpy(&low, e + 24, 4); memcpy(&high, e + 28, 4);
-    const unsigned length = item == 9 ? 256 : item == 13 ? 20 : 32, set = item == 13;
-    static const uint32_t inputs[] = { 0, 0x200, 0, 0, 0x400, 0x600 };
-    assert(e[0] == 9 && (unsigned)e[3] == item + 1 && request == 0xfffe && cmd == (set ? 263u : 262u));
-    assert((unsigned)(e[12] | e[13] << 8) == item - 7 && (unsigned)(e[14] | e[15] << 8) == length &&
-        (unsigned)(e[16] | e[17] << 8) == length);
-    assert(low == HOST13_PA + 0x1c000 + inputs[item - 9 < 2 ? item - 9 : item - 9] && !high);
+    const unsigned length = e[14] | e[15] << 8;
+    assert(e[0] == 9 && (unsigned)e[3] == item + 1 && request == 0xfffe && (unsigned)(e[12] | e[13] << 8) == item - 7);
+    assert((unsigned)(e[16] | e[17] << 8) == length && !high && low >= HOST13_PA + 0x1c000 && low < HOST13_PA + 0x1d000);
     const char *input = (const char *)host_dram + (low - HOST13_PA);
-    assert(!strcmp(input, item == 9 ? "ver" : "cur_etheraddr"));
-    if (set) {
-        assert(!memcmp(input + 14, firmware_chosen_mac, 6));
-        memcpy(chip16, input + 14, 6);
-    }
-    if (host13_fault == 8 && item == 9) return;     /* "ver" never answered */
-    if (host13_fault == 9 && set) return;           /* the set never answered */
-    tcm11[(0x2f0710 - 0x170000) / 4] = item + 1;
-    static const unsigned ids[] = { 7, 8, 0, 0, 9, 10 };
-    const unsigned at = tcm13(0x2f0720), id = ids[item - 9], resp = item == 9 ? 32 : set ? 0 : 6;
-    uint32_t ack[6] = { (uint32_t)(at + 1) << 24 | 0x0au, 0xfffe, 0x00020000u, 0, 0, 0 };
-    uint32_t cpl[6] = { (uint32_t)(at + 2) << 24 | 0x0cu, id, 0x00020000u, resp | (item - 7) << 16, cmd, 0 };
-    ack[5] = ack[0] ^ ack[1] ^ ack[2] ^ ack[3] ^ ack[4];
-    cpl[5] = cpl[0] ^ cpl[1] ^ cpl[2] ^ cpl[3] ^ cpl[4];
-    memcpy(host_dram + 0x5000 + 24 * at, ack, sizeof(ack)); memset(host_dev + 0x5000 + 24 * at, 1, sizeof(ack));
-    memcpy(host_dram + 0x5000 + 24 * (at + 1), cpl, sizeof(cpl)); memset(host_dev + 0x5000 + 24 * (at + 1), 1, sizeof(cpl));
     static const char version[32] = "wl0: test version 18.41.117";
-    static const uint8_t mac[6] = { 0x00, 0x90, 0x4c, 0xc5, 0x12, 0x38 };  /* the NVRAM fixture's macaddr */
-    const unsigned buffer = id <= 8 ? 0x18000 + 0x2000 * (id - 7) : 0x1e000 + 0x1000 * (id - 9);
-    /* the chip's address: its own until a set gives it another */
-    const uint8_t *now = item == 14 && host13_fault != 10 ? chip16 : mac;
-    if (resp) {
-        memcpy(host_dram + buffer, item == 9 ? (const void *)version : (const void *)now, resp);
-        memset(host_dev + buffer, 1, resp);
+    const void *data = NULL;
+    unsigned resp = 0, answer = 1;
+    if (cmd == 262 && !strcmp(input, "ver")) {
+        assert(length == 256); data = version; resp = 32; answer = host13_fault != 8;
+    } else if (cmd == 262 && !strcmp(input, "cur_etheraddr")) {
+        assert(length == 32); data = have16 && host13_fault != 10 ? chip16 : firmware_chip_mac; resp = 6;
+    } else if (cmd == 263 && !strcmp(input, "cur_etheraddr")) {
+        assert(mode >= 16 && length == 20 && !memcmp(input + 14, firmware_chosen_mac, 6));
+        memcpy(chip16, input + 14, 6); have16 = 1; answer = host13_fault != 9;
+    } else if (cmd == 2) {
+        static const uint8_t zero[4];
+        assert(mode >= 17 && length == 4 && !memcmp(input, zero, 4)); up17 = 1; answer = host13_fault != 11;
+    } else if (cmd == 262 && !strcmp(input, "isup")) {
+        assert(mode >= 17 && length == 32 && up17); data = &up17; resp = 4;
+    } else {
+        assert(0);
     }
-    tcm11[(0x2f0720 - 0x170000) / 4] = at + 2;
+    if (!answer) return;
+    tcm11[(0x2f0710 - 0x170000) / 4] = w;
+    assert(nposted15);
+    const unsigned id = posted15[--nposted15];  /* the newest posted buffer, as the chip did */
+    const uint32_t ack[6] = { 0x0au, 0xfffe, 0x00020000u, 0, 0, 0 };
+    const uint32_t cpl[6] = { 0x0cu, id, 0x00020000u, resp | (item - 7) << 16, cmd, 0 };
+    d2h13(ack); d2h13(cpl);
+    if (resp) {
+        memcpy(host_dram + buffer13(id), data, resp); memset(host_dev + buffer13(id), 1, resp);
+    }
+    if (cmd == 2) {
+        /* one event in event buffer id 4: ether header (the chip's address),
+         * bcmeth header, then wl_event_msg_t with type 54, status 0 */
+        uint8_t packet[48] = { 0 };
+        memcpy(packet, firmware_chip_mac, 6); memcpy(packet + 6, firmware_chip_mac, 6);
+        packet[24 + 7] = 54;
+        memcpy(host_dram + buffer13(4), packet, sizeof(packet)); memset(host_dev + buffer13(4), 1, sizeof(packet));
+        const uint32_t event[6] = { 0x0eu, 4, 0x00020000u, 48, 0, 0 };
+        d2h13(event);
+    }
 }
 static void pcie13_write(unsigned off, uint32_t value) {
     static const uint32_t rings[5][3] = { { 0x00000, 64, 40 }, { 0x01000, 512, 32 }, { 0x05000, 64, 24 },
@@ -806,7 +817,8 @@ static void reset(unsigned which, unsigned failure) {
     for (unsigned b = 0; b < 13; b++) bank_info[b] = mode >= 10 ? (b == 4 ? 0x88c07 : 0x108c0f) : b < 5 ? 0x203 : 0xf;
     thread_starts = thread_fail = threads_released = deferred_s = 0;
     host13_fault = host_allocs = cleans = flushes = bme_ever = hostready13 = db0_13 = ioctl14_db = iovar15_db = 0; mailbox13 = 0;
-    firmware_mac_mode = 0; memset(chip16, 0, sizeof(chip16));
+    firmware_mac_mode = 0; memset(chip16, 0, sizeof(chip16)); have16 = up17 = 0;
+    nposted15 = 1; posted15[0] = 2;     /* the first ioctl's answer takes buffer 1 */
     memset(host_cpu, 0, sizeof(host_cpu)); memset(host_dram, 0, sizeof(host_dram)); memset(host_dev, 0, sizeof(host_dev));
     wifi_host = NULL; wifi_host_pa = 0; wifi_master = 0;
     memset(tcm11, 0, sizeof(tcm11)); vector0 = 0; r4_io = 0x21; r4_reset = 0;
@@ -867,7 +879,7 @@ static void verify_quiet(void) {
     if (strstr(logs, "Gen1 probe begin:"))
         assert(!(memory[4][0xc/4] | memory[4][0x10/4] | memory[4][0x14/4]));
     assert(unmaps == (mode >= 6 ? 11u : mode + 5) && link_polls <= 500 &&
-        now_us < (mode >= 16 ? 30000000u : mode >= 11 ? 20000000u : mode == 10 ? 7000000u : 1000000u));
+        now_us < (mode >= 16 ? 40000000u : mode >= 11 ? 20000000u : mode == 10 ? 7000000u : 1000000u));
     if (mode >= 11) assert(!r4_running && !r4_reset && r4_io == 0x21); /* Halted before power-off. */
     if (mode >= 5) {
         uint32_t expected_control = endpoint_fault == 7 || endpoint_fault == 10 ? 0x80000000 : 0;
@@ -1445,6 +1457,35 @@ int main(void) {
                                                : "mode 16: cur_etheraddr read back (status 0, 6 bytes): now the attachment's\n"));
     }
     puts("Firmware MAC: the attachment's address set when the chip's differs, read back, absent/same/unanswered cases, never logged passed");
+    /* S10 port, mode 17: WLC_UP, isup, the first event. After the set (MAC
+     * mode 0), with the address already right (2), and WLC_UP unanswered. */
+    mode = 17;
+    static const unsigned faults17[][2] = { { 0, 0 }, { 0, 2 }, { 11, 2 } };
+    for (unsigned k = 0; k < 3; k++) {
+        reset(8, 0); firmware_fixture_nvram(good, sizeof(good)); nvram_fixture_bytes = sizeof(good);
+        host13_fault = faults17[k][0]; firmware_mac_mode = faults17[k][1];
+        b2l_wifi_diag_start(); verify_quiet();
+        assert(strstr(logs, "mode 17: deferred run finished") && strstr(logs, "cleanup=verified"));
+        assert(strstr(logs, "bus mastering off again (endpoint, then root port)"));
+        assert(!strstr(logs, "0x5e1cb202") && !strstr(logs, "0xc54c9000") && !strstr(logs, "buffer 0:"));
+        assert(strstr(logs, "mode 17: completion read index ") &&
+            strstr(logs, "given back; two more ioctl-response buffers posted"));
+        const unsigned up_item = firmware_mac_mode == 2 ? 13 : 17;
+        char line[160];
+        snprintf(line, sizeof(line), "mode 17: ioctl 2 (WLC_UP) sent (4 bytes in and out), write index %u, DB0 %#x",
+            up_item + 1, 0xff000000u | (up_item + 1));
+        assert(strstr(logs, line) && up17);
+        if (host13_fault == 11) {
+            assert(strstr(logs, "mode 17: WLC_UP: no completion in 2 s") && !strstr(logs, "isup sent"));
+            continue;
+        }
+        assert(strstr(logs, "mode 17: WLC_UP: status 0\n"));
+        assert(strstr(logs, "mode 17: WLC_GET_VAR isup sent (32 bytes in and out)"));
+        assert(strstr(logs, "mode 17: isup (status 0, 4 bytes): 1\n"));
+        assert(strstr(logs, "mode 17: event 1: 48 bytes, type 54 status 0\n"));
+        assert(strstr(logs, "mode 17: 1 firmware events so far\n"));
+    }
+    puts("Firmware up: WLC_UP and isup one at a time, the first event by type only, no address in the log passed");
 }
 '''
 

@@ -594,3 +594,31 @@ triangles were drawn:
 - six vertices and no index buffer;
 - `fixed_vert_lph_spc` without constant values;
 - NDC, buffer 0 and no indices together.
+
+### Boot 77 (build 75) and what was added after it
+
+The probes found the side at fault. `std_vert0_lph` with Core Animation's
+exact layout, matrix, vertices and indices drew right (left half zero).
+`fixed_vert_lph_spc` drew nothing in every variant: NDC with identity,
+buffer 0, no indices, no constant values, and all three together. So the
+data and our draw path are right, and the shader as we translate it is the
+problem.
+
+Its dumped NIR shows what no proven vertex shader has. It has two
+`[[point_size]]` outputs, `point_size_per` and `point_size_lin`: in the AIR
+they are alternatives chosen by function constants, and since those are not
+folded both remain, both at `VARYING_SLOT_PSIZ`. One of them is stored to
+without being declared in the shader's variables (driver slot 1 is a gap
+in the declared outputs). A store to an output the driver never placed can
+land anywhere, including on the position.
+
+`b2l_mtl.c` now fixes the outputs before Panfrost sees a shader. Stores to
+undeclared outputs are dropped, and of several declared `[[point_size]]`
+outputs only the first is kept (only one exists for any set of constants,
+and Panfrost reads it only for points). It logs what it dropped. The
+pipeline label (newly passed from the plug-in, appended to the descriptor
+struct so an older library still reads the rest) turns this off with
+`b2l:keep`, the tests' control, logged and not counted. `b2l:no-psiz`
+removes every point size instead. The six probes run again with the fix on,
+plus the control and the no-psiz case, and Core Animation's own frame runs
+with the fix too.

@@ -124,6 +124,9 @@ struct b2l_mtl_render_pipeline_desc {
 	struct {
 		uint32_t stride, step_function, step_rate;
 	} layout[B2L_MTL_MAX_BUFFERS];
+	/* S10 port, M2c: the descriptor's label (last, so that an older library
+	 * reads the fields before it unchanged). */
+	char label[48];
 };
 
 /* What making a pipeline took, for the log. */

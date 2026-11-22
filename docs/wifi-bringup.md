@@ -836,3 +836,31 @@ back (now the attachment's, or still not). The iovar code is now one
 generic `WLC_GET_VAR`/`WLC_SET_VAR` sender. The tests cover the set and its
 read-back, a set never answered, a chip that keeps its own address, no
 `/chosen` address, an address already right, and no address ever in the log.
+
+Result (boot 77, build 75): mode 16 had nothing to do. The chip's
+`cur_etheraddr` already was the attachment's address (so the chip has the
+right MAC, and what differs is the NVRAM's default `macaddr`), and no set
+was sent.
+
+## S10: the radio up (mode 17)
+
+`b2l_wifi_diag=17` repeats mode 16 and then does what `dhd_preinit_ioctls`
+ends with:
+
+1. It posts two more 2 KiB ioctl-response buffers (request ids 11 and 12;
+   ids 1 and 2 are not posted again, because the firmware may still hold
+   one of them).
+2. It sends `WLC_UP` (ioctl 2, a zero int, the plain ioctl form without an
+   iovar name) and then `WLC_GET_VAR "isup"`.
+3. It polls 2 s more. The firmware's `MSG_TYPE_WL_EVENT` completions are
+   logged with only the event type and status from `wl_event_msg_t`, as
+   the packet starts with addresses.
+
+No scan or join is asked for. From mode 15 on, the dump of the posted
+buffers is off, since an answer can hold the MAC and an event packet starts
+with addresses. The test's firmware is now generic: it checks whatever was
+posted since its read index, answers in the newest posted buffer (as the
+real chip did), and sends one event, whose packet carries an address, after
+`WLC_UP`. The mode-17 cases are after a MAC set, with the MAC already right,
+and with `WLC_UP` unanswered, and the test checks that no address reaches
+the log.

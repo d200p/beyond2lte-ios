@@ -48,6 +48,8 @@
  * "cur_etheraddr" iovars (the MAC is compared, never logged).
  * b2l_wifi_diag=16 (S10 port) also gives the chip the attachment's MAC
  * (/chosen mac-address-wifi0) when its own differs, and reads it back.
+ * b2l_wifi_diag=17 (S10 port) also brings the radio up (WLC_UP), reads
+ * "isup" and logs the first firmware events (types only); no scan or join.
  * A powered PHY alone does not establish that DBI/ELBI accesses are safe.
  * All addresses/offsets are sourced in docs/wifi-bringup.md.
  */
@@ -92,6 +94,7 @@
 #define WIFI_HOST_IOCTL2 0x18000u       /* mode 15: two more ioctl-response buffers */
 #define WIFI_HOST_IOVAR_IN 0x1c000u     /* modes 15 and 16: the iovars' inputs, 512 bytes each */
 #define WIFI_HOST_IOCTL3 0x1e000u       /* mode 16: two 4 KiB ioctl-response buffers */
+#define WIFI_HOST_IOCTL4 0x1d000u       /* mode 17: two 2 KiB ioctl-response buffers */
 extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
 /* bcmmsgbuf.h sizes for IPC revision 7 (the default, not DHD_HTPUT_TUNABLES). */
 static const struct { uint32_t offset; uint16_t items, size; } wifi_rings[5] = {
@@ -1008,18 +1011,19 @@ wifi_host_buffer(uint32_t request)
     if (request >= 3 && request <= 6) return WIFI_HOST_EVENT + 0x800u * (request - 3);
     if (request >= 7 && request <= 8) return WIFI_HOST_IOCTL2 + 0x2000u * (request - 7);
     if (request >= 9 && request <= 10) return WIFI_HOST_IOCTL3 + 0x1000u * (request - 9);
+    if (request >= 11 && request <= 12) return WIFI_HOST_IOCTL4 + 0x800u * (request - 11);
     return 0;
 }
 
 /* The completions the firmware wrote, with dhd_prot_d2h_sync_xorcsum's
  * check (all words XOR to zero), and anything in the scratch and buffers. */
 static void
-wifi_log_host_writes(const struct wifi_host_view *v)
+wifi_log_host_writes(const struct wifi_host_view *v, int dump_buffers)
 {
     FlushPoC_DcacheRegion((vm_offset_t)wifi_host, WIFI_HOST_BYTES);
     for (unsigned r = 2; r < 5; r++) {
         unsigned n = v->d2h_write[r - 2] < wifi_rings[r].items ? v->d2h_write[r - 2] : 0;
-        for (unsigned i = 0; i < n && i < (r == 2 ? 8u : 2u); i++) {
+        for (unsigned i = 0; i < n && i < (r == 2 ? 16u : 2u); i++) {
             const uint8_t *c = wifi_host + wifi_rings[r].offset + wifi_rings[r].size * i;
             uint32_t x = 0;
             for (unsigned w = 0; w < wifi_rings[r].size; w += 4) x ^= wifi_le32(c + w);
@@ -1031,9 +1035,10 @@ wifi_log_host_writes(const struct wifi_host_view *v)
     }
     const uint8_t *s = wifi_host + WIFI_HOST_SCRATCH;
     wlog("mode 13: scratch %#x %#x\n", wifi_le32(s), wifi_le32(s + 4));
-    /* The first six only: mode 15's two hold "ver" and the MAC address,
-     * which mode 15 reports itself (the MAC only as a comparison). */
-    for (unsigned i = 0; i < 6; i++) {
+    /* Modes 13 and 14 only, the first six buffers: from mode 15 on, an
+     * answer can hold the MAC address and an event packet starts with
+     * addresses; those are reported as verdicts or event types instead. */
+    for (unsigned i = 0; dump_buffers && i < 6; i++) {
         const uint8_t *b = wifi_host + wifi_host_buffer(1 + i);
         uint32_t w0 = wifi_le32(b), w1 = wifi_le32(b + 4), w2 = wifi_le32(b + 8), w3 = wifi_le32(b + 12);
         if (w0 | w1 | w2 | w3)
@@ -1124,10 +1129,11 @@ wifi_host_var(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb
     unsigned length, uint32_t in_off, const uint8_t **answer, unsigned *bytes, int *status)
 {
     const uint64_t in = wifi_host_pa + in_off;
-    const unsigned done = last->d2h_write[0], name_bytes = (unsigned)strlen(name) + 1;
+    const int iovar = cmd == 262 || cmd == 263;    /* WLC_GET_VAR, WLC_SET_VAR: the name first */
+    const unsigned done = last->d2h_write[0], name_bytes = iovar ? (unsigned)strlen(name) + 1 : 0;
     uint64_t deadline;
     memset(wifi_host + in_off, 0, 0x200);
-    memcpy(wifi_host + in_off, name, name_bytes);
+    if (iovar) memcpy(wifi_host + in_off, name, name_bytes);
     if (value) memcpy(wifi_host + in_off + name_bytes, value, value_bytes);
     uint8_t *e = wifi_host + wifi_rings[0].offset + wifi_rings[0].size * item;
     memset(e, 0, wifi_rings[0].size);
@@ -1148,8 +1154,12 @@ wifi_host_var(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb
         wlog("%s: %s: write index or DB0 failed\n", tag, name);
         return -1;
     }
-    wlog("%s: WLC_%s_VAR %s sent (%u bytes in and out), write index %u, DB0 %#x\n", tag, cmd == 263 ? "SET" : "GET",
-        name, length, item + 1, 0xff000000u | (item + 1));
+    if (iovar)
+        wlog("%s: WLC_%s_VAR %s sent (%u bytes in and out), write index %u, DB0 %#x\n", tag,
+            cmd == 263 ? "SET" : "GET", name, length, item + 1, 0xff000000u | (item + 1));
+    else
+        wlog("%s: ioctl %u (%s) sent (%u bytes in and out), write index %u, DB0 %#x\n", tag, cmd, name, length,
+            item + 1, 0xff000000u | (item + 1));
     if (wifi_host_poll(regions, info, d2h_mb, item + 1, name, last)) return -1;
     FlushPoC_DcacheRegion((vm_offset_t)wifi_host, WIFI_HOST_BYTES);
     unsigned upto = last->d2h_write[0] < wifi_rings[2].items ? last->d2h_write[0] : 0;
@@ -1189,7 +1199,7 @@ wifi_host_repost(struct wifi_region *regions, const uint32_t *info, const struct
         e[0] = 0x0b;                            /* MSG_TYPE_IOCTLRESP_BUF_POST */
         e[3] = (uint8_t)((254 + item + i) % 253);
         wifi_put(e + 4, id + i, 4);
-        wifi_put(e + 8, id < 9 ? 0x2000u : 0x1000u, 2);
+        wifi_put(e + 8, id < 9 ? 0x2000u : id < 11 ? 0x1000u : 0x800u, 2);
         wifi_put(e + 16, (uint32_t)pa, 4);
         wifi_put(e + 20, (uint32_t)(pa >> 32), 4);
     }
@@ -1210,6 +1220,92 @@ wifi_chosen_mac(uint8_t mac[6])
 }
 
 /*
+ * S10 port, mode 16: when the chip's address is not the attachment's, set
+ * it and read it back (items *next on). 0: go on, 1: unanswered (stop, as
+ * DHD would with an ioctl outstanding), -1: a failed access.
+ */
+static int
+wifi_host_mac(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb, struct wifi_host_view *last,
+    const uint8_t chip[6], unsigned *next)
+{
+    const uint8_t *answer = NULL;
+    unsigned bytes = 0;
+    int status = 0, r;
+    uint8_t chosen[6];
+    if (!wifi_chosen_mac(chosen)) {
+        wlog("mode 16: no mac-address-wifi0 in /chosen; nothing set\n");
+        return 0;
+    }
+    if (!memcmp(chip, chosen, 6)) {
+        wlog("mode 16: the chip's address already is the attachment's; nothing set\n");
+        return 0;
+    }
+    if (wifi_host_repost(regions, info, last, *next, 9)) return -1;
+    *next += 2;
+    wlog("mode 16: the chip's address is not the attachment's; completion read index %u given back, two more "
+        "ioctl-response buffers posted\n", last->d2h_write[0]);
+    r = wifi_host_var(regions, info, d2h_mb, last, "mode 16", (*next)++, 263, "cur_etheraddr", chosen, 6, 20,
+        WIFI_HOST_IOVAR_IN + 0x400u, &answer, &bytes, &status);
+    if (r) return r;
+    wlog("mode 16: cur_etheraddr set: status %d\n", status);
+    r = wifi_host_var(regions, info, d2h_mb, last, "mode 16", (*next)++, 262, "cur_etheraddr", NULL, 0, 32,
+        WIFI_HOST_IOVAR_IN + 0x600u, &answer, &bytes, &status);
+    if (r) return r;
+    wlog("mode 16: cur_etheraddr read back (status %d, %u bytes): %s\n", status, bytes,
+        bytes < 6 ? "too short" : memcmp(answer, chosen, 6) ? "still NOT the attachment's" : "now the attachment's");
+    return 0;
+}
+
+/*
+ * S10 port, mode 17: the radio up, as dhd_preinit_ioctls ends: two more
+ * ioctl-response buffers (2 KiB, request ids 11 and 12), then WLC_UP (2, a
+ * zero int) and WLC_GET_VAR "isup", then 2 s more for what the firmware
+ * sends by itself. Its MSG_TYPE_WL_EVENT completions are logged with the
+ * event type and status only (an event packet starts with addresses). No
+ * scan or join is asked for, so nothing is asked to be transmitted.
+ */
+static int
+wifi_host_up(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb, struct wifi_host_view *last,
+    unsigned *next)
+{
+    const uint8_t *answer = NULL;
+    unsigned bytes = 0;
+    int status = 0, r;
+    static const uint8_t zero[4];
+    if (wifi_host_repost(regions, info, last, *next, 11)) return -1;
+    *next += 2;
+    wlog("mode 17: completion read index %u given back; two more ioctl-response buffers posted\n",
+        last->d2h_write[0]);
+    r = wifi_host_var(regions, info, d2h_mb, last, "mode 17", (*next)++, 2, "WLC_UP", zero, 4, 4,
+        WIFI_HOST_IOVAR_IN + 0x800u, &answer, &bytes, &status);
+    if (r) return r < 0 ? -1 : 0;
+    wlog("mode 17: WLC_UP: status %d\n", status);
+    r = wifi_host_var(regions, info, d2h_mb, last, "mode 17", (*next)++, 262, "isup", NULL, 0, 32,
+        WIFI_HOST_IOVAR_IN + 0xa00u, &answer, &bytes, &status);
+    if (r) return r < 0 ? -1 : 0;
+    wlog("mode 17: isup (status %d, %u bytes): %u\n", status, bytes, bytes >= 4 ? wifi_le32(answer) : 0);
+    if (wifi_host_poll(regions, info, d2h_mb, *next, "isup", last)) return -1;
+    FlushPoC_DcacheRegion((vm_offset_t)wifi_host, WIFI_HOST_BYTES);
+    unsigned events = 0, upto = last->d2h_write[0] < wifi_rings[2].items ? last->d2h_write[0] : 0;
+    for (unsigned i = 0; i < upto; i++) {
+        const uint8_t *c = wifi_host + wifi_rings[2].offset + wifi_rings[2].size * i;
+        if (c[0] != 0x0e) continue;     /* MSG_TYPE_WL_EVENT */
+        uint32_t at = wifi_host_buffer(wifi_le32(c + 4));
+        unsigned length = c[12] | c[13] << 8;
+        events++;
+        if (!at || length < 40 || events > 8) continue;
+        /* bcm_event_t: ether header (14), bcmeth header (10), wl_event_msg_t
+         * (version, flags, then event_type and status, big-endian) */
+        const uint8_t *m = wifi_host + at + 24;
+        wlog("mode 17: event %u: %u bytes, type %u status %u\n", events, length,
+            (unsigned)m[4] << 24 | (unsigned)m[5] << 16 | (unsigned)m[6] << 8 | m[7],
+            (unsigned)m[8] << 24 | (unsigned)m[9] << 16 | (unsigned)m[10] << 8 | m[11]);
+    }
+    wlog("mode 17: %u firmware events so far\n", events);
+    return 0;
+}
+
+/*
  * S10 port, mode 15: what dhd_sync_with_dongle asks first, one at a time:
  * WLC_GET_VAR "ver" (logged) and "cur_etheraddr" (compared with the NVRAM's
  * macaddr, never logged). Mode 16: the address in the private attachment
@@ -1224,7 +1320,7 @@ wifi_host_hello(struct wifi_region *regions, uint32_t mode, const uint32_t *info
     const uint8_t *answer = NULL;
     unsigned bytes = 0;
     int status = 0, r;
-    uint8_t chip[6], nvram[6], chosen[6];
+    uint8_t chip[6], nvram[6];
     if (last->h2d_read != 7 || last->d2h_write[0] < 2) {
         wlog("mode 15: the ioctl was not answered (read %u, completions %u); no iovars sent\n", last->h2d_read,
             last->d2h_write[0]);
@@ -1251,27 +1347,10 @@ wifi_host_hello(struct wifi_region *regions, uint32_t mode, const uint32_t *info
         bytes < 6 ? "too short" : !have_nvram ? "no NVRAM macaddr to compare" :
         memcmp(chip, nvram, 6) ? "DIFFERS from the NVRAM macaddr" : "matches the NVRAM macaddr");
     if (mode < 16 || bytes < 6) return 0;
-    if (!wifi_chosen_mac(chosen)) {
-        wlog("mode 16: no mac-address-wifi0 in /chosen; nothing set\n");
-        return 0;
-    }
-    if (!memcmp(chip, chosen, 6)) {
-        wlog("mode 16: the chip's address already is the attachment's; nothing set\n");
-        return 0;
-    }
-    if (wifi_host_repost(regions, info, last, 11, 9)) return -1;
-    wlog("mode 16: the chip's address is not the attachment's; completion read index %u given back, two more "
-        "ioctl-response buffers posted\n", last->d2h_write[0]);
-    r = wifi_host_var(regions, info, d2h_mb, last, "mode 16", 13, 263, "cur_etheraddr", chosen, 6, 20,
-        WIFI_HOST_IOVAR_IN + 0x400u, &answer, &bytes, &status);
+    unsigned next = 11;
+    r = wifi_host_mac(regions, info, d2h_mb, last, chip, &next);
     if (r) return r < 0 ? -1 : 0;
-    wlog("mode 16: cur_etheraddr set: status %d\n", status);
-    r = wifi_host_var(regions, info, d2h_mb, last, "mode 16", 14, 262, "cur_etheraddr", NULL, 0, 32,
-        WIFI_HOST_IOVAR_IN + 0x600u, &answer, &bytes, &status);
-    if (r) return r < 0 ? -1 : 0;
-    wlog("mode 16: cur_etheraddr read back (status %d, %u bytes): %s\n", status, bytes,
-        bytes < 6 ? "too short" : memcmp(answer, chosen, 6) ? "still NOT the attachment's" : "now the attachment's");
-    return 0;
+    return mode >= 17 && wifi_host_up(regions, info, d2h_mb, last, &next) < 0 ? -1 : 0;
 }
 
 /*
@@ -1382,7 +1461,7 @@ wifi_host_start(struct wifi_region *regions, uint32_t mode, uint32_t shared, uin
     if (wifi_host_poll(regions, info, d2h_mb, 6, "posts", &last)) return;
     if (mode >= 14 && wifi_host_ioctl(regions, info, d2h_mb, &last)) return;
     if (mode >= 15 && wifi_host_hello(regions, mode, info, d2h_mb, &last)) return;
-    wifi_log_host_writes(&last);
+    wifi_log_host_writes(&last, mode < 15);
     wifi_log_console(regions, console, deadline, console_index);
     return;
 stopped:
@@ -2093,7 +2172,7 @@ void
 b2l_wifi_diag_start(void)
 {
     uint32_t mode = 0;
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 16) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 17) {
         wlog("diagnostic disabled; no MMIO access\n");
         return;
     }

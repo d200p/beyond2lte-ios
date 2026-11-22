@@ -1702,6 +1702,71 @@ dump_nir(const char *what, nir_shader *nir)
 	ralloc_free(text);
 }
 
+/*
+ * S10 port, M2c (boot 77): fixed_vert_lph_spc drew nothing with any data
+ * (NDC, buffer 0, no indices, no constants), while std_vert0 drew Core
+ * Animation's own data right. Its two [[point_size]] outputs, point_size_per
+ * and point_size_lin (chosen by function constants that are not folded), both
+ * take VARYING_SLOT_PSIZ, and in boot 76's dump one of them is stored to
+ * without being declared. Before the driver sees a shader: stores to output
+ * variables it does not declare are dropped, and of several declared
+ * [[point_size]] outputs only the first is kept (only one exists for any set
+ * of constants, and Panfrost reads it only for points); `no_psiz` removes them
+ * all. The tests' pipeline label "b2l:keep" skips this (their control), and
+ * "b2l:no-psiz" asks for the second.
+ */
+static void
+fix_outputs(nir_shader *nir, bool no_psiz, const char *name)
+{
+	struct set *declared = _mesa_pointer_set_create(NULL), *removed = _mesa_pointer_set_create(NULL);
+	bool have_psiz = false;
+	nir_foreach_shader_out_variable_safe(var, nir) {
+		if (var->data.location == VARYING_SLOT_PSIZ && (no_psiz || have_psiz)) {
+			exec_node_remove(&var->node);
+			_mesa_set_add(removed, var);
+			continue;
+		}
+		have_psiz |= var->data.location == VARYING_SLOT_PSIZ;
+		_mesa_set_add(declared, var);
+	}
+	unsigned dangling = 0, psiz_stores = 0;
+	nir_foreach_function_impl(impl, nir) {
+		nir_foreach_block(block, impl) {
+			nir_foreach_instr_safe(instr, block) {
+				if (instr->type != nir_instr_type_intrinsic) {
+					continue;
+				}
+				nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+				if (in->intrinsic != nir_intrinsic_store_deref) {
+					continue;
+				}
+				nir_deref_instr *d = nir_src_as_deref(in->src[0]);
+				if (d == NULL || !nir_deref_mode_is(d, nir_var_shader_out)) {
+					continue;
+				}
+				nir_variable *var = nir_deref_instr_get_variable(d);
+				if (var != NULL && _mesa_set_search(removed, var) != NULL) {
+					psiz_stores++;
+				} else if (var == NULL || _mesa_set_search(declared, var) == NULL) {
+					dangling++;
+				} else {
+					continue;
+				}
+				nir_instr_remove(instr);
+			}
+		}
+		nir_metadata_preserve(impl, nir_metadata_control_flow);
+	}
+	unsigned extra = removed->entries;
+	_mesa_set_destroy(declared, NULL);
+	_mesa_set_destroy(removed, NULL);
+	if (dangling != 0 || extra != 0) {
+		nir_opt_dce(nir);
+		b2l_drm_note("mtl M2: %s: %u stores to undeclared outputs dropped, %u point-size outputs removed "
+		    "(%u stores)%s", name, dangling, extra, psiz_stores, no_psiz ? ", no-psiz" : "");
+	}
+}
+
 static struct b2l_mtl_render_pipeline *
 render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipeline_desc *desc,
     struct b2l_mtl_pipeline_report *report, char *why, size_t why_size)
@@ -1748,6 +1813,12 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 	nir_shader *fs = desc->fragment != NULL ? nir_shader_clone(NULL, desc->fragment->nir) : NULL;
 	if (fs != NULL) {
 		link_varyings(fs, &desc->vertex->info, &desc->fragment->info, report);
+	}
+	if (strstr(desc->label, "b2l:keep") == NULL) {
+		fix_outputs(vs, strstr(desc->label, "b2l:no-psiz") != NULL, function_name(desc->vertex));
+		if (fs != NULL) {
+			fix_outputs(fs, false, function_name(desc->fragment));
+		}
 	}
 	prepare_for_gallium(vs);
 	if (fs != NULL) {

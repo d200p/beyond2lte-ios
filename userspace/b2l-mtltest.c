@@ -780,10 +780,13 @@ ca_uber_draw(id device, id queue, id library, bool fetch, bool clear_fs)
  */
 enum { PROBE_STD = 1, PROBE_NDC = 2, PROBE_BUFFER0 = 4, PROBE_FLAT = 8, PROBE_PLAIN = 16 };
 
+/* `tag` (M2c, boot 77): the pipeline's label, which b2l_mtl.c reads. "b2l:keep"
+ * leaves the output fixes out, the control: logged, not counted. */
 static void
-vs_probe(id device, id queue, id library, unsigned flags, const char *what)
+vs_probe(id device, id queue, id library, unsigned flags, const char *what, const char *tag)
 {
 	char label[120], why[200], probes[120] = "";
+	const bool control = tag != NULL && strstr(tag, "b2l:keep") != NULL;
 	snprintf(label, sizeof(label), "draw: Core Animation's vertex data with attachment_clear, %s", what);
 	id error = nil, v = nil;
 	if (flags & (PROBE_STD | PROBE_PLAIN)) {
@@ -811,6 +814,9 @@ vs_probe(id device, id queue, id library, unsigned flags, const char *what)
 	id d = make("MTLRenderPipelineDescriptor");
 	MSG(void, id)(d, S("setVertexFunction:"), v);
 	MSG(void, id)(d, S("setFragmentFunction:"), f);
+	if (tag != NULL) {
+		MSG(void, id)(d, S("setLabel:"), nsstr(tag));
+	}
 	MSG(void, unsigned long)(at(MSG(id)(d, S("colorAttachments")), 0), S("setPixelFormat:"), 80);
 	id vd = MSG(id)(cls("MTLVertexDescriptor"), S("vertexDescriptor"));
 	id attributes = MSG(id)(vd, S("attributes"));
@@ -899,6 +905,11 @@ vs_probe(id device, id queue, id library, unsigned flags, const char *what)
 	}
 	pixel_text(back, ROW, 16, 32, probes, sizeof(probes));
 	pixel_text(back, ROW, 48, 32, probes, sizeof(probes));
+	if (control) {
+		say("control (%s, not counted): %s: status %lu, %u of %u left pixels not zero, %u right not blue;%s", tag,
+		    label, status, wrong_left, 31u * SIDE, wrong_right, probes);
+		return;
+	}
 	verdict(label, vb != nil && ib != nil && status == 4 && wrong_left == 0 && wrong_right == 0,
 	    "status %lu, %u of %u left pixels not zero, %u right not blue, %llu ms;%s %s", status, wrong_left, 31u * SIDE,
 	    wrong_right, (unsigned long long)ms, probes, why);
@@ -1333,13 +1344,19 @@ b2l_mtl_test_run(void)
 		ca_uber_draw(device, queue, library, true, false);
 		ca_uber_draw(device, queue, library, false, false);
 		ca_uber_draw(device, queue, library, false, true);
-		/* M2c (boot 76): one change at a time from that vertex-shader draw */
-		vs_probe(device, queue, library, PROBE_STD, "std_vert0 (proven) as its vertex shader");
-		vs_probe(device, queue, library, PROBE_NDC, "vertices in NDC, identity matrix");
-		vs_probe(device, queue, library, PROBE_BUFFER0, "vertices in buffer 0");
-		vs_probe(device, queue, library, PROBE_FLAT, "six vertices, no index buffer");
-		vs_probe(device, queue, library, PROBE_PLAIN, "no constant values");
-		vs_probe(device, queue, library, PROBE_NDC | PROBE_BUFFER0 | PROBE_FLAT, "NDC, buffer 0 and no indices");
+		/* M2c (boot 76): one change at a time from that vertex-shader draw;
+		 * boot 77: only std_vert0 drew. With b2l_mtl.c's output fixes now
+		 * on, the same probes, then the control without them (b2l:keep)
+		 * and every point-size output removed (b2l:no-psiz). */
+		vs_probe(device, queue, library, 0, "its vertex shader, output fixes on", NULL);
+		vs_probe(device, queue, library, 0, "its vertex shader, output fixes off", "b2l:keep");
+		vs_probe(device, queue, library, 0, "its vertex shader, no point size at all", "b2l:no-psiz");
+		vs_probe(device, queue, library, PROBE_STD, "std_vert0 (proven) as its vertex shader", NULL);
+		vs_probe(device, queue, library, PROBE_NDC, "vertices in NDC, identity matrix", NULL);
+		vs_probe(device, queue, library, PROBE_BUFFER0, "vertices in buffer 0", NULL);
+		vs_probe(device, queue, library, PROBE_FLAT, "six vertices, no index buffer", NULL);
+		vs_probe(device, queue, library, PROBE_PLAIN, "no constant values", NULL);
+		vs_probe(device, queue, library, PROBE_NDC | PROBE_BUFFER0 | PROBE_FLAT, "NDC, buffer 0 and no indices", NULL);
 	}
 	events_and_heap(device, queue);
 	if (t != nil) {

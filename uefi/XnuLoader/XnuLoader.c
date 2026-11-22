@@ -444,8 +444,10 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * (boot 75: it answered 0x14e46c77): also the "ver" and
                  * "cur_etheraddr" iovars, the MAC only compared. Mode 16
                  * (boot 76: the chip's address is not the NVRAM's): also
-                 * the attachment's MAC set on the chip and read back. */
-                "b2l_wifi_diag=16 "
+                 * the attachment's MAC set on the chip and read back.
+                 * Mode 17 (boot 77: the chip's MAC already was it): also
+                 * WLC_UP, "isup" and the first events; no scan or join. */
+                "b2l_wifi_diag=17 "
                 /* S10 port: test boots come back to TWRP by themselves 8 min
                  * after start (after Metal's test and Wi-Fi's deferred run),
                  * synced like the volume-key chord (B2LPower.cpp). */
