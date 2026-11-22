@@ -128,7 +128,7 @@ static vm_map_t kernel_map;
 static pmap_t kernel_pmap;
 static _Alignas(16384) uint8_t host_cpu[HOST13_BYTES];
 static uint8_t host_dram[HOST13_BYTES], host_dev[HOST13_BYTES];
-static unsigned host13_fault, host_allocs, cleans, flushes, bme_ever, hostready13, db0_13;
+static unsigned host13_fault, host_allocs, cleans, flushes, bme_ever, hostready13, db0_13, ioctl14_db;
 static uint32_t mailbox13;
 static kern_return_t kmem_alloc_contig(vm_map_t map, vm_offset_t *va, vm_size_t size, vm_offset_t mask,
     ppnum_t max, ppnum_t pmask, unsigned flags, int tag) {
@@ -231,11 +231,39 @@ static void tcm13_write(uint32_t address, uint32_t value) {
         (address >= 0x2f0720 && address < 0x2f072c) || (address >= 0x2f0730 && address < 0x2f073c);
     int shared = address == 0x2f0034 || address == 0x2f0038 || address == 0x2f003c || address == 0x2f0054;
     assert(mode >= 13 && host_allocs == 1 && (ring_mem || index || shared));
-    if (address == 0x2f0700 && value) assert(value == 6 && master13_on() && hostready13 && !db0_13);
+    if (address == 0x2f0700 && value)
+        assert(master13_on() && hostready13 && ((value == 6 && !db0_13) || (mode >= 14 && value == 7 && db0_13 == 1)));
     else assert(!bme_ever && !hostready13 && (index ? !value : 1));
     tcm11[(address - 0x170000) / 4] = value;
 }
 static uint32_t tcm13(uint32_t address) { return tcm11[(address - 0x170000) / 4]; }
+/* Mode 14: the ioctl, then (unless fault 7) its acknowledgement, its
+ * completion and WLC_IOCTL_MAGIC in the first ioctl-response buffer. */
+static void ioctl14(uint32_t value) {
+    assert(mode >= 14 && value == 0xff000007 && tcm13(0x2f0700) == 7 && tcm13(0x2f0710) == 6 && !ioctl14_db++);
+    db0_13++;
+    const uint8_t *item = host_dram + 40 * 6;
+    uint32_t request, cmd, low, high;
+    memcpy(&request, item + 4, 4); memcpy(&cmd, item + 8, 4); memcpy(&low, item + 24, 4); memcpy(&high, item + 28, 4);
+    assert(item[0] == 9 && !item[1] && !item[2] && item[3] == 7 && request == 0xfffe && cmd == 0);
+    assert((item[12] | item[13] << 8) == 1 && (item[14] | item[15] << 8) == 4 && (item[16] | item[17] << 8) == 4);
+    assert(low == HOST13_PA + 0x11800 && !high);
+    for (unsigned b = 18; b < 24; b++) assert(!item[b]);
+    for (unsigned b = 32; b < 40; b++) assert(!item[b]);
+    for (unsigned b = 0; b < 64; b++) assert(!host_dram[0x11800 + b]);
+    if (host13_fault == 7) return;  /* no answer */
+    tcm11[(0x2f0710 - 0x170000) / 4] = 7;
+    uint32_t ack[6] = { 0x0200000au, 0xfffe, 0x00020000u, 0, 0, 0 };
+    uint32_t cpl[6] = { 0x0300000cu, 1, 0x00020000u, 4u | 1u << 16, 0, 0 };
+    ack[5] = ack[0] ^ ack[1] ^ ack[2] ^ ack[3] ^ ack[4];
+    cpl[5] = cpl[0] ^ cpl[1] ^ cpl[2] ^ cpl[3] ^ cpl[4];
+    memcpy(host_dram + 0x5000 + 24, ack, sizeof(ack)); memset(host_dev + 0x5000 + 24, 1, sizeof(ack));
+    memcpy(host_dram + 0x5000 + 48, cpl, sizeof(cpl)); memset(host_dev + 0x5000 + 48, 1, sizeof(cpl));
+    const uint32_t magic = 0x14e46c77;
+    memcpy(host_dram + 0x12000, &magic, 4); memset(host_dev + 0x12000, 1, 4);
+    tcm11[(0x2f0720 - 0x170000) / 4] = 3;
+    mailbox13 = 0x200;
+}
 static void pcie13_write(unsigned off, uint32_t value) {
     static const uint32_t rings[5][3] = { { 0x00000, 64, 40 }, { 0x01000, 512, 32 }, { 0x05000, 64, 24 },
                                           { 0x06000, 1024, 24 }, { 0x0c000, 512, 40 } };
@@ -253,7 +281,9 @@ static void pcie13_write(unsigned off, uint32_t value) {
         for (unsigned i = 0; i < HOST13_BYTES; i++) assert(!host_dram[i]);
         return;
     }
-    assert(off == 0x140 && value == 0xff000006 && hostready13 && !db0_13++ && tcm13(0x2f0700) == 6);
+    assert(off == 0x140 && hostready13);
+    if (db0_13 == 1) { ioctl14(value); return; }
+    assert(value == 0xff000006 && !db0_13++ && tcm13(0x2f0700) == 6);
     for (unsigned i = 0; i < 6; i++) {
         const uint8_t *item = host_dram + 40 * i;   /* what the chip reads */
         uint32_t request, low, high;
@@ -702,7 +732,7 @@ static void reset(unsigned which, unsigned failure) {
     if (mode >= 10) { firmware_fixture_setup(); memset(firmware_ram, 0, sizeof(firmware_ram)); }
     for (unsigned b = 0; b < 13; b++) bank_info[b] = mode >= 10 ? (b == 4 ? 0x88c07 : 0x108c0f) : b < 5 ? 0x203 : 0xf;
     thread_starts = thread_fail = threads_released = deferred_s = 0;
-    host13_fault = host_allocs = cleans = flushes = bme_ever = hostready13 = db0_13 = 0; mailbox13 = 0;
+    host13_fault = host_allocs = cleans = flushes = bme_ever = hostready13 = db0_13 = ioctl14_db = 0; mailbox13 = 0;
     memset(host_cpu, 0, sizeof(host_cpu)); memset(host_dram, 0, sizeof(host_dram)); memset(host_dev, 0, sizeof(host_dev));
     wifi_host = NULL; wifi_host_pa = 0; wifi_master = 0;
     memset(tcm11, 0, sizeof(tcm11)); vector0 = 0; r4_io = 0x21; r4_reset = 0;
@@ -1238,6 +1268,42 @@ int main(void) {
         assert(strstr(logs, "mode 13: event buffer 2: 0xe1 0xe2 0xe3 0xe4\n"));
     }
     puts("Firmware host rings: owned contiguous memory, DHD's ring/scratch/host_cap writes, cache cleans before each doorbell, bus mastering order and its undo, posted buffers, completions read back passed");
+    /* S10 port, mode 14: one ioctl after the buffers. 5: the buffers are
+     * never taken, so no ioctl; 7: the ioctl gets no answer. */
+    mode = 14;
+    static const unsigned faults14[] = { 0, 5, 7 };
+    for (unsigned k = 0; k < 3; k++) {
+        unsigned fault = faults14[k];
+        reset(8, 0); firmware_fixture_nvram(good, sizeof(good)); nvram_fixture_bytes = sizeof(good);
+        host13_fault = fault;
+        b2l_wifi_diag_start(); verify_quiet();
+        assert(strstr(logs, "mode 14: deferred run finished") && strstr(logs, "cleanup=verified"));
+        assert(strstr(logs, "bus mastering off again (endpoint, then root port)"));
+        assert(!wifi_master && !(memory[8][4/4] & 4) && !(memory[9][0x2004/4] & 4) && hostready13 == 1);
+        if (fault == 5) {
+            assert(strstr(logs, "mode 14: the firmware took 0 of the 6 buffers; no ioctl sent") && !ioctl14_db);
+            continue;
+        }
+        assert(ioctl14_db == 1 && db0_13 == 2);
+        assert(strstr(logs, "mode 14: ioctl WLC_GET_MAGIC sent (4 bytes in and out, input at pa 0x9f011800), "
+            "write index 7, DB0 0xff000007"));
+        if (fault == 7) {
+            assert(strstr(logs, "2000 ms after the ioctl: control submissions read 6 of 7; completion writes 1 0 0"));
+            assert(!strstr(logs, "ring 2 item 1") && !strstr(logs, "ioctl-response buffer 0"));
+            continue;
+        }
+        assert(strstr(logs, " 200 ms after the ioctl: control submissions read 7 of 7; completion writes 3 0 0; "
+            "mailbox int 0x200"));
+        char line[200];
+        snprintf(line, sizeof(line), "ring 2 item 1: type 0xa if 0 flags 0 epoch 2 request 0xfffe status 0 ring 2; "
+            "0 0 %#x 0; xor 0\n", 0x0200000au ^ 0xfffeu ^ 0x00020000u);
+        assert(strstr(logs, line));
+        snprintf(line, sizeof(line), "ring 2 item 2: type 0xc if 0 flags 0 epoch 3 request 0x1 status 0 ring 2; "
+            "0x10004 0 %#x 0; xor 0\n", 0x0300000cu ^ 1u ^ 0x00020000u ^ 0x10004u);
+        assert(strstr(logs, line));
+        assert(strstr(logs, "mode 13: ioctl-response buffer 0: 0x14e46c77 0 0 0\n"));
+    }
+    puts("Firmware ioctl: WLC_GET_MAGIC as dhd_fillup_ioct_reqst sends it, after the buffers only, its acknowledgement, completion and answer read back passed");
 }
 '''
 

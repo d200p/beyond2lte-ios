@@ -438,8 +438,10 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * the host, read only, 2 s more and its console again. Mode 13
                  * (boots 72 and 73 ran mode 12): also the host side of those
                  * rings in phone memory, bus mastering, the hostready and
-                 * control doorbells with six posted buffers, 2 s of polling. */
-                "b2l_wifi_diag=13 "
+                 * control doorbells with six posted buffers, 2 s of polling.
+                 * Mode 14 (boot 74: the firmware took all six): also one
+                 * ioctl, WLC_GET_MAGIC, and 2 s for its answer. */
+                "b2l_wifi_diag=14 "
                 /* S10 port: test boots come back to TWRP by themselves 8 min
                  * after start (after Metal's test and Wi-Fi's deferred run),
                  * synced like the volume-key chord (B2LPower.cpp). */

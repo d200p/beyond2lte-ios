@@ -1601,6 +1601,74 @@ write_mask(uint32_t m)
 	    ((m & 1) ? PIPE_MASK_A : 0);
 }
 
+/*
+ * S10 port, M2c (boot 74): what a fragment shader made of its constants.
+ * Core Animation's 60 (fc_framebuffer_fetch 1, fc_attachment_count 1,
+ * fc_blend_function 0x3e: blending in the shader, from dest_0) gave the same
+ * 278 NIR instructions as the test's single one, and its frame stayed zero.
+ * One line per fragment shader (the first 40 of a process): the constants it
+ * was translated with (count, nonzero, a digest), what it writes, how many
+ * output stores, framebuffer fetches, UBO loads and discards it has.
+ */
+static void
+note_fragment(struct b2l_mtl_function *f, nir_shader *fs)
+{
+	static unsigned noted;
+	if (__atomic_fetch_add(&noted, 1, __ATOMIC_RELAXED) >= 40) {
+		return;
+	}
+	unsigned fetches = 0, stores = 0, discards = 0, ubo_loads = 0;
+	nir_foreach_function_impl(impl, fs) {
+		nir_foreach_block(block, impl) {
+			nir_foreach_instr(instr, block) {
+				if (instr->type != nir_instr_type_intrinsic) {
+					continue;
+				}
+				nir_intrinsic_instr *in = nir_instr_as_intrinsic(instr);
+				switch (in->intrinsic) {
+				case nir_intrinsic_load_output:
+					fetches++;
+					break;
+				case nir_intrinsic_store_output:
+					stores++;
+					break;
+				case nir_intrinsic_store_deref:
+					stores += nir_deref_mode_is(nir_src_as_deref(in->src[0]), nir_var_shader_out);
+					break;
+				case nir_intrinsic_terminate:
+				case nir_intrinsic_terminate_if:
+				case nir_intrinsic_demote:
+				case nir_intrinsic_demote_if:
+					discards++;
+					break;
+				case nir_intrinsic_load_ubo:
+					ubo_loads++;
+					break;
+				default:
+					break;
+				}
+			}
+		}
+	}
+	uint32_t digest = 2166136261u;
+	unsigned supplied = 0, nonzero = 0;
+	for (unsigned k = 0; k < f->num_constants; k++) {
+		if (!f->constants[k].supplied) {
+			continue;
+		}
+		supplied++;
+		nonzero += f->constants[k].bits != 0;
+		uint64_t v = (uint64_t)f->constants[k].index << 32 ^ f->constants[k].bits;
+		for (unsigned b = 0; b < 8; b++) {
+			digest = (digest ^ (uint8_t)(v >> (8 * b))) * 16777619u;
+		}
+	}
+	b2l_drm_note("mtl M2: fragment %s: %u of %u constants supplied (%u nonzero, digest %08x); writes 0x%llx, "
+	    "%u output stores, %u framebuffer fetches%s, %u UBO loads, %u discards", function_name(f), supplied,
+	    f->num_constants, nonzero, digest, (unsigned long long)fs->info.outputs_written, stores, fetches,
+	    fs->info.fs.uses_fbfetch_output ? " (fbfetch on)" : "", ubo_loads, discards);
+}
+
 static struct b2l_mtl_render_pipeline *
 render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipeline_desc *desc,
     struct b2l_mtl_pipeline_report *report, char *why, size_t why_size)
@@ -1651,6 +1719,7 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 	prepare_for_gallium(vs);
 	if (fs != NULL) {
 		prepare_for_gallium(fs);
+		note_fragment(desc->fragment, fs);
 	}
 
 	/* Vertex elements in driver-location order, from the descriptor. */

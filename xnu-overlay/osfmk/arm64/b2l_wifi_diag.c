@@ -42,6 +42,8 @@
  * ioctl is sent and no interrupt is enabled. The memory is never freed, so a
  * late DMA can only land in it; bus mastering is off again once the R4 is
  * halted, before the power-off.
+ * b2l_wifi_diag=14 (S10 port) also sends one ioctl, WLC_GET_MAGIC, once the
+ * buffers are taken, and polls 2 s for its completions and its answer.
  * A powered PHY alone does not establish that DBI/ELBI accesses are safe.
  * All addresses/offsets are sourced in docs/wifi-bringup.md.
  */
@@ -80,6 +82,7 @@
 #define WIFI_MAILBOX_INT 0xc30u
 #define WIFI_HOST_BYTES 0x18000u
 #define WIFI_HOST_SCRATCH 0x11000u      /* DMA_D2H_SCRATCH_BUF_LEN 8 */
+#define WIFI_HOST_IOCTL_IN 0x11800u     /* mode 14: the ioctl's input */
 #define WIFI_HOST_IOCTL 0x12000u        /* two 8 KiB ioctl-response buffers */
 #define WIFI_HOST_EVENT 0x16000u        /* four 2 KiB event buffers */
 extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
@@ -959,14 +962,35 @@ wifi_host_view(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
 }
 
 static void
-wifi_log_view(unsigned ms, const struct wifi_host_view *v)
+wifi_log_view(const char *when, unsigned posted, const struct wifi_host_view *v)
 {
-    char when[32];
-    if (ms) snprintf(when, sizeof(when), "%u ms after the posts", ms);
-    else snprintf(when, sizeof(when), "after hostready");
-    wlog("mode 13: %s: control submissions read %u of 6; completion writes %u %u %u; "
-        "mailbox int %#x; d2h mailbox data %#x\n", when, v->h2d_read, v->d2h_write[0], v->d2h_write[1],
+    wlog("mode 13: %s: control submissions read %u of %u; completion writes %u %u %u; "
+        "mailbox int %#x; d2h mailbox data %#x\n", when, v->h2d_read, posted, v->d2h_write[0], v->d2h_write[1],
         v->d2h_write[2], v->mailbox_int, v->d2h_data);
+}
+
+/* Every 200 ms for 2 s, the state when it changed and at the end. */
+static int
+wifi_host_poll(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb, unsigned posted, const char *after,
+    struct wifi_host_view *last)
+{
+    struct wifi_host_view now;
+    uint64_t deadline;
+    for (unsigned i = 1; i <= 10; i++) {
+        delay_for_interval(200, NSEC_PER_MSEC);
+        clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+        if (wifi_host_view(regions, info, d2h_mb, &now, deadline)) {
+            wlog("mode 13: poll %u lost the link/BAR guard\n", i);
+            return -1;
+        }
+        if (memcmp(&now, last, sizeof(now)) || i == 10) {
+            char when[48];
+            snprintf(when, sizeof(when), "%u ms after the %s", 200 * i, after);
+            wifi_log_view(when, posted, &now);
+        }
+        *last = now;
+    }
+    return 0;
 }
 
 /* The completions the firmware wrote, with dhd_prot_d2h_sync_xorcsum's
@@ -998,6 +1022,47 @@ wifi_log_host_writes(const struct wifi_host_view *v)
 }
 
 /*
+ * S10 port, mode 14: one ioctl the way dhd_fillup_ioct_reqst sends it, once
+ * the firmware has taken the six buffers: MSG_TYPE_IOCTLPTR_REQ for
+ * WLC_GET_MAGIC (0), 4 bytes in and out, request id DHD_IOCTL_REQ_PKTID, its
+ * input in phone memory; write index 7 and DB0. The firmware should answer
+ * on the control completion ring (MSG_TYPE_IOCTLPTR_REQ_ACK, then
+ * MSG_TYPE_IOCTL_CMPLT) and put 0x14e46c77 (WLC_IOCTL_MAGIC) in the first
+ * ioctl-response buffer: the chip writing phone memory.
+ */
+static int
+wifi_host_ioctl(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb, struct wifi_host_view *last)
+{
+    uint64_t deadline, in = wifi_host_pa + WIFI_HOST_IOCTL_IN;
+    if (last->h2d_read != 6) {
+        wlog("mode 14: the firmware took %u of the 6 buffers; no ioctl sent\n", last->h2d_read);
+        return 0;
+    }
+    uint8_t *item = wifi_host + wifi_rings[0].offset + wifi_rings[0].size * 6;
+    memset(wifi_host + WIFI_HOST_IOCTL_IN, 0, 64);
+    item[0] = 0x09;                             /* MSG_TYPE_IOCTLPTR_REQ */
+    item[3] = (uint8_t)((254 + 6) % 253);       /* the seventh H2D item */
+    wifi_put(item + 4, 0xfffe, 4);              /* DHD_IOCTL_REQ_PKTID */
+    wifi_put(item + 8, 0, 4);                   /* WLC_GET_MAGIC */
+    wifi_put(item + 12, 1, 2);                  /* trans_id */
+    wifi_put(item + 14, 4, 2);                  /* input_buf_len */
+    wifi_put(item + 16, 4, 2);                  /* output_buf_len */
+    wifi_put(item + 24, (uint32_t)in, 4);
+    wifi_put(item + 28, (uint32_t)(in >> 32), 4);
+    CleanPoC_DcacheRegion((vm_offset_t)item, wifi_rings[0].size);
+    CleanPoC_DcacheRegion((vm_offset_t)wifi_host + WIFI_HOST_IOCTL_IN, 64);
+    clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+    if (wifi_tcm_set(regions, info[1], 7, deadline) ||
+        wifi_bp_write(regions, WIFI_PCIE_CORE + WIFI_H2D_DB0, 0xff000007u, deadline)) {
+        wlog("mode 14: ioctl write index or DB0 failed\n");
+        return -1;
+    }
+    wlog("mode 14: ioctl WLC_GET_MAGIC sent (4 bytes in and out, input at pa %#llx), write index 7, DB0 %#x\n",
+        (unsigned long long)in, 0xff000007u);
+    return wifi_host_poll(regions, info, d2h_mb, 7, "ioctl", last);
+}
+
+/*
  * dhd_prot_init's dongle writes for this firmware (flags: IPC 7, hostready,
  * xorcsum, no DMA indices, 4-byte indices, no IDMA/IFRM/DAR): per common
  * ring base, max items and item size, indices zero (dhd_prot_ring_init),
@@ -1010,12 +1075,12 @@ wifi_log_host_writes(const struct wifi_host_view *v)
  * to turn off after the R4 is halted.
  */
 static void
-wifi_host_start(struct wifi_region *regions, uint32_t shared, uint32_t console, uint32_t *console_index)
+wifi_host_start(struct wifi_region *regions, uint32_t mode, uint32_t shared, uint32_t console, uint32_t *console_index)
 {
     uint32_t flags = 0, d2h_mb = 0, rings_info = 0, info[5];
     const uint32_t host_cap = 7u | 0x400u | 0x1000u | 0x800000u;
     uint64_t deadline, scratch;
-    struct wifi_host_view last, now;
+    struct wifi_host_view last;
     clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
     if (wifi_bp_read(regions, shared, &flags, deadline) || wifi_bp_read(regions, shared + 44, &d2h_mb, deadline) ||
         wifi_bp_read(regions, shared + 48, &rings_info, deadline)) {
@@ -1079,7 +1144,7 @@ wifi_host_start(struct wifi_region *regions, uint32_t shared, uint32_t console, 
         wlog("mode 13: state after hostready unreadable\n");
         return;
     }
-    wifi_log_view(0, &last);
+    wifi_log_view("after hostready", 6, &last);
     wifi_log_console(regions, console, deadline, console_index);
     /* dhd_prot_rxbufpost_ctrl: msg_type, if_id 0, flags 0 (no H2D phase),
      * epoch from seqnum H2D_EPOCH_INIT_VAL (254) modulo 253, a request id,
@@ -1102,16 +1167,8 @@ wifi_host_start(struct wifi_region *regions, uint32_t shared, uint32_t console, 
     }
     wlog("mode 13: 2 ioctl-response and 4 event buffers posted, control submission write index 6, DB0 %#x\n",
         0xff000006u);
-    for (unsigned i = 1; i <= 10; i++) {
-        delay_for_interval(200, NSEC_PER_MSEC);
-        clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
-        if (wifi_host_view(regions, info, d2h_mb, &now, deadline)) {
-            wlog("mode 13: poll %u lost the link/BAR guard\n", i);
-            return;
-        }
-        if (memcmp(&now, &last, sizeof(now)) || i == 10) wifi_log_view(200 * i, &now);
-        last = now;
-    }
+    if (wifi_host_poll(regions, info, d2h_mb, 6, "posts", &last)) return;
+    if (mode >= 14 && wifi_host_ioctl(regions, info, d2h_mb, &last)) return;
     wifi_log_host_writes(&last);
     wifi_log_console(regions, console, deadline, console_index);
     return;
@@ -1219,7 +1276,7 @@ wifi_firmware_boot(struct wifi_region *regions, uint32_t mode)
                 (flags & 0x200u) ? " ASSERT" : "");
         wifi_log_console(regions, words[5], deadline, &console_index);
     }
-    if (mode >= 13) wifi_host_start(regions, shared, words[5], &console_index);
+    if (mode >= 13) wifi_host_start(regions, mode, shared, words[5], &console_index);
 halt:
     /* dhdpcie_bus_download_state(enter): halt the ARM and remove reset. */
     clock_interval_to_deadline(100, NSEC_PER_MSEC, &deadline);
@@ -1823,7 +1880,7 @@ void
 b2l_wifi_diag_start(void)
 {
     uint32_t mode = 0;
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 13) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 14) {
         wlog("diagnostic disabled; no MMIO access\n");
         return;
     }

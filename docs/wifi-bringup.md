@@ -757,3 +757,29 @@ writes one completion with a valid xorcsum plus an event. The faults cover
 no memory, a page hole, memory outside owned RAM, no `hostrdy` flag, a
 firmware that never takes the buffers, and an endpoint that will not
 master.
+
+Result (boot 74, build 72): mode 13 worked as written. Host memory was at
+pa `0x84740000`, and the rings, indices, scratch and `host_cap` were
+written and read back. Bus mastering came on, and the hostready doorbell
+was rung (nothing changed in 200 ms). Then the six buffers were posted and
+DB0 rung, and within 200 ms the firmware's read index of the control
+submissions was 6 of 6: the chip read them from phone memory. It wrote no
+completion, no mailbox status and no scratch, which is expected with
+nothing asked. Its console printed nothing new. Bus mastering went off
+again, and every cleanup was verified.
+
+## S10: one ioctl (mode 14)
+
+`b2l_wifi_diag=14` repeats mode 13. Once the firmware has taken the six
+buffers, it sends one ioctl the way `dhd_fillup_ioct_reqst` does:
+`MSG_TYPE_IOCTLPTR_REQ` (`0x09`) for `WLC_GET_MAGIC` (command 0), request id
+`DHD_IOCTL_REQ_PKTID` (`0xfffe`), transaction id 1, 4 bytes in and 4 out,
+with its input in phone memory. Then write index 7, DB0 `0xff000007` and
+2 s of polling. The firmware should answer on the control completion ring
+with `MSG_TYPE_IOCTLPTR_REQ_ACK` (`0x0a`), then `MSG_TYPE_IOCTL_CMPLT`
+(`0x0c`, response length 4, transaction id 1), and write `0x14e46c77`
+(`WLC_IOCTL_MAGIC`) in the first ioctl-response buffer. That would be the
+chip writing phone memory, the second half of the message-buffer path.
+Every completion is logged with its xorcsum check. The test's firmware
+checks the request at the doorbell and answers as above. Its faults are
+buffers never taken (no ioctl is sent) and an ioctl never answered.

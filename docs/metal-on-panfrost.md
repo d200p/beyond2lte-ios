@@ -509,3 +509,36 @@ either written somewhere else or not at all. Added to the next build:
   bytes, and 128 for the uniforms of buffer 2 and up.
 - A function's summary (matched constants) comes first, then its constants
   on as many lines as they need.
+
+### Boot 74 (build 72) and what was added after it
+
+The reads at draw and at commit settle the geometry. Core Animation writes
+its matrix after binding the buffer and before the draw, and at commit it is
+right: column-major (1/32, 0, 0, 0), (0, -1/32, 0, 0), (0, 0, 0, 0),
+(-1, 1, 0, 1), pixels 0..64 to NDC -1..1, y flipped. The vertices are right
+too: red half4 for the first layer, green for the second. Its fragment
+uniforms (`CA::OGL::Metal::Uniform`, 256 bytes in buffer 1) are still zero
+at commit. All 60 fragment constants are matched. Among them,
+`fc_framebuffer_fetch` is 1, `fc_attachment_count` 1 and
+`fc_blend_function` 0x3e: pipeline blending is off, and the shader reads its
+target (`dest_0`, an `air.render_target` input) and blends itself. The
+shader's `air.static_init` gives `frg_has_color0 = (fc_generic &&
+fc_attachment_count != 0) || fc_dest_index == 0` (true here) and
+`has_dest_0` true for these constants. So this shader should differ from the
+test's (fetch off), yet both came out at 278 NIR instructions, and the frame
+is still zero.
+
+Added to the next build:
+
+- One line per fragment shader made into a pipeline. It gives the constants
+  it was translated with (count, nonzero, a digest) and what came out: the
+  outputs it writes, its output stores, framebuffer fetches (and whether
+  `uses_fbfetch_output` is set), UBO loads and discards.
+- Two new tests draw Core Animation's red layer by hand, without Core
+  Animation: the same pipeline, all 60 constants typed as the AIR declares
+  them, the same vertex layout, matrix, zero uniforms and indices, onto a
+  target cleared blue. They read back whether the left half is red and the
+  right half blue. One uses Core Animation's constants (fetch on, blend
+  0x3e), the other turns fetch and blend off. If only the first fails, the
+  framebuffer fetch is to blame. If both fail, the fixed-function shader
+  itself is.

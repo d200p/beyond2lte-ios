@@ -596,6 +596,167 @@ blend_pipeline(id device, id library)
 	return p;
 }
 
+/*
+ * M2c (boot 74): Core Animation's own draw, outside Core Animation. Its frame
+ * stayed zero though at commit its matrix, vertices and indices were right.
+ * Here is the same pipeline (fixed_vert_lph_spc + fixed_frag_lph_cph with all
+ * 60 of its fragment constants, typed as the AIR declares them:
+ * fc_attachment_count 1, fc_framebuffer_fetch 1, fc_blend_function 0x3e, the
+ * rest 0; the 5 vertex ones 0) and the same vertex layout (stride 48,
+ * colour half4 at 32). The matrix is the one it had at commit (pixels to NDC),
+ * with its zero fragment uniforms and its indices 0 1 2 2 3 0. One red layer
+ * goes over the left half of a target cleared blue. With `fetch` off,
+ * fc_framebuffer_fetch and fc_blend_function are 0, to tell the shader's
+ * blending apart from the rest.
+ */
+enum { CA_B = 53, CA_U = 49, CA_U2 = 50, CA_U4 = 52 };     /* MTLDataType Bool, UChar, UChar2, UChar4 */
+static const struct {
+	const char *name;
+	unsigned char type;
+} ca_constants[60] = {
+	{ "fc_generic", CA_B }, { "fc_vertex_layout", CA_U }, { "fc_framebuffer_fetch", CA_B },
+	{ "fc_attachment_count", CA_U }, { "fc_has_lod_bias", CA_B }, { "fc_has_noise_scale", CA_B },
+	{ "fc_has_ycbcr_matrix", CA_B }, { "fc_has_gamma_luts", CA_B }, { "fc_has_asg_77_weights", CA_B },
+	{ "fc_has_attachment_0", CA_B }, { "fc_has_attachment_1", CA_B }, { "fc_has_attachment_2", CA_B },
+	{ "fc_has_image_0A", CA_B }, { "fc_has_image_1A", CA_B }, { "fc_has_image_0B", CA_B },
+	{ "fc_has_image_1B", CA_B }, { "fc_has_image_0C", CA_B }, { "fc_has_image_1C", CA_B },
+	{ "fc_has_noise_tex", CA_B }, { "fc_has_lut_tex", CA_B }, { "fc_has_color_params", CA_B },
+	{ "fc_has_color_trc0", CA_B }, { "fc_has_color_trc1", CA_B }, { "fc_has_color_cube0", CA_B },
+	{ "fc_has_color_cube1", CA_B }, { "fc_texture_function", CA_U }, { "fc_blend_function", CA_U },
+	{ "fc_destination_function", CA_U }, { "fc_image_count", CA_U }, { "fc_dest_index", CA_U },
+	{ "fc_dest_count", CA_U }, { "fc_noise_width", CA_U }, { "fc_clamp_color", CA_B },
+	{ "fc_extended_range", CA_B }, { "fc_unbounded_range", CA_B }, { "fc_debug_xr", CA_B },
+	{ "fc_has_premultiply", CA_B }, { "fc_has_hdr_scale", CA_B }, { "fc_has_edr_factor", CA_B },
+	{ "fc_perspective", CA_B }, { "fc_image_function0", CA_U }, { "fc_image_function1", CA_U },
+	{ "fc_coord_function0", CA_U }, { "fc_coord_function1", CA_U }, { "fc_plane_count0", CA_U },
+	{ "fc_plane_count1", CA_U }, { "fc_texcoord_count0", CA_U }, { "fc_texcoord_count1", CA_U },
+	{ "fc_memoryless_index0", CA_U }, { "fc_memoryless_index1", CA_U }, { "fc_color_inputs0", CA_U },
+	{ "fc_color_inputs1", CA_U }, { "fc_color_opcodes0", CA_U4 }, { "fc_color_opcodes1", CA_U4 },
+	{ "fc_color_opcodes_ext0", CA_U2 }, { "fc_color_opcodes_ext1", CA_U2 }, { "fc_color_opaque0", CA_B },
+	{ "fc_color_opaque1", CA_B }, { "fc_filter0", CA_U }, { "fc_filter1", CA_U },
+};
+
+static void
+ca_uber_draw(id device, id queue, id library, bool fetch)
+{
+	char label[112], why[200], probes[160] = "";
+	snprintf(label, sizeof(label), "draw: Core Animation's red layer with its pipeline and data (framebuffer fetch %s)",
+	    fetch ? "on, blend 0x3e" : "off, blend 0");
+	id values = make("MTLFunctionConstantValues");
+	for (unsigned i = 0; i < 60; i++) {
+		uint8_t v[4] = { 0, 0, 0, 0 };
+		if (!strcmp(ca_constants[i].name, "fc_attachment_count")) {
+			v[0] = 1;
+		}
+		if (fetch && !strcmp(ca_constants[i].name, "fc_framebuffer_fetch")) {
+			v[0] = 1;
+		}
+		if (fetch && !strcmp(ca_constants[i].name, "fc_blend_function")) {
+			v[0] = 0x3e;
+		}
+		MSG(void, const void *, unsigned long, id)(values, S("setConstantValue:type:withName:"), v,
+		    ca_constants[i].type, nsstr(ca_constants[i].name));
+	}
+	id vvalues = make("MTLFunctionConstantValues");
+	static const char *const vnames[5] = { "fc_generic", "fc_perspective", "fc_texcoord_count0", "fc_texcoord_count1",
+		"fc_vertex_layout" };
+	static const unsigned char vtypes[5] = { CA_B, CA_B, CA_U, CA_U, CA_U };
+	for (unsigned i = 0; i < 5; i++) {
+		uint8_t zero = 0;
+		MSG(void, const void *, unsigned long, id)(vvalues, S("setConstantValue:type:withName:"), &zero, vtypes[i],
+		    nsstr(vnames[i]));
+	}
+	id error = nil;
+	id v = MSG(id, id, id, id *)(library, S("newFunctionWithName:constantValues:error:"), nsstr("fixed_vert_lph_spc"),
+	    vvalues, &error);
+	id f = v != nil ? MSG(id, id, id, id *)(library, S("newFunctionWithName:constantValues:error:"),
+	    nsstr("fixed_frag_lph_cph"), values, &error) : nil;
+	if (v == nil || f == nil) {
+		verdict(label, false, "functions %s and %s %s", name_of(v), name_of(f), error_text(error, why, sizeof(why)));
+		return;
+	}
+	id d = make("MTLRenderPipelineDescriptor");
+	MSG(void, id)(d, S("setVertexFunction:"), v);
+	MSG(void, id)(d, S("setFragmentFunction:"), f);
+	MSG(void, unsigned long)(at(MSG(id)(d, S("colorAttachments")), 0), S("setPixelFormat:"), 80);
+	id vd = MSG(id)(cls("MTLVertexDescriptor"), S("vertexDescriptor"));
+	id attributes = MSG(id)(vd, S("attributes"));
+	static const unsigned long format[] = { 31, 29, 29, 27 }, offset[] = { 0, 16, 24, 32 };
+	for (unsigned i = 0; i < 4; i++) {
+		id a = at(attributes, i);
+		MSG(void, unsigned long)(a, S("setFormat:"), format[i]);
+		MSG(void, unsigned long)(a, S("setOffset:"), offset[i]);
+		MSG(void, unsigned long)(a, S("setBufferIndex:"), 1);
+	}
+	MSG(void, unsigned long)(at(MSG(id)(vd, S("layouts")), 1), S("setStride:"), 48);
+	MSG(void, id)(d, S("setVertexDescriptor:"), vd);
+	error = nil;
+	id p = MSG(id, id, id *)(device, S("newRenderPipelineStateWithDescriptor:error:"), d, &error);
+	id td = MSG(id, unsigned long, unsigned long, unsigned long, bool)(cls("MTLTextureDescriptor"),
+	    S("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), 80, SIDE, SIDE, false);
+	MSG(void, unsigned long)(td, S("setUsage:"), 5);   /* shader read, render target */
+	id target = MSG(id, id)(device, S("newTextureWithDescriptor:"), td);
+	if (p == nil || target == nil) {
+		verdict(label, false, "pipeline %s, target %s %s", name_of(p), name_of(target),
+		    error_text(error, why, sizeof(why)));
+		return;
+	}
+	struct vertex {
+		float position[4], st0[2], st1[2];
+		uint16_t colour[4];
+		uint32_t pad[2];
+	} quad[4] = {
+		{ { 0, 0, 0, 1 }, { 0, 0 }, { 0, 0 }, { 0x3c00, 0, 0, 0x3c00 }, { 0, 0 } },
+		{ { 32, 0, 0, 1 }, { 0, 0 }, { 0, 0 }, { 0x3c00, 0, 0, 0x3c00 }, { 0, 0 } },
+		{ { 32, 64, 0, 1 }, { 0, 0 }, { 0, 0 }, { 0x3c00, 0, 0, 0x3c00 }, { 0, 0 } },
+		{ { 0, 64, 0, 1 }, { 0, 0 }, { 0, 0 }, { 0x3c00, 0, 0, 0x3c00 }, { 0, 0 } },
+	};
+	static const float mvp[16] = { 1.0f / 32, 0, 0, 0, 0, -1.0f / 32, 0, 0, 0, 0, 0, 0, -1, 1, 0, 1 };
+	static const uint8_t uniforms[256];
+	static const uint16_t indices[6] = { 0, 1, 2, 2, 3, 0 };
+	id vb = MSG(id, const void *, unsigned long, unsigned long)(device, S("newBufferWithBytes:length:options:"), quad,
+	    sizeof(quad), 0);
+	id ib = MSG(id, const void *, unsigned long, unsigned long)(device, S("newBufferWithBytes:length:options:"),
+	    indices, sizeof(indices), 0);
+	uint64_t ms = 0;
+	id cb = MSG(id)(queue, S("commandBuffer"));
+	id e = begin_pass(cb, target, (clear_color){ 0.25, 0.5, 0.75, 1.0 });
+	MSG(void, id)(e, S("setRenderPipelineState:"), p);
+	MSG(void, id, unsigned long, unsigned long)(e, S("setVertexBuffer:offset:atIndex:"), vb, 0, 1);
+	MSG(void, const void *, unsigned long, unsigned long)(e, S("setVertexBytes:length:atIndex:"), mvp, sizeof(mvp), 2);
+	MSG(void, const void *, unsigned long, unsigned long)(e, S("setFragmentBytes:length:atIndex:"), uniforms,
+	    sizeof(uniforms), 1);
+	MSG(void, unsigned long, unsigned long, unsigned long, id, unsigned long)(e,
+	    S("drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:"), 3 /* triangles */, 6,
+	    0 /* MTLIndexTypeUInt16 */, ib, 0);
+	MSG(void)(e, S("endEncoding"));
+	unsigned long status = run(cb, why, sizeof(why), &ms);
+	static uint8_t back[ROW * SIDE];
+	region_t whole = { { 0, 0, 0 }, { SIDE, SIDE, 1 } };
+	MSG(void, void *, unsigned long, region_t, unsigned long)(target, S("getBytes:bytesPerRow:fromRegion:mipmapLevel:"),
+	    back, ROW, whole, 0);
+	static const uint8_t red[4] = { 0, 0, 255, 255 }, blue[4] = { 191, 128, 64, 255 };
+	unsigned wrong_left = 0, wrong_right = 0;
+	for (unsigned y = 0; y < SIDE; y++) {
+		for (unsigned x = 0; x < SIDE; x++) {
+			if (x == 31 || x == 32) {
+				continue;
+			}
+			if (x < 31) {
+				wrong_left += !near(back + y * ROW + x * 4, red, 2);
+			} else {
+				wrong_right += !near(back + y * ROW + x * 4, blue, 2);
+			}
+		}
+	}
+	pixel_text(back, ROW, 16, 32, probes, sizeof(probes));
+	pixel_text(back, ROW, 48, 32, probes, sizeof(probes));
+	pixel_text(back, ROW, 2, 2, probes, sizeof(probes));
+	verdict(label, vb != nil && ib != nil && status == 4 && wrong_left == 0 && wrong_right == 0,
+	    "status %lu, %u of %u left pixels not red, %u of %u right ones not blue, %llu ms;%s %s", status, wrong_left,
+	    31u * SIDE, wrong_right, 31u * SIDE, (unsigned long long)ms, probes, why);
+}
+
 static id
 texture_rgba(id device, unsigned long usage)
 {
@@ -1021,6 +1182,9 @@ b2l_mtl_test_run(void)
 			}
 		}
 		compute_copy(device, queue, library);
+		/* M2c: Core Animation's draw by hand, with and without its blending */
+		ca_uber_draw(device, queue, library, true);
+		ca_uber_draw(device, queue, library, false);
 	}
 	events_and_heap(device, queue);
 	if (t != nil) {
