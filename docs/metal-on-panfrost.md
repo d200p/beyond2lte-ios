@@ -689,3 +689,26 @@ Panfrost sees the shader, and logs the mask. The label `b2l:all-targets`
 skips this, as the control. The `b2l:raw-scratch` and `b2l:narrow` controls
 stay, and with this fix in place they now say whether those two fixes are
 needed as well.
+
+### Boot 80 (build 78) and what was added after it
+
+The stores to the missing targets are gone (colours 1 and 2 of
+`fixed_frag_lph_cph`, colour 1 of `attachment_clear` and `image_rect_blit`),
+and the red layer is still `00000000` in every variant and control. With
+the fragment shader down to one store of the vertex colour, the colour
+itself has to be zero. No test so far carried a vertex attribute to a
+fragment output: `image_rect_blit` has no attributes, and the probes'
+`attachment_clear` ignores the colour.
+
+Panfrost counts a vertex shader's attributes as the inputs it reads
+(`pan_shader.c`: `attribute_count = util_bitcount64(inputs_read)`), and
+`bifrost_compile.c` indexes them by the input's driver location. Gallium's
+frontends number only the inputs a shader reads, so that fits. We numbered
+every declared input. `fixed_vert_lph_spc` declares five (position, two
+texture coordinates, colour, point size) and reads two, so its colour had
+driver location 3, past the 2 attribute descriptors Panfrost emits. The
+position, at location 0, was right, which is why the geometry always was.
+`b2l_mtl.c` now removes the vertex inputs a shader does not read before
+the driver locations are given, and the vertex elements follow them. The
+label `b2l:all-inputs` skips this, as the control. The earlier controls stay
+and now say which of the other fixes are still needed.

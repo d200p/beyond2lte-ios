@@ -647,8 +647,9 @@ static const struct {
  * varyings to 32-bit. `perspective` sets fc_perspective in both stages (the
  * smooth color_per instead); `tag` is the pipeline label: "b2l:raw-scratch"
  * leaves the scratch as it was, "b2l:narrow" the varyings 16-bit,
- * "b2l:all-targets" the stores to colours without an attachment (controls,
- * logged, not counted). */
+ * "b2l:all-targets" the stores to colours without an attachment,
+ * "b2l:all-inputs" the vertex inputs it does not read (controls, logged, not
+ * counted). */
 static void
 ca_uber_draw(id device, id queue, id library, bool fetch, bool clear_fs, bool perspective, const char *tag)
 {
@@ -1374,6 +1375,10 @@ b2l_mtl_test_run(void)
 		 * color_lin and NaN to colours 1 and 2, which have no attachment;
 		 * b2l_mtl.c now drops those stores. The control keeps them. */
 		ca_uber_draw(device, queue, library, false, false, false, "b2l:all-targets");
+		/* M2c (boot 80): still zero; its colour attribute sat past the
+		 * attributes Panfrost counts. b2l_mtl.c now numbers only the inputs
+		 * read; the control keeps the unread ones. */
+		ca_uber_draw(device, queue, library, false, false, false, "b2l:all-inputs");
 		/* M2c (boot 76): one change at a time from that vertex-shader draw;
 		 * boot 77: only std_vert0 drew. With b2l_mtl.c's output fixes now
 		 * on, the same probes, then the control without them (b2l:keep)

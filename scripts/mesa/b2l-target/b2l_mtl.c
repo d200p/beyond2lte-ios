@@ -2193,6 +2193,37 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 	if (fs != NULL) {
 		fold_scratch(fs, function_name(desc->fragment), desc->label);
 	}
+	/*
+	 * S10 port, M2c (boot 80): every variant of Core Animation's red layer
+	 * still came out zero with its fragment shader down to color0 = the
+	 * vertex colour, while its positions were right. Panfrost counts a vertex
+	 * shader's attributes as the inputs it reads (pan_shader.c:
+	 * attribute_count = bitcount(inputs_read)) and indexes them by driver
+	 * location, as Gallium's frontends number only the inputs a shader reads.
+	 * fixed_vert_lph_spc declares five (position, two texture coordinates,
+	 * colour, point size) and reads two, so its colour sat at location 3 of 2
+	 * attribute descriptors. The inputs it does not read go before the
+	 * locations are given; the elements below follow them. The tests' label
+	 * "b2l:all-inputs" skips this (their control).
+	 */
+	if (strstr(desc->label, "b2l:all-inputs") == NULL) {
+		static unsigned noted;
+		unsigned before = 0, after = 0;
+		nir_opt_dce(vs);
+		nir_foreach_shader_in_variable(var, vs) {
+			(void)var;
+			before++;
+		}
+		nir_remove_dead_variables(vs, nir_var_shader_in, NULL);
+		nir_foreach_shader_in_variable(var, vs) {
+			(void)var;
+			after++;
+		}
+		if (after != before && __atomic_fetch_add(&noted, 1, __ATOMIC_RELAXED) < 40) {
+			b2l_drm_note("mtl M2: %s: %u of %u vertex inputs not read, removed; the other %u numbered from 0",
+			    function_name(desc->vertex), before - after, before, after);
+		}
+	}
 	prepare_for_gallium(vs);
 	if (fs != NULL) {
 		prepare_for_gallium(fs);

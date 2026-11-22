@@ -94,7 +94,7 @@ static void delay_for_interval(unsigned n, unsigned unit) {
         assert(mode >= 11 && n == 360 && !deferred_s && !maps); deferred_s = n; return;
     }
     assert(unit == NSEC_PER_MSEC && (n == 1 || n == 20 || n == 200 ||
-        (mode >= 5 && (n == 9 || n == 100)) || (mode >= 11 && n == 6000))); now_us += n * 1000;
+        (mode >= 5 && (n == 9 || n == 100)) || (mode >= 11 && n == 6000) || (mode >= 18 && n == 1000))); now_us += n * 1000;
 }
 static kern_return_t kernel_thread_start(thread_continue_t fn, void *arg, thread_t *out) {
     assert(mode >= 11 && !thread_starts++ && !maps);
@@ -278,8 +278,15 @@ static unsigned have16, up17, posted15[16], nposted15;
  * and the scan: five results (one network twice), then the final event.
  * "scan_ver" answers major 2 as the chip did (boot 79), so escan version 2.
  * Faults: 12 the escan refused, 15 the final event never comes, 16
- * "scan_ver" unsupported (escan version 1). */
-static unsigned ev18[8], nev18, escan18, scan18_next;
+ * "scan_ver" unsupported (escan version 1), 17 the first escan refused with
+ * BCME_EPERM, 18 both. After an escan the console gains a line naming an
+ * address, which must reach the log masked. */
+static unsigned ev18[8], nev18, escan18, scan18_next, escans18;
+static void console18(const char *line) {
+    const unsigned at = tcm13(0x2f0110);
+    memcpy((uint8_t *)tcm11 + (0x2f1000 - 0x170000) + at, line, strlen(line));
+    tcm11_put(0x2f0110, at + (unsigned)strlen(line));
+}
 static uint8_t mask18[16];
 static const struct { uint8_t bssid[6]; uint16_t chanspec; int16_t rssi; } scan18[5] = {
     { { 0x00, 0x11, 0x22, 0xaa, 0xbb, 0x01 }, 0x1001, -40 },
@@ -383,6 +390,15 @@ static void iovar15(uint32_t value) {
         assert(mode >= 18 && length == 32 && up17);
         if (host13_fault == 16) status = -23;   /* BCME_UNSUPPORTED */
         else { data = version; resp = 32; }
+    } else if (cmd == 262 && !strcmp(input, "clmver")) {
+        static const char clm[64] = "API: 20.0\nData: Model.CLM 1.2\nCreation: test\n";
+        assert(mode >= 18 && length == 512); data = clm; resp = 64;
+    } else if (cmd == 262 && !strcmp(input, "country")) {
+        static const uint8_t country[12] = { 'X', 'Z', 0, 0, 7, 0, 0, 0, 'X', 'Z', 0, 0 };
+        assert(mode >= 18 && length == 32); data = country; resp = 12;
+    } else if (cmd == 262 && !strcmp(input, "mpc")) {
+        static const uint32_t mpc = 1;
+        assert(mode >= 18 && length == 32); data = &mpc; resp = 4;
     } else if (cmd == 262 && !strcmp(input, "event_msgs")) {
         assert(mode >= 18 && length == 32); data = mask18; resp = 16;
     } else if (cmd == 263 && !strcmp(input, "event_msgs")) {
@@ -404,7 +420,12 @@ static void iovar15(uint32_t value) {
         if (v2) assert(!q[55] && q[56] == 1 && !q[57] && !q[58] && !q[59]);     /* pad, passive (a word) */
         else assert(q[51] == 1);                                      /* passive (a byte) */
         assert(nprobes == UINT32_MAX && active == UINT32_MAX && passive == 110 && home == UINT32_MAX && !channels);
-        if (host13_fault == 12) status = -2; else start_scan = 1;
+        assert(escans18 < (host13_fault == 17 || host13_fault == 18 ? 2u : 1u));
+        escans18++;
+        console18("000001.500 wl0: escan from 00:90:4c:c5:12:38\n");
+        if (host13_fault == 12) status = -2;
+        else if (host13_fault == 18 || (host13_fault == 17 && escans18 == 1)) status = -26;   /* BCME_EPERM */
+        else start_scan = 1;
     } else {
         assert(0);
     }
@@ -907,7 +928,8 @@ static void reset(unsigned which, unsigned failure) {
     host13_fault = host_allocs = cleans = flushes = bme_ever = hostready13 = db0_13 = ioctl14_db = iovar15_db = 0; mailbox13 = 0;
     firmware_mac_mode = 0; memset(chip16, 0, sizeof(chip16)); have16 = up17 = 0;
     nposted15 = 1; posted15[0] = 2;     /* the first ioctl's answer takes buffer 1 */
-    nev18 = 4; ev18[0] = 3; ev18[1] = 4; ev18[2] = 5; ev18[3] = 6; escan18 = scan18_next = 0; memset(mask18, 0, 16);
+    nev18 = 4; ev18[0] = 3; ev18[1] = 4; ev18[2] = 5; ev18[3] = 6; escan18 = scan18_next = escans18 = 0;
+    memset(mask18, 0, 16);
     memset(host_cpu, 0, sizeof(host_cpu)); memset(host_dram, 0, sizeof(host_dram)); memset(host_dev, 0, sizeof(host_dev));
     wifi_host = NULL; wifi_host_pa = 0; wifi_master = 0;
     memset(tcm11, 0, sizeof(tcm11)); vector0 = 0; r4_io = 0x21; r4_reset = 0;
@@ -1579,8 +1601,8 @@ int main(void) {
     /* S10 port, mode 18: one passive scan. With the address already right
      * (2) and after the set (0); the escan refused (12); never finished (15). */
     mode = 18;
-    static const unsigned faults18[][2] = { { 0, 2 }, { 0, 0 }, { 12, 2 }, { 15, 2 }, { 16, 2 } };
-    for (unsigned k = 0; k < 5; k++) {
+    static const unsigned faults18[][2] = { { 0, 2 }, { 0, 0 }, { 12, 2 }, { 15, 2 }, { 16, 2 }, { 17, 2 }, { 18, 2 } };
+    for (unsigned k = 0; k < 7; k++) {
         reset(8, 0); firmware_fixture_nvram(good, sizeof(good)); nvram_fixture_bytes = sizeof(good);
         host13_fault = faults18[k][0]; firmware_mac_mode = faults18[k][1];
         b2l_wifi_diag_start(); verify_quiet();
@@ -1589,8 +1611,12 @@ int main(void) {
         assert(!strstr(logs, "ModelNet") && !strstr(logs, "aa:bb") && !strstr(logs, "0xaa2211") &&
             !strstr(logs, "0xbbaa") && !strstr(logs, "0x5e1cb202") && !strstr(logs, "0xc54c9000"));
         assert(strstr(logs, "mode 17: WLC_UP: status 0\n"));
-        assert(strstr(logs, "ioctl-response buffers 9 to 12 posted again, 1 used event buffers given back\n"));
-        const unsigned first = firmware_mac_mode == 2 ? 20 : 24;    /* scan_ver's item */
+        assert(strstr(logs, "ioctl-response buffers 7 to 12 posted again, 1 used event buffers given back\n"));
+        assert(strstr(logs, "console: 000001.500 wl0: escan from xx:xx:xx:xx:xx:xx\n") && !strstr(logs, "00:90:4c"));
+        assert(strstr(logs, "mode 18: clmver (status 0, 64 bytes): API: 20.0 | Data: Model.CLM 1.2 | Creation: test\n"));
+        assert(strstr(logs, "mode 18: country (status 0, 12 bytes): XZ rev 7, ccode XZ\n"));
+        assert(strstr(logs, "mode 18: mpc (status 0, 4 bytes): 1\n"));
+        const unsigned first = firmware_mac_mode == 2 ? 22 : 26;    /* scan_ver's item */
         char line[200];
         snprintf(line, sizeof(line), "mode 18: WLC_GET_VAR scan_ver sent (32 bytes in and out), write index %u, DB0 %#x",
             first + 1, 0xff000000u | (first + 1));
@@ -1601,15 +1627,27 @@ int main(void) {
         assert(strstr(logs, "mode 18: event_msgs (status 0, 16 bytes): ESCAN_RESULT off\n"));
         assert(strstr(logs, "mode 18: event_msgs set with ESCAN_RESULT: status 0\n"));
         snprintf(line, sizeof(line), "mode 18: WLC_SET_VAR escan sent (%u bytes in and out), write index %u, DB0 %#x",
-            v2 ? 86u : 78u, first + 4, 0xff000000u | (first + 4));
+            v2 ? 86u : 78u, first + 7, 0xff000000u | (first + 7));
         assert(strstr(logs, line));
+        if (host13_fault == 17 || host13_fault == 18) {
+            assert(strstr(logs, "mode 18: escan v2 (passive, every channel, 110 ms each) set: status -26\n"));
+            snprintf(line, sizeof(line), "mode 18: WLC_SET_VAR escan sent (86 bytes in and out), write index %u, DB0 %#x",
+                first + 10, 0xff000000u | (first + 10));
+            assert(strstr(logs, line) && escans18 == 2);
+            if (host13_fault == 18) {
+                assert(strstr(logs, "mode 18: escan v2 once more after 1 s: status -26\n") && !strstr(logs, "results,"));
+                continue;
+            }
+            assert(strstr(logs, "mode 18: escan v2 once more after 1 s: status 0\n"));
+        }
         if (host13_fault == 12) {
             assert(strstr(logs, "mode 18: escan v2 (passive, every channel, 110 ms each) set: status -2\n"));
             assert(!strstr(logs, "results,") && !escan18);
             continue;
         }
-        assert(strstr(logs, v2 ? "mode 18: escan v2 (passive, every channel, 110 ms each) set: status 0\n"
-                               : "mode 18: escan v1 (passive, every channel, 110 ms each) set: status 0\n"));
+        if (host13_fault != 17)
+            assert(strstr(logs, v2 ? "mode 18: escan v2 (passive, every channel, 110 ms each) set: status 0\n"
+                                   : "mode 18: escan v1 (passive, every channel, 110 ms each) set: status 0\n"));
         assert(strstr(logs, "mode 18: result 1: channel 1 (2.4 GHz), RSSI -40 dBm\n"));
         assert(strstr(logs, "mode 18: result 2: channel 6 (2.4 GHz), RSSI -67 dBm\n"));
         assert(strstr(logs, "mode 18: result 3: channel 1 (2.4 GHz), RSSI -42 dBm, a network heard before\n"));

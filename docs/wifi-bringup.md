@@ -910,3 +910,20 @@ layout `"scan_ver"` asks for, version 2 when its major is 2 (version 1 when
 it is not given). The test's firmware answers `scan_ver` as the chip did and
 checks every field of both layouts. A new case, `scan_ver` unsupported,
 covers version 1.
+
+Result (boot 80, build 78): the version-2 escan was taken as a layout and
+refused with status -26 (`BCME_EPERM`), which DHD treats as "scan not
+permitted at this time". The firmware's console said nothing about it,
+because the last console read used a deadline set before the ring set-up
+had started, long expired, and came back "unreadable".
+
+Added after it: the last console read gets a deadline of its own. Addresses
+in console lines (`xx:xx:xx:xx:xx:xx`, as `bcm_ether_ntoa` prints them)
+are masked, since from here on the console can name networks. Before the
+scan, mode 18 reads `"clmver"` (the firmware's CLM regulatory data, which a
+scan needs), `"country"` and `"mpc"`, all read only. For them it posts
+ioctl-response buffers 7 and 8 again as well. An escan refused with
+`BCME_EPERM` is sent once more 1 s later. The test's firmware answers the
+three reads, prints a console line with an address after each escan (the
+log must show it masked), and has two more cases: `BCME_EPERM` once, then
+results, and `BCME_EPERM` twice.

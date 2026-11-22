@@ -718,6 +718,27 @@ done:
     wlog("firmware %s: %s\n", what, text);
 }
 
+static int
+wifi_hex_digit(char c)
+{
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+/* S10 port: an address the firmware prints (bcm_ether_ntoa, xx:xx:xx:xx:xx:xx)
+ * never reaches the log; from mode 17 on the console can name networks. */
+static void
+wifi_mask_addresses(char *s, unsigned n)
+{
+    for (unsigned k = 0; k + 17 <= n; k++) {
+        int match = 1;
+        for (unsigned p = 0; match && p < 17; p++) match = p % 3 == 2 ? s[k + p] == ':' : wifi_hex_digit(s[k + p]);
+        if (!match) continue;
+        for (unsigned p = 0; p < 17; p++)
+            if (p % 3 != 2) s[k + p] = 'x';
+        k += 16;
+    }
+}
+
 /* The text before the console's write index, one log line per firmware line;
  * from *last on (mode 12's second read), at most 4 KiB. *last becomes the index. */
 static void
@@ -764,6 +785,7 @@ wifi_log_console(struct wifi_region *regions, uint32_t console, uint64_t deadlin
             if (text[j] == '\r') text[j] = ' ';
             else if (text[j] < 0x20 || text[j] > 0x7e) text[j] = '.';
         }
+        wifi_mask_addresses(text + start, i - start);
         if (i > start) {
             wlog("console: %s\n", text + start);
             lines++;
@@ -1386,11 +1408,11 @@ wifi_scan_event(struct wifi_scan *s, const uint8_t *packet, unsigned length)
 /*
  * S10 port, mode 18: one passive scan, the radio's first work on air, and
  * listening only: escan with the passive scan type sends no probe request,
- * so nothing is transmitted. First the ioctl-response buffers 9 to 12 are
+ * so nothing is transmitted. First the ioctl-response buffers 7 to 12 are
  * posted again (consumed by now, or never posted), the event buffers the
  * firmware has used are given back, "scan_ver" is read (which wl_scan_params
- * layout the firmware wants; version 1 is sent here), and "event_msgs" is
- * read and set with WLC_E_ESCAN_RESULT (69). Then "escan": version 1,
+ * layout the firmware wants), "clmver", "country" and "mpc" are read, and
+ * "event_msgs" is read and set with WLC_E_ESCAN_RESULT (69). Then "escan": version 1,
  * WL_SCAN_ACTION_START, any SSID, the broadcast BSSID, any BSS type,
  * passive, the firmware's own channel list, 110 ms each. For up to 8 s every
  * MSG_TYPE_WL_EVENT is read and its buffer posted again, as dhd_prot refills
@@ -1410,6 +1432,8 @@ wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
     *next += 2;
     if (wifi_host_repost(regions, info, last, *next, 11)) return -1;
     *next += 2;
+    if (wifi_host_repost(regions, info, last, *next, 7)) return -1;
+    *next += 2;
     FlushPoC_DcacheRegion((vm_offset_t)wifi_host + wifi_rings[2].offset,
         (unsigned long)wifi_rings[2].items * wifi_rings[2].size);
     unsigned at = last->d2h_write[0] < wifi_rings[2].items ? last->d2h_write[0] : 0, given = 0;
@@ -1425,7 +1449,7 @@ wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
             given++;
         }
     }
-    wlog("mode 18: completion read index %u given back; ioctl-response buffers 9 to 12 posted again, "
+    wlog("mode 18: completion read index %u given back; ioctl-response buffers 7 to 12 posted again, "
         "%u used event buffers given back\n", last->d2h_write[0], given);
     r = wifi_host_var(regions, info, d2h_mb, last, "mode 18", (*next)++, 262, "scan_ver", NULL, 0, 32,
         WIFI_HOST_IOVAR_IN + 0xc00u, &answer, &bytes, &status);
@@ -1439,6 +1463,44 @@ wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
             answer[0] | answer[1] << 8, answer[2] | answer[3] << 8, major, v2 ? 2u : 1u);
     else
         wlog("mode 18: scan_ver (status %d, %u bytes): not given; escan version 1 sent\n", status, bytes);
+    /* Boot 80: the escan v2 was refused with BCME_EPERM (-26). What the
+     * firmware holds that a scan depends on: its CLM (regulatory) data, its
+     * country and its power-saving mode, read only. */
+    r = wifi_host_var(regions, info, d2h_mb, last, "mode 18", (*next)++, 262, "clmver", NULL, 0, 512,
+        WIFI_HOST_IOVAR_IN + 0x400u, &answer, &bytes, &status);
+    if (r) return r < 0 ? -1 : 0;
+    char clm[200];
+    unsigned clm_n = 0;
+    for (unsigned k = 0; status == 0 && k < bytes && answer[k] && clm_n + 4 < sizeof(clm); k++) {
+        if (answer[k] == '\n') {
+            if (k + 1 < bytes && answer[k + 1]) { clm[clm_n++] = ' '; clm[clm_n++] = '|'; clm[clm_n++] = ' '; }
+        } else {
+            clm[clm_n++] = answer[k] >= 0x20 && answer[k] <= 0x7e ? (char)answer[k] : '.';
+        }
+    }
+    clm[clm_n] = 0;
+    wlog("mode 18: clmver (status %d, %u bytes): %s\n", status, bytes, clm_n ? clm : "(none)");
+    r = wifi_host_var(regions, info, d2h_mb, last, "mode 18", (*next)++, 262, "country", NULL, 0, 32,
+        WIFI_HOST_IOVAR_IN + 0x600u, &answer, &bytes, &status);
+    if (r) return r < 0 ? -1 : 0;
+    if (status == 0 && bytes >= 12) {
+        /* wl_country_t: country_abbrev[4], rev, ccode[4] */
+        char abbrev[5], ccode[5];
+        for (unsigned k = 0; k < 4; k++) {
+            abbrev[k] = answer[k] >= 0x20 && answer[k] <= 0x7e ? (char)answer[k] : 0;
+            ccode[k] = answer[8 + k] >= 0x20 && answer[8 + k] <= 0x7e ? (char)answer[8 + k] : 0;
+        }
+        abbrev[4] = ccode[4] = 0;
+        wlog("mode 18: country (status 0, %u bytes): %s rev %d, ccode %s\n", bytes, abbrev, (int)wifi_le32(answer + 4),
+            ccode);
+    } else {
+        wlog("mode 18: country (status %d, %u bytes): not given\n", status, bytes);
+    }
+    r = wifi_host_var(regions, info, d2h_mb, last, "mode 18", (*next)++, 262, "mpc", NULL, 0, 32,
+        WIFI_HOST_IOVAR_IN + 0x800u, &answer, &bytes, &status);
+    if (r) return r < 0 ? -1 : 0;
+    if (status == 0 && bytes >= 4) wlog("mode 18: mpc (status 0, %u bytes): %u\n", bytes, wifi_le32(answer));
+    else wlog("mode 18: mpc (status %d, %u bytes): not given\n", status, bytes);
     r = wifi_host_var(regions, info, d2h_mb, last, "mode 18", (*next)++, 262, "event_msgs", NULL, 0, 32,
         WIFI_HOST_IOVAR_IN + 0xe00u, &answer, &bytes, &status);
     if (r) return r < 0 ? -1 : 0;
@@ -1484,6 +1546,19 @@ wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
         WIFI_HOST_IOVAR_IN + 0x200u, &answer, &bytes, &status);
     if (r) return r < 0 ? -1 : 0;
     wlog("mode 18: escan v%u (passive, every channel, 110 ms each) set: status %d\n", v2 ? 2u : 1u, status);
+    if (status == -26) {
+        /* BCME_EPERM, which DHD takes as "not permitted at this time": once
+         * more, 1 s later, with ioctl-response buffers 11 and 12 again. */
+        delay_for_interval(1000, NSEC_PER_MSEC);
+        clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+        if (wifi_host_view(regions, info, d2h_mb, last, deadline) ||
+            wifi_host_repost(regions, info, last, *next, 11)) return -1;
+        *next += 2;
+        r = wifi_host_var(regions, info, d2h_mb, last, "mode 18", (*next)++, 263, "escan", params, size, size + 6,
+            WIFI_HOST_IOVAR_IN + 0xa00u, &answer, &bytes, &status);
+        if (r) return r < 0 ? -1 : 0;
+        wlog("mode 18: escan v%u once more after 1 s: status %d\n", v2 ? 2u : 1u, status);
+    }
     if (status) return 0;
     struct wifi_scan s;
     memset(&s, 0, sizeof(s));
@@ -1714,6 +1789,7 @@ wifi_host_start(struct wifi_region *regions, uint32_t mode, uint32_t shared, uin
     if (mode >= 14 && wifi_host_ioctl(regions, info, d2h_mb, &last)) return;
     if (mode >= 15 && wifi_host_hello(regions, mode, info, d2h_mb, &last)) return;
     wifi_log_host_writes(&last, mode < 15);
+    clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
     wifi_log_console(regions, console, deadline, console_index);
     return;
 stopped:
