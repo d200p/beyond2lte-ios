@@ -542,3 +542,29 @@ Added to the next build:
   0x3e), the other turns fetch and blend off. If only the first fails, the
   framebuffer fetch is to blame. If both fail, the fixed-function shader
   itself is.
+
+### Boot 75 (build 73) and what was added after it
+
+Both draws of Core Animation's red layer by hand left their target
+untouched, blue everywhere, with fetch on and with fetch off. The
+fragment-shader lines show why the two cannot differ: whatever the
+constants (the test's one, Core Animation's 60 with three nonzero, the
+fetch-off set with one nonzero), `fixed_frag_lph_cph` comes out the same.
+It writes outputs `0x70` (three colour targets) with 3 stores and 2
+framebuffer fetches, and `uses_fbfetch_output` is set even with
+`fc_framebuffer_fetch` 0. So the constants the `air.static_init`
+constructor turns into program-scope variables (and into the
+`__metal_implicit_fc_pred_*` predicates of the interface) do not specialise
+the shader. The output equals the destination, as a blend with a
+transparent source would give: blue over blue here, zero over zero in
+Core Animation's frame.
+
+Added to the next build:
+
+- The whole NIR of the first fragment shader with a nonzero constant (the
+  fetch-on draw by hand) and of its vertex shader, one log line per NIR
+  line. With it, the per-shader line also counts scratch loads and stores:
+  where the constructor's variables would sit if they are not folded.
+- A third draw by hand: Core Animation's vertex shader and data with
+  `attachment_clear_frag_lph`, which the other tests prove. A zero left
+  half clears the vertex shader, and blue there puts it in question too.

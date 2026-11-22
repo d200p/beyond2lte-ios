@@ -44,6 +44,8 @@
  * halted, before the power-off.
  * b2l_wifi_diag=14 (S10 port) also sends one ioctl, WLC_GET_MAGIC, once the
  * buffers are taken, and polls 2 s for its completions and its answer.
+ * b2l_wifi_diag=15 (S10 port) also asks, one at a time, for the "ver" and
+ * "cur_etheraddr" iovars (the MAC is compared, never logged).
  * A powered PHY alone does not establish that DBI/ELBI accesses are safe.
  * All addresses/offsets are sourced in docs/wifi-bringup.md.
  */
@@ -80,11 +82,13 @@
 #define WIFI_H2D_DB0 0x140u
 #define WIFI_H2D_DB1 0x144u
 #define WIFI_MAILBOX_INT 0xc30u
-#define WIFI_HOST_BYTES 0x18000u
+#define WIFI_HOST_BYTES 0x20000u
 #define WIFI_HOST_SCRATCH 0x11000u      /* DMA_D2H_SCRATCH_BUF_LEN 8 */
 #define WIFI_HOST_IOCTL_IN 0x11800u     /* mode 14: the ioctl's input */
 #define WIFI_HOST_IOCTL 0x12000u        /* two 8 KiB ioctl-response buffers */
 #define WIFI_HOST_EVENT 0x16000u        /* four 2 KiB event buffers */
+#define WIFI_HOST_IOCTL2 0x18000u       /* mode 15: two more ioctl-response buffers */
+#define WIFI_HOST_IOVAR_IN 0x1c000u     /* mode 15: the iovars' inputs, 512 bytes each */
 extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
 /* bcmmsgbuf.h sizes for IPC revision 7 (the default, not DHD_HTPUT_TUNABLES). */
 static const struct { uint32_t offset; uint16_t items, size; } wifi_rings[5] = {
@@ -993,6 +997,16 @@ wifi_host_poll(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
     return 0;
 }
 
+/* Where the buffer with this request id is, 0 for none. */
+static uint32_t
+wifi_host_buffer(uint32_t request)
+{
+    if (request >= 1 && request <= 2) return WIFI_HOST_IOCTL + 0x2000u * (request - 1);
+    if (request >= 3 && request <= 6) return WIFI_HOST_EVENT + 0x800u * (request - 3);
+    if (request >= 7 && request <= 8) return WIFI_HOST_IOCTL2 + 0x2000u * (request - 7);
+    return 0;
+}
+
 /* The completions the firmware wrote, with dhd_prot_d2h_sync_xorcsum's
  * check (all words XOR to zero), and anything in the scratch and buffers. */
 static void
@@ -1001,7 +1015,7 @@ wifi_log_host_writes(const struct wifi_host_view *v)
     FlushPoC_DcacheRegion((vm_offset_t)wifi_host, WIFI_HOST_BYTES);
     for (unsigned r = 2; r < 5; r++) {
         unsigned n = v->d2h_write[r - 2] < wifi_rings[r].items ? v->d2h_write[r - 2] : 0;
-        for (unsigned i = 0; i < n && i < (r == 2 ? 4u : 2u); i++) {
+        for (unsigned i = 0; i < n && i < (r == 2 ? 8u : 2u); i++) {
             const uint8_t *c = wifi_host + wifi_rings[r].offset + wifi_rings[r].size * i;
             uint32_t x = 0;
             for (unsigned w = 0; w < wifi_rings[r].size; w += 4) x ^= wifi_le32(c + w);
@@ -1013,8 +1027,10 @@ wifi_log_host_writes(const struct wifi_host_view *v)
     }
     const uint8_t *s = wifi_host + WIFI_HOST_SCRATCH;
     wlog("mode 13: scratch %#x %#x\n", wifi_le32(s), wifi_le32(s + 4));
+    /* The first six only: mode 15's two hold "ver" and the MAC address,
+     * which mode 15 reports itself (the MAC only as a comparison). */
     for (unsigned i = 0; i < 6; i++) {
-        const uint8_t *b = wifi_host + (i < 2 ? WIFI_HOST_IOCTL + 0x2000u * i : WIFI_HOST_EVENT + 0x800u * (i - 2));
+        const uint8_t *b = wifi_host + wifi_host_buffer(1 + i);
         uint32_t w0 = wifi_le32(b), w1 = wifi_le32(b + 4), w2 = wifi_le32(b + 8), w3 = wifi_le32(b + 12);
         if (w0 | w1 | w2 | w3)
             wlog("mode 13: %s buffer %u: %#x %#x %#x %#x\n", i < 2 ? "ioctl-response" : "event", i, w0, w1, w2, w3);
@@ -1060,6 +1076,138 @@ wifi_host_ioctl(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_
     wlog("mode 14: ioctl WLC_GET_MAGIC sent (4 bytes in and out, input at pa %#llx), write index 7, DB0 %#x\n",
         (unsigned long long)in, 0xff000007u);
     return wifi_host_poll(regions, info, d2h_mb, 7, "ioctl", last);
+}
+
+/* The NVRAM's macaddr=xx:xx:xx:xx:xx:xx, 0 when there is none. */
+static int
+wifi_nvram_mac(uint8_t mac[6])
+{
+    for (unsigned i = 0; wifi_nvram && i < wifi_nvram_bytes && wifi_nvram[i]; ) {
+        const char *e = (const char *)wifi_nvram + i;
+        unsigned length = 0;
+        while (i + length < wifi_nvram_bytes && e[length]) length++;
+        if (length == 25 && !strncmp(e, "macaddr=", 8)) {
+            for (unsigned b = 0; b < 6; b++) {
+                unsigned v = 0;
+                for (unsigned k = 0; k < 2; k++) {
+                    char c = e[8 + 3 * b + k];
+                    unsigned d = c >= '0' && c <= '9' ? (unsigned)(c - '0') : c >= 'a' && c <= 'f' ?
+                        (unsigned)(c - 'a' + 10) : c >= 'A' && c <= 'F' ? (unsigned)(c - 'A' + 10) : 16;
+                    if (d == 16) return 0;
+                    v = v << 4 | d;
+                }
+                mac[b] = (uint8_t)v;
+            }
+            return 1;
+        }
+        i += length + 1;
+    }
+    return 0;
+}
+
+/*
+ * S10 port, mode 15: what dhd_sync_with_dongle asks first, one ioctl at a
+ * time as DHD sends them: two more ioctl-response buffers posted, then
+ * WLC_GET_VAR (262) "ver" (256 bytes) and WLC_GET_VAR "cur_etheraddr" (32),
+ * each with its name as the input. The control completion read index is
+ * given back first, as DHD does after reading completions. "ver" is logged;
+ * the MAC address is not: it is only compared with the NVRAM's macaddr.
+ */
+static int
+wifi_host_iovar(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb, struct wifi_host_view *last,
+    unsigned item, const char *name, unsigned length)
+{
+    const uint32_t in_off = WIFI_HOST_IOVAR_IN + (item == 9 ? 0 : 0x200u);
+    const uint64_t in = wifi_host_pa + in_off;
+    const unsigned done = last->d2h_write[0];
+    uint64_t deadline;
+    memset(wifi_host + in_off, 0, 0x200);
+    memcpy(wifi_host + in_off, name, strlen(name) + 1);
+    uint8_t *e = wifi_host + wifi_rings[0].offset + wifi_rings[0].size * item;
+    memset(e, 0, wifi_rings[0].size);
+    e[0] = 0x09;                                /* MSG_TYPE_IOCTLPTR_REQ */
+    e[3] = (uint8_t)((254 + item) % 253);
+    wifi_put(e + 4, 0xfffe, 4);                 /* DHD_IOCTL_REQ_PKTID */
+    wifi_put(e + 8, 262, 4);                    /* WLC_GET_VAR */
+    wifi_put(e + 12, item == 9 ? 2 : 3, 2);     /* trans_id */
+    wifi_put(e + 14, length, 2);
+    wifi_put(e + 16, length, 2);
+    wifi_put(e + 24, (uint32_t)in, 4);
+    wifi_put(e + 28, (uint32_t)(in >> 32), 4);
+    CleanPoC_DcacheRegion((vm_offset_t)wifi_host + wifi_rings[0].offset, 11u * wifi_rings[0].size);
+    CleanPoC_DcacheRegion((vm_offset_t)wifi_host + in_off, 0x200);
+    clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+    if (wifi_tcm_set(regions, info[1], item + 1, deadline) ||
+        wifi_bp_write(regions, WIFI_PCIE_CORE + WIFI_H2D_DB0, 0xff000000u | (item + 1), deadline)) {
+        wlog("mode 15: %s: write index or DB0 failed\n", name);
+        return -1;
+    }
+    wlog("mode 15: WLC_GET_VAR %s sent (%u bytes in and out), write index %u, DB0 %#x\n", name, length, item + 1,
+        0xff000000u | (item + 1));
+    if (wifi_host_poll(regions, info, d2h_mb, item + 1, name, last)) return -1;
+    /* The completion for it: the newest MSG_TYPE_IOCTL_CMPLT after `done`. */
+    FlushPoC_DcacheRegion((vm_offset_t)wifi_host, WIFI_HOST_BYTES);
+    unsigned upto = last->d2h_write[0] < wifi_rings[2].items ? last->d2h_write[0] : 0, found = 0;
+    for (unsigned i = done; i < upto; i++) {
+        const uint8_t *c = wifi_host + wifi_rings[2].offset + wifi_rings[2].size * i;
+        if (c[0] != 0x0c) continue;
+        int status = (int16_t)(c[8] | c[9] << 8);
+        unsigned resp = c[12] | c[13] << 8;
+        uint32_t at = wifi_host_buffer(wifi_le32(c + 4));
+        if (!at || resp > 0x2000u) {
+            wlog("mode 15: %s: completion %u status %d, %u bytes in buffer id %#x (not ours)\n", name, i, status,
+                resp, wifi_le32(c + 4));
+            continue;
+        }
+        const uint8_t *b = wifi_host + at;
+        found = 1;
+        if (!strcmp(name, "ver")) {
+            char text[200];
+            unsigned n = 0;
+            for (; n < resp && n < sizeof(text) - 1 && b[n]; n++) text[n] = b[n] >= 0x20 && b[n] <= 0x7e ? (char)b[n] : ' ';
+            text[n] = 0;
+            wlog("mode 15: ver (status %d, %u bytes): %s\n", status, resp, text);
+        } else {
+            uint8_t mac[6];
+            int have = wifi_nvram_mac(mac);
+            wlog("mode 15: cur_etheraddr (status %d, %u bytes): %s\n", status, resp,
+                resp < 6 ? "too short" : !have ? "no NVRAM macaddr to compare" :
+                memcmp(b, mac, 6) ? "DIFFERS from the NVRAM macaddr" : "matches the NVRAM macaddr");
+        }
+    }
+    if (!found) wlog("mode 15: %s: no completion in 2 s\n", name);
+    return found ? 0 : 1;
+}
+
+static int
+wifi_host_hello(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb, struct wifi_host_view *last)
+{
+    uint64_t deadline;
+    if (last->h2d_read != 7 || last->d2h_write[0] < 2) {
+        wlog("mode 15: the ioctl was not answered (read %u, completions %u); no iovars sent\n", last->h2d_read,
+            last->d2h_write[0]);
+        return 0;
+    }
+    clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+    /* dhd_prot_upd_read_idx: the completions read so far are the host's */
+    if (wifi_tcm_set(regions, info[4], last->d2h_write[0], deadline)) return -1;
+    for (unsigned i = 0; i < 2; i++) {
+        uint8_t *item = wifi_host + wifi_rings[0].offset + wifi_rings[0].size * (7 + i);
+        uint64_t pa = wifi_host_pa + WIFI_HOST_IOCTL2 + 0x2000u * i;
+        memset(item, 0, wifi_rings[0].size);
+        item[0] = 0x0b;                         /* MSG_TYPE_IOCTLRESP_BUF_POST */
+        item[3] = (uint8_t)((254 + 7 + i) % 253);
+        wifi_put(item + 4, 7 + i, 4);
+        wifi_put(item + 8, 0x2000u, 2);
+        wifi_put(item + 16, (uint32_t)pa, 4);
+        wifi_put(item + 20, (uint32_t)(pa >> 32), 4);
+    }
+    wlog("mode 15: completion read index %u given back; two more ioctl-response buffers posted\n",
+        last->d2h_write[0]);
+    /* One at a time, as DHD: the second only once the first has its answer. */
+    int r = wifi_host_iovar(regions, info, d2h_mb, last, 9, "ver", 256);
+    if (r) return r < 0 ? -1 : 0;
+    return wifi_host_iovar(regions, info, d2h_mb, last, 10, "cur_etheraddr", 32) < 0 ? -1 : 0;
 }
 
 /*
@@ -1169,6 +1317,7 @@ wifi_host_start(struct wifi_region *regions, uint32_t mode, uint32_t shared, uin
         0xff000006u);
     if (wifi_host_poll(regions, info, d2h_mb, 6, "posts", &last)) return;
     if (mode >= 14 && wifi_host_ioctl(regions, info, d2h_mb, &last)) return;
+    if (mode >= 15 && wifi_host_hello(regions, info, d2h_mb, &last)) return;
     wifi_log_host_writes(&last);
     wifi_log_console(regions, console, deadline, console_index);
     return;
@@ -1880,7 +2029,7 @@ void
 b2l_wifi_diag_start(void)
 {
     uint32_t mode = 0;
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 14) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 15) {
         wlog("diagnostic disabled; no MMIO access\n");
         return;
     }

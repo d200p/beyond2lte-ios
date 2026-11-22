@@ -636,12 +636,20 @@ static const struct {
 	{ "fc_color_opaque1", CA_B }, { "fc_filter0", CA_U }, { "fc_filter1", CA_U },
 };
 
+/* `clear_fs` (boot 75: both draws left the target untouched): Core
+ * Animation's vertex shader with attachment_clear_frag_lph, a fragment
+ * shader the other tests prove, which writes zero. A zero left half clears
+ * the vertex shader, blue there means the vertex shader is at fault too. */
 static void
-ca_uber_draw(id device, id queue, id library, bool fetch)
+ca_uber_draw(id device, id queue, id library, bool fetch, bool clear_fs)
 {
 	char label[112], why[200], probes[160] = "";
-	snprintf(label, sizeof(label), "draw: Core Animation's red layer with its pipeline and data (framebuffer fetch %s)",
-	    fetch ? "on, blend 0x3e" : "off, blend 0");
+	if (clear_fs) {
+		snprintf(label, sizeof(label), "draw: Core Animation's vertex shader and data with attachment_clear");
+	} else {
+		snprintf(label, sizeof(label), "draw: Core Animation's red layer with its pipeline and data "
+		    "(framebuffer fetch %s)", fetch ? "on, blend 0x3e" : "off, blend 0");
+	}
 	id values = make("MTLFunctionConstantValues");
 	for (unsigned i = 0; i < 60; i++) {
 		uint8_t v[4] = { 0, 0, 0, 0 };
@@ -669,8 +677,9 @@ ca_uber_draw(id device, id queue, id library, bool fetch)
 	id error = nil;
 	id v = MSG(id, id, id, id *)(library, S("newFunctionWithName:constantValues:error:"), nsstr("fixed_vert_lph_spc"),
 	    vvalues, &error);
-	id f = v != nil ? MSG(id, id, id, id *)(library, S("newFunctionWithName:constantValues:error:"),
-	    nsstr("fixed_frag_lph_cph"), values, &error) : nil;
+	id f = v == nil ? nil : clear_fs ? MSG(id, id)(library, S("newFunctionWithName:"), nsstr("attachment_clear_frag_lph")) :
+	    MSG(id, id, id, id *)(library, S("newFunctionWithName:constantValues:error:"), nsstr("fixed_frag_lph_cph"),
+	    values, &error);
 	if (v == nil || f == nil) {
 		verdict(label, false, "functions %s and %s %s", name_of(v), name_of(f), error_text(error, why, sizeof(why)));
 		return;
@@ -735,7 +744,7 @@ ca_uber_draw(id device, id queue, id library, bool fetch)
 	region_t whole = { { 0, 0, 0 }, { SIDE, SIDE, 1 } };
 	MSG(void, void *, unsigned long, region_t, unsigned long)(target, S("getBytes:bytesPerRow:fromRegion:mipmapLevel:"),
 	    back, ROW, whole, 0);
-	static const uint8_t red[4] = { 0, 0, 255, 255 }, blue[4] = { 191, 128, 64, 255 };
+	static const uint8_t red[4] = { 0, 0, 255, 255 }, zero[4] = { 0, 0, 0, 0 }, blue[4] = { 191, 128, 64, 255 };
 	unsigned wrong_left = 0, wrong_right = 0;
 	for (unsigned y = 0; y < SIDE; y++) {
 		for (unsigned x = 0; x < SIDE; x++) {
@@ -743,7 +752,7 @@ ca_uber_draw(id device, id queue, id library, bool fetch)
 				continue;
 			}
 			if (x < 31) {
-				wrong_left += !near(back + y * ROW + x * 4, red, 2);
+				wrong_left += !near(back + y * ROW + x * 4, clear_fs ? zero : red, 2);
 			} else {
 				wrong_right += !near(back + y * ROW + x * 4, blue, 2);
 			}
@@ -753,8 +762,8 @@ ca_uber_draw(id device, id queue, id library, bool fetch)
 	pixel_text(back, ROW, 48, 32, probes, sizeof(probes));
 	pixel_text(back, ROW, 2, 2, probes, sizeof(probes));
 	verdict(label, vb != nil && ib != nil && status == 4 && wrong_left == 0 && wrong_right == 0,
-	    "status %lu, %u of %u left pixels not red, %u of %u right ones not blue, %llu ms;%s %s", status, wrong_left,
-	    31u * SIDE, wrong_right, 31u * SIDE, (unsigned long long)ms, probes, why);
+	    "status %lu, %u of %u left pixels not %s, %u of %u right ones not blue, %llu ms;%s %s", status, wrong_left,
+	    31u * SIDE, clear_fs ? "zero" : "red", wrong_right, 31u * SIDE, (unsigned long long)ms, probes, why);
 }
 
 static id
@@ -1183,8 +1192,9 @@ b2l_mtl_test_run(void)
 		}
 		compute_copy(device, queue, library);
 		/* M2c: Core Animation's draw by hand, with and without its blending */
-		ca_uber_draw(device, queue, library, true);
-		ca_uber_draw(device, queue, library, false);
+		ca_uber_draw(device, queue, library, true, false);
+		ca_uber_draw(device, queue, library, false, false);
+		ca_uber_draw(device, queue, library, false, true);
 	}
 	events_and_heap(device, queue);
 	if (t != nil) {

@@ -783,3 +783,34 @@ chip writing phone memory, the second half of the message-buffer path.
 Every completion is logged with its xorcsum check. The test's firmware
 checks the request at the doorbell and answers as above. Its faults are
 buffers never taken (no ioctl is sent) and an ioctl never answered.
+
+Result (boot 75, build 73): mode 14 worked. The firmware took the ioctl
+(read index 7 of 7) and wrote two control completions with valid xorcsums:
+`MSG_TYPE_IOCTLPTR_REQ_ACK` (request `0xfffe`, status 0) and
+`MSG_TYPE_IOCTL_CMPLT` (request id 2, so the second posted buffer; status
+0, response length 4, transaction 1). It also wrote `0x14e46c77`, the WLC
+magic, in that buffer. Both items carry the D2H phase bit (`flags 0x80`),
+and `PCIMailBoxInt` read `0x1`. The message-buffer path now works both
+ways: the chip reads requests from phone memory and writes answers there.
+
+## S10: the first iovars (mode 15)
+
+`b2l_wifi_diag=15` repeats mode 14 and, if the ioctl was answered, asks
+what `dhd_sync_with_dongle` asks first. One request goes at a time, as DHD
+sends them:
+
+1. It gives the control completion read index back
+   (`dhd_prot_upd_read_idx`) and posts two more 8 KiB ioctl-response
+   buffers (request ids 7 and 8).
+2. It sends `WLC_GET_VAR` (262) for `"ver"` (256 bytes in and out, the name
+   as the input) and logs the version string from the completion's buffer.
+3. Only if that one was answered, it sends `WLC_GET_VAR` for
+   `"cur_etheraddr"` (32 bytes). The address is not logged. It is compared
+   with the NVRAM's `macaddr=` and only the verdict (matches or differs) is
+   written. For the same reason the buffer dump stops at the first six
+   buffers.
+
+The test's firmware checks both requests and answers each with an ack, a
+completion and the value. Its faults are the ioctl never answered (no
+iovar is sent) and `"ver"` never answered (`"cur_etheraddr"` is not sent).
+The test also checks that the MAC never reaches the log.

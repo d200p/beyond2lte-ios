@@ -123,12 +123,12 @@ typedef void *vm_map_t;
 #define VM_KERN_MEMORY_IOKIT 1
 #define ptoa_64(p) ((uint64_t)(p) << PAGE_SHIFT)
 #define HOST13_PA 0x9f000000u
-#define HOST13_BYTES 0x18000u
+#define HOST13_BYTES 0x20000u
 static vm_map_t kernel_map;
 static pmap_t kernel_pmap;
 static _Alignas(16384) uint8_t host_cpu[HOST13_BYTES];
 static uint8_t host_dram[HOST13_BYTES], host_dev[HOST13_BYTES];
-static unsigned host13_fault, host_allocs, cleans, flushes, bme_ever, hostready13, db0_13, ioctl14_db;
+static unsigned host13_fault, host_allocs, cleans, flushes, bme_ever, hostready13, db0_13, ioctl14_db, iovar15_db;
 static uint32_t mailbox13;
 static kern_return_t kmem_alloc_contig(vm_map_t map, vm_offset_t *va, vm_size_t size, vm_offset_t mask,
     ppnum_t max, ppnum_t pmask, unsigned flags, int tag) {
@@ -225,6 +225,7 @@ static void start_firmware(void) {
 }
 /* Mode 13 writes into the running firmware's RAM only what dhd_prot_init
  * writes, all before bus mastering except the control submission write index. */
+static uint32_t tcm13(uint32_t address) { return tcm11[(address - 0x170000) / 4]; }
 static void tcm13_write(uint32_t address, uint32_t value) {
     int ring_mem = address >= 0x2f0600 && address < 0x2f0650 && (address & 15) >= 4;
     int index = (address >= 0x2f0700 && address < 0x2f0708) || (address >= 0x2f0710 && address < 0x2f0718) ||
@@ -232,11 +233,13 @@ static void tcm13_write(uint32_t address, uint32_t value) {
     int shared = address == 0x2f0034 || address == 0x2f0038 || address == 0x2f003c || address == 0x2f0054;
     assert(mode >= 13 && host_allocs == 1 && (ring_mem || index || shared));
     if (address == 0x2f0700 && value)
-        assert(master13_on() && hostready13 && ((value == 6 && !db0_13) || (mode >= 14 && value == 7 && db0_13 == 1)));
+        assert(master13_on() && hostready13 && ((value == 6 && !db0_13) || (mode >= 14 && value == 7 && db0_13 == 1) ||
+            (mode >= 15 && value == 10 && db0_13 == 2) || (mode >= 15 && value == 11 && db0_13 == 3)));
+    else if (address == 0x2f0730 && value)
+        assert(mode >= 15 && master13_on() && db0_13 == 2 && value == tcm13(0x2f0720)); /* read index given back */
     else assert(!bme_ever && !hostready13 && (index ? !value : 1));
     tcm11[(address - 0x170000) / 4] = value;
 }
-static uint32_t tcm13(uint32_t address) { return tcm11[(address - 0x170000) / 4]; }
 /* Mode 14: the ioctl, then (unless fault 7) its acknowledgement, its
  * completion and WLC_IOCTL_MAGIC in the first ioctl-response buffer. */
 static void ioctl14(uint32_t value) {
@@ -264,6 +267,49 @@ static void ioctl14(uint32_t value) {
     tcm11[(0x2f0720 - 0x170000) / 4] = 3;
     mailbox13 = 0x200;
 }
+/* Mode 15: two more ioctl-response buffers with "ver", then
+ * "cur_etheraddr"; each answered (unless fault 8) with an ack, a completion
+ * and the value in the next buffer. */
+static void iovar15(uint32_t value) {
+    assert(mode >= 15 && (db0_13 == 2 || db0_13 == 3));
+    const unsigned item = db0_13 == 2 ? 9 : 10;
+    assert(value == (0xff000000u | (item + 1)) && tcm13(0x2f0700) == item + 1);
+    db0_13++; iovar15_db++;
+    if (item == 9) {
+        assert(tcm13(0x2f0730) == 3);
+        for (unsigned i = 0; i < 2; i++) {
+            const uint8_t *b = host_dram + 40 * (7 + i);
+            uint32_t request, low, high;
+            memcpy(&request, b + 4, 4); memcpy(&low, b + 16, 4); memcpy(&high, b + 20, 4);
+            assert(b[0] == 0x0b && (unsigned)b[3] == 8 + i && request == 7 + i && (b[8] | b[9] << 8) == 0x2000);
+            assert(low == HOST13_PA + 0x18000 + 0x2000 * i && !high);
+        }
+    }
+    const uint8_t *e = host_dram + 40 * item;
+    uint32_t request, cmd, low, high;
+    memcpy(&request, e + 4, 4); memcpy(&cmd, e + 8, 4); memcpy(&low, e + 24, 4); memcpy(&high, e + 28, 4);
+    const unsigned length = item == 9 ? 256 : 32;
+    assert(e[0] == 9 && (unsigned)e[3] == item + 1 && request == 0xfffe && cmd == 262);
+    assert((e[12] | e[13] << 8) == (item == 9 ? 2 : 3) && (unsigned)(e[14] | e[15] << 8) == length &&
+        (unsigned)(e[16] | e[17] << 8) == length);
+    assert(low == HOST13_PA + 0x1c000 + (item == 9 ? 0 : 0x200) && !high);
+    assert(!strcmp((const char *)host_dram + (low - HOST13_PA), item == 9 ? "ver" : "cur_etheraddr"));
+    if (host13_fault == 8) return;      /* never answered */
+    tcm11[(0x2f0710 - 0x170000) / 4] = item + 1;
+    const unsigned at = tcm13(0x2f0720), id = item == 9 ? 7 : 8, resp = item == 9 ? 32 : 6;
+    uint32_t ack[6] = { (uint32_t)(at + 1) << 24 | 0x0au, 0xfffe, 0x00020000u, 0, 0, 0 };
+    uint32_t cpl[6] = { (uint32_t)(at + 2) << 24 | 0x0cu, id, 0x00020000u, resp | (item == 9 ? 2u : 3u) << 16, 262, 0 };
+    ack[5] = ack[0] ^ ack[1] ^ ack[2] ^ ack[3] ^ ack[4];
+    cpl[5] = cpl[0] ^ cpl[1] ^ cpl[2] ^ cpl[3] ^ cpl[4];
+    memcpy(host_dram + 0x5000 + 24 * at, ack, sizeof(ack)); memset(host_dev + 0x5000 + 24 * at, 1, sizeof(ack));
+    memcpy(host_dram + 0x5000 + 24 * (at + 1), cpl, sizeof(cpl)); memset(host_dev + 0x5000 + 24 * (at + 1), 1, sizeof(cpl));
+    static const char version[32] = "wl0: test version 18.41.117";
+    static const uint8_t mac[6] = { 0x00, 0x90, 0x4c, 0xc5, 0x12, 0x38 };  /* the NVRAM fixture's macaddr */
+    const unsigned buffer = 0x18000 + 0x2000 * (id - 7);
+    memcpy(host_dram + buffer, item == 9 ? (const void *)version : (const void *)mac, resp);
+    memset(host_dev + buffer, 1, resp);
+    tcm11[(0x2f0720 - 0x170000) / 4] = at + 2;
+}
 static void pcie13_write(unsigned off, uint32_t value) {
     static const uint32_t rings[5][3] = { { 0x00000, 64, 40 }, { 0x01000, 512, 32 }, { 0x05000, 64, 24 },
                                           { 0x06000, 1024, 24 }, { 0x0c000, 512, 40 } };
@@ -283,6 +329,7 @@ static void pcie13_write(unsigned off, uint32_t value) {
     }
     assert(off == 0x140 && hostready13);
     if (db0_13 == 1) { ioctl14(value); return; }
+    if (db0_13 >= 2) { iovar15(value); return; }
     assert(value == 0xff000006 && !db0_13++ && tcm13(0x2f0700) == 6);
     for (unsigned i = 0; i < 6; i++) {
         const uint8_t *item = host_dram + 40 * i;   /* what the chip reads */
@@ -732,7 +779,7 @@ static void reset(unsigned which, unsigned failure) {
     if (mode >= 10) { firmware_fixture_setup(); memset(firmware_ram, 0, sizeof(firmware_ram)); }
     for (unsigned b = 0; b < 13; b++) bank_info[b] = mode >= 10 ? (b == 4 ? 0x88c07 : 0x108c0f) : b < 5 ? 0x203 : 0xf;
     thread_starts = thread_fail = threads_released = deferred_s = 0;
-    host13_fault = host_allocs = cleans = flushes = bme_ever = hostready13 = db0_13 = ioctl14_db = 0; mailbox13 = 0;
+    host13_fault = host_allocs = cleans = flushes = bme_ever = hostready13 = db0_13 = ioctl14_db = iovar15_db = 0; mailbox13 = 0;
     memset(host_cpu, 0, sizeof(host_cpu)); memset(host_dram, 0, sizeof(host_dram)); memset(host_dev, 0, sizeof(host_dev));
     wifi_host = NULL; wifi_host_pa = 0; wifi_master = 0;
     memset(tcm11, 0, sizeof(tcm11)); vector0 = 0; r4_io = 0x21; r4_reset = 0;
@@ -1239,7 +1286,7 @@ int main(void) {
             assert(strstr(logs, "is not contiguous owned RAM below 4 GiB; kept, not used") && !bme_ever && !cleans);
             continue;
         }
-        assert(strstr(logs, "mode 13: host memory 98304 bytes at pa 0x9f000000: contiguous owned RAM"));
+        assert(strstr(logs, "mode 13: host memory 131072 bytes at pa 0x9f000000: contiguous owned RAM"));
         assert(strstr(logs, "five common rings at pa 0x9f000000, indices zero, scratch at 0x9f011000 (8 bytes), "
             "host_cap 0x801407: written and read back"));
         assert(bme_ever);
@@ -1304,6 +1351,39 @@ int main(void) {
         assert(strstr(logs, "mode 13: ioctl-response buffer 0: 0x14e46c77 0 0 0\n"));
     }
     puts("Firmware ioctl: WLC_GET_MAGIC as dhd_fillup_ioct_reqst sends it, after the buffers only, its acknowledgement, completion and answer read back passed");
+    /* S10 port, mode 15: "ver", then "cur_etheraddr". 7: the first ioctl is
+     * never answered, so no iovar; 8: "ver" is never answered, so no
+     * cur_etheraddr. */
+    mode = 15;
+    static const unsigned faults15[] = { 0, 7, 8 };
+    for (unsigned k = 0; k < 3; k++) {
+        unsigned fault = faults15[k];
+        reset(8, 0); firmware_fixture_nvram(good, sizeof(good)); nvram_fixture_bytes = sizeof(good);
+        host13_fault = fault;
+        b2l_wifi_diag_start(); verify_quiet();
+        assert(strstr(logs, "mode 15: deferred run finished") && strstr(logs, "cleanup=verified"));
+        assert(strstr(logs, "bus mastering off again (endpoint, then root port)"));
+        assert(!wifi_master && !(memory[8][4/4] & 4) && !(memory[9][0x2004/4] & 4));
+        if (fault == 7) {
+            assert(strstr(logs, "mode 15: the ioctl was not answered (read 6, completions 1); no iovars sent"));
+            assert(!iovar15_db);
+            continue;
+        }
+        assert(strstr(logs, "mode 15: completion read index 3 given back; two more ioctl-response buffers posted"));
+        assert(strstr(logs, "mode 15: WLC_GET_VAR ver sent (256 bytes in and out), write index 10, DB0 0xff00000a"));
+        if (fault == 8) {
+            assert(strstr(logs, "mode 15: ver: no completion in 2 s") && iovar15_db == 1);
+            assert(!strstr(logs, "WLC_GET_VAR cur_etheraddr"));
+            continue;
+        }
+        assert(iovar15_db == 2 && db0_13 == 4);
+        assert(strstr(logs, "mode 15: ver (status 0, 32 bytes): wl0: test version 18.41.117\n"));
+        assert(strstr(logs, "mode 15: WLC_GET_VAR cur_etheraddr sent (32 bytes in and out), write index 11, DB0 0xff00000b"));
+        assert(strstr(logs, "mode 15: cur_etheraddr (status 0, 6 bytes): matches the NVRAM macaddr\n"));
+        assert(!strstr(logs, "00:90:4c") && !strstr(logs, "0xc54c9000"));
+        assert(strstr(logs, "ring 2 item 6: type 0xc"));
+    }
+    puts("Firmware iovars: buffers reposted, read index given back, ver then cur_etheraddr one at a time, the MAC compared and never logged passed");
 }
 '''
 

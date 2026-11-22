@@ -1610,14 +1610,11 @@ write_mask(uint32_t m)
  * was translated with (count, nonzero, a digest), what it writes, how many
  * output stores, framebuffer fetches, UBO loads and discards it has.
  */
-static void
+static unsigned
 note_fragment(struct b2l_mtl_function *f, nir_shader *fs)
 {
 	static unsigned noted;
-	if (__atomic_fetch_add(&noted, 1, __ATOMIC_RELAXED) >= 40) {
-		return;
-	}
-	unsigned fetches = 0, stores = 0, discards = 0, ubo_loads = 0;
+	unsigned fetches = 0, stores = 0, discards = 0, ubo_loads = 0, scratch_loads = 0, scratch_stores = 0;
 	nir_foreach_function_impl(impl, fs) {
 		nir_foreach_block(block, impl) {
 			nir_foreach_instr(instr, block) {
@@ -1644,6 +1641,12 @@ note_fragment(struct b2l_mtl_function *f, nir_shader *fs)
 				case nir_intrinsic_load_ubo:
 					ubo_loads++;
 					break;
+				case nir_intrinsic_load_scratch:
+					scratch_loads++;
+					break;
+				case nir_intrinsic_store_scratch:
+					scratch_stores++;
+					break;
 				default:
 					break;
 				}
@@ -1663,10 +1666,40 @@ note_fragment(struct b2l_mtl_function *f, nir_shader *fs)
 			digest = (digest ^ (uint8_t)(v >> (8 * b))) * 16777619u;
 		}
 	}
-	b2l_drm_note("mtl M2: fragment %s: %u of %u constants supplied (%u nonzero, digest %08x); writes 0x%llx, "
-	    "%u output stores, %u framebuffer fetches%s, %u UBO loads, %u discards", function_name(f), supplied,
-	    f->num_constants, nonzero, digest, (unsigned long long)fs->info.outputs_written, stores, fetches,
-	    fs->info.fs.uses_fbfetch_output ? " (fbfetch on)" : "", ubo_loads, discards);
+	if (__atomic_fetch_add(&noted, 1, __ATOMIC_RELAXED) < 40) {
+		b2l_drm_note("mtl M2: fragment %s: %u of %u constants supplied (%u nonzero, digest %08x); writes 0x%llx, "
+		    "%u output stores, %u framebuffer fetches%s, %u UBO loads, %u discards, scratch %u loads %u stores",
+		    function_name(f), supplied, f->num_constants, nonzero, digest,
+		    (unsigned long long)fs->info.outputs_written, stores, fetches,
+		    fs->info.fs.uses_fbfetch_output ? " (fbfetch on)" : "", ubo_loads, discards, scratch_loads,
+		    scratch_stores);
+	}
+	return nonzero;
+}
+
+/*
+ * S10 port, M2c (boot 75): every function constant set gave the same fragment
+ * shader (writes 0x70, 3 stores, 2 fetches, fbfetch on even with
+ * fc_framebuffer_fetch 0), and Core Animation's draw by hand left its target
+ * untouched either way. The whole NIR of the first fragment shader with a
+ * nonzero constant and of its vertex shader, as the driver gets them: one
+ * log line per NIR line, cut at 220 bytes ('+' when cut), once a process.
+ */
+static void
+dump_nir(const char *what, nir_shader *nir)
+{
+	char *text = nir_shader_as_str(nir, NULL);
+	if (text == NULL) {
+		return;
+	}
+	unsigned line = 0;
+	for (const char *p = text; *p != 0 && line < 1500; line++) {
+		const char *end = strchr(p, '\n');
+		size_t n = end != NULL ? (size_t)(end - p) : strlen(p);
+		b2l_drm_note("mtl M2: nir %s %u: %.*s%s", what, line, (int)(n > 220 ? 220 : n), p, n > 220 ? "+" : "");
+		p += n + (end != NULL);
+	}
+	ralloc_free(text);
 }
 
 static struct b2l_mtl_render_pipeline *
@@ -1719,7 +1752,14 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 	prepare_for_gallium(vs);
 	if (fs != NULL) {
 		prepare_for_gallium(fs);
-		note_fragment(desc->fragment, fs);
+		static bool dumped;
+		if (note_fragment(desc->fragment, fs) != 0 && !__atomic_test_and_set(&dumped, __ATOMIC_RELAXED)) {
+			b2l_drm_note("mtl M2: nir dump of %s + %s begins", function_name(desc->vertex),
+			    function_name(desc->fragment));
+			dump_nir("fs", fs);
+			dump_nir("vs", vs);
+			b2l_drm_note("mtl M2: nir dump ends");
+		}
 	}
 
 	/* Vertex elements in driver-location order, from the descriptor. */
