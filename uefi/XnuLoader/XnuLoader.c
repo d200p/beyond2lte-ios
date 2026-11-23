@@ -449,8 +449,12 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * WLC_UP, "isup" and the first events; no scan or join.
                  * Mode 18 (boot 78: WLC_UP answered 0, the interface event
                  * came): also one passive scan (listening only, nothing
-                 * transmitted), logged as counts, channels and levels. */
-                "b2l_wifi_diag=18 "
+                 * transmitted), logged as counts, channels and levels.
+                 * Mode 19 (boots 79-81: the escan was refused, the firmware
+                 * had only "Generic.Min" CLM data and the country "#n"):
+                 * first the board's CLM blob from the attachment (B2LFW003)
+                 * with "clmload", as DHD loads it, and the country XZ/11. */
+                "b2l_wifi_diag=19 "
                 /* S10 port: test boots come back to TWRP by themselves 8 min
                  * after start (after Metal's test and Wi-Fi's deferred run),
                  * synced like the volume-key chord (B2LPower.cpp). */
@@ -460,8 +464,12 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * library asks Metal for its device in a child process 60 s
                  * after start ("mtl M1:"). Level 1 shows the device to that
                  * child only: Core Animation stays on OpenGL ES. The M0 sweep
-                 * (b2l_mtl_sweep=1) is done and off. */
-                "b2l_metal=1 "
+                 * (b2l_mtl_sweep=1) is done and off. M3 (boot 81: Core
+                 * Animation's CARenderer drew its layers on Metal): level 2
+                 * also shows it to backboardd, so the lock screen and home
+                 * screen are drawn by Metal; a backboardd started again in the
+                 * same boot is not shown it and draws with OpenGL ES. */
+                "b2l_metal=2 "
                 /* S10: the per-syscall/IPC boundary diagnostics are off in
                  * the working system. With b2l_diag=1 every system call of
                  * backboardd, SpringBoard and Settings went through them, and

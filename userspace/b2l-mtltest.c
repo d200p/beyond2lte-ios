@@ -1363,22 +1363,28 @@ b2l_mtl_test_run(void)
 		compute_copy(device, queue, library);
 		/* M2c: Core Animation's draw by hand, with and without its blending */
 		ca_uber_draw(device, queue, library, true, false, false, NULL);
-		ca_uber_draw(device, queue, library, false, false, false, NULL);
+		/* boot 81: with fc_blend_function 0 the layer comes out zero while
+		 * Core Animation's own constants (0x3e) draw it and CARenderer draws:
+		 * 0 is not "copy" in its encoding. A control from now on. */
+		ca_uber_draw(device, queue, library, false, false, false, "fetch-off");
 		ca_uber_draw(device, queue, library, false, true, false, NULL);
 		/* M2c (boot 78): the red layer was 00000000. The smooth colour
 		 * (fc_perspective), then the controls without the scratch
 		 * forwarding and without the 32-bit varyings. */
-		ca_uber_draw(device, queue, library, false, false, true, NULL);
-		ca_uber_draw(device, queue, library, false, false, false, "b2l:raw-scratch");
-		ca_uber_draw(device, queue, library, false, false, false, "b2l:narrow");
+		ca_uber_draw(device, queue, library, true, false, true, NULL);
+		ca_uber_draw(device, queue, library, true, false, false, "b2l:raw-scratch");
+		ca_uber_draw(device, queue, library, true, false, false, "b2l:narrow");
 		/* M2c (boot 79): still 00000000 with the shader down to color0 =
 		 * color_lin and NaN to colours 1 and 2, which have no attachment;
 		 * b2l_mtl.c now drops those stores. The control keeps them. */
-		ca_uber_draw(device, queue, library, false, false, false, "b2l:all-targets");
+		ca_uber_draw(device, queue, library, true, false, false, "b2l:all-targets");
 		/* M2c (boot 80): still zero; its colour attribute sat past the
 		 * attributes Panfrost counts. b2l_mtl.c now numbers only the inputs
 		 * read; the control keeps the unread ones. */
-		ca_uber_draw(device, queue, library, false, false, false, "b2l:all-inputs");
+		ca_uber_draw(device, queue, library, true, false, false, "b2l:all-inputs");
+		/* M3 (boot 81: all of them drew with Core Animation's own constants
+		 * once the inputs were numbered right): the controls above, now with
+		 * those constants, say which of the other fixes are still needed. */
 		/* M2c (boot 76): one change at a time from that vertex-shader draw;
 		 * boot 77: only std_vert0 drew. With b2l_mtl.c's output fixes now
 		 * on, the same probes, then the control without them (b2l:keep)

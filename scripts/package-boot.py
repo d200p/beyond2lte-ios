@@ -88,6 +88,11 @@ def read_wifi_mac(path):
 # follows the firmware in the attachment (B2LFW002, uefi/XnuLoader/BootMetadata.h).
 WIFI_NVRAM_MAX = 32768
 NVRAM_LAYOUT_ERROR = "private NVRAM is not in the DHD-processed layout"
+# S10 port: Wi-Fi mode 19 loads the board's CLM (regulatory) blob with DHD's
+# "clmload"; it follows the NVRAM (B2LFW003). Only this blob is accepted.
+WIFI_CLM_SIZE = 29464
+WIFI_CLM_SHA256 = "5e5520cc655991923b7c88c85c2c027d22b0462dc6a3bfd8fd191cbefae33300"
+WIFI_CLM_MAX = 65536
 
 
 def check_nvram(data):
@@ -136,9 +141,9 @@ def process_nvram(text):
     return bytes(out)
 
 
-def wifi_metadata(mac=None, firmware_size=0, nvram_size=0):
+def wifi_metadata(mac=None, firmware_size=0, nvram_size=0, clm_size=0):
     if mac is None:
-        if firmware_size or nvram_size:
+        if firmware_size or nvram_size or clm_size:
             raise ValueError("private firmware requires WiFi metadata")
         return bytes(32)
     if len(mac) != 6 or not any(mac) or mac[0] & 1:
@@ -147,7 +152,11 @@ def wifi_metadata(mac=None, firmware_size=0, nvram_size=0):
         raise ValueError("unsupported private firmware length")
     if nvram_size and (not firmware_size or nvram_size > WIFI_NVRAM_MAX or nvram_size % 4):
         raise ValueError("unsupported private NVRAM length")
-    if nvram_size:
+    if clm_size and (not nvram_size or clm_size > WIFI_CLM_MAX or clm_size % 4):
+        raise ValueError("unsupported private CLM length")
+    if clm_size:
+        extension = b"B2LFW003" + struct.pack("<IHHH", firmware_size, nvram_size, nvram_size ^ 0xffff, clm_size // 4)
+    elif nvram_size:
         extension = b"B2LFW002" + struct.pack("<IHH", firmware_size, nvram_size, nvram_size ^ 0xffff) + bytes(2)
     elif firmware_size:
         extension = b"B2LFW001" + struct.pack("<I", firmware_size) + bytes(6)
@@ -157,11 +166,11 @@ def wifi_metadata(mac=None, firmware_size=0, nvram_size=0):
 
 
 def wifi_attachment(field):
-    """(firmware bytes, NVRAM bytes) the descriptor declares."""
+    """(firmware bytes, NVRAM bytes, CLM bytes) the descriptor declares."""
     extension = field[14:]
     if extension == bytes(18):
-        return 0, 0
-    if len(extension) != 18 or extension[:7] != b"B2LFW00" or extension[7:8] not in (b"1", b"2"):
+        return 0, 0, 0
+    if len(extension) != 18 or extension[:7] != b"B2LFW00" or extension[7:8] not in (b"1", b"2", b"3"):
         raise ValueError("invalid private firmware descriptor")
     size = struct.unpack_from("<I", extension, 8)[0]
     if size != WIFI_FIRMWARE_SIZE:
@@ -169,11 +178,13 @@ def wifi_attachment(field):
     if extension[7:8] == b"1":
         if any(extension[12:]):
             raise ValueError("invalid private firmware descriptor")
-        return size, 0
-    nvram, check = struct.unpack_from("<HH", extension, 12)
-    if any(extension[16:]) or not nvram or nvram ^ check != 0xffff or nvram > WIFI_NVRAM_MAX or nvram % 4:
+        return size, 0, 0
+    nvram, check, clm_words = struct.unpack_from("<HHH", extension, 12)
+    if not nvram or nvram ^ check != 0xffff or nvram > WIFI_NVRAM_MAX or nvram % 4:
         raise ValueError("invalid private firmware descriptor")
-    return size, nvram
+    if (extension[7:8] == b"2") != (clm_words == 0) or clm_words * 4 > WIFI_CLM_MAX:
+        raise ValueError("invalid private firmware descriptor")
+    return size, nvram, clm_words * 4
 
 
 def wifi_firmware_size(field):
@@ -273,15 +284,18 @@ def check_boot(path):
     if size < 4096 or size > 128 * 1024 * 1024 or trailer + offset + size > len(data):
         raise ValueError("invalid BOOT trailer size")
     wifi_present = check_wifi_metadata(data[trailer + 288:trailer + 320])
-    firmware_size, nvram_size = wifi_attachment(data[trailer + 288:trailer + 320])
+    firmware_size, nvram_size, clm_size = wifi_attachment(data[trailer + 288:trailer + 320])
     firmware_offset = trailer + offset + size
-    if firmware_offset + firmware_size + nvram_size != len(data):
+    if firmware_offset + firmware_size + nvram_size + clm_size != len(data):
         raise ValueError("invalid BOOT trailer size")
     firmware_end = firmware_offset + firmware_size
     if firmware_size and hashlib.sha256(data[firmware_offset:firmware_end]).hexdigest() != WIFI_FIRMWARE_SHA256:
         raise ValueError("private firmware SHA-256 mismatch")
     if nvram_size:
-        check_nvram(data[firmware_end:])
+        check_nvram(data[firmware_end:firmware_end + nvram_size])
+    if clm_size and (clm_size != WIFI_CLM_SIZE or
+                     hashlib.sha256(data[firmware_end + nvram_size:]).hexdigest() != WIFI_CLM_SHA256):
+        raise ValueError("private CLM blob SHA-256 mismatch")
     macho = trailer + offset
     if struct.unpack_from("<III", data, macho) != (0xfeedfacf, 0x0100000c, 0):
         raise ValueError("XNU must be a thin, plain ARM64 Mach-O image")
@@ -290,7 +304,7 @@ def check_boot(path):
             "payload_version": PAYLOAD_VERSION, "seed_bytes": SEED_SIZE,
             "wifi_mac_present": wifi_present, "wifi_firmware_bytes": firmware_size,
             "wifi_firmware_file_offset": firmware_offset if firmware_size else None,
-            "wifi_nvram_bytes": nvram_size}
+            "wifi_nvram_bytes": nvram_size, "wifi_clm_bytes": clm_size}
 
 
 def main():

@@ -35,9 +35,12 @@
  *
  * Who is shown the device: boot argument b2l_metal=1 shows it only to a
  * process started with B2L_MTL_TEST in its environment (userspace/b2l-gpu.c
- * starts one); b2l_metal=2 (M3) shows it to everyone, backboardd included. A
- * process not shown it gets no class registered, so Metal finds no device and
- * Core Animation stays on its OpenGL ES path.
+ * starts one); b2l_metal=2 (M3) to that process and to backboardd, Core
+ * Animation's render server, which draws the lock screen and home screen;
+ * b2l_metal=3 to every process. A process not shown it gets no class
+ * registered, so Metal finds no device and Core Animation stays on its
+ * OpenGL ES path -- which is also the fallback: a backboardd started again in
+ * the same boot (after a crash, or the watchdog's kill) is not shown it.
  */
 #include <Block.h>
 #include <CoreFoundation/CoreFoundation.h>
@@ -55,7 +58,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/sysctl.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include "b2l_mali_uapi.h"
 #include "b2l_mtl.h"
@@ -157,13 +163,69 @@ metal_level(void)
 	return 0;
 }
 
+/*
+ * S10 port, M3: how many times backboardd started with the device before
+ * this start, in this boot, and this start counted. The count lives in a
+ * marker in /private/var/tmp written at each start; one older than the boot
+ * counts for nothing (as b2l-gpu.c's once_per_boot markers). -1 when the
+ * marker cannot be written: then the device is not shown either.
+ */
+#define BACKBOARDD_MARKER "/private/var/tmp/b2l-metal-backboardd.starts"
+
+static int
+backboardd_starts_before(void)
+{
+	struct timeval boot;
+	size_t size = sizeof(boot);
+	int mib[2] = { CTL_KERN, KERN_BOOTTIME };
+	struct stat st;
+	unsigned before = 0;
+	if (sysctl(mib, 2, &boot, &size, NULL, 0) != 0) {
+		return -1;
+	}
+	if (stat(BACKBOARDD_MARKER, &st) == 0 && st.st_mtime >= boot.tv_sec) {
+		char text[16] = "";
+		int fd = open(BACKBOARDD_MARKER, O_RDONLY);
+		if (fd >= 0) {
+			ssize_t got = read(fd, text, sizeof(text) - 1);
+			close(fd);
+			text[got > 0 ? got : 0] = 0;
+		}
+		before = (unsigned)atoi(text);
+		if (before == 0) {
+			before = 1;     /* a marker of this boot that says nothing: a start all the same */
+		}
+	}
+	char text[16];
+	int n = snprintf(text, sizeof(text), "%u\n", before + 1);
+	int fd = open(BACKBOARDD_MARKER, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0 || n <= 0 || write(fd, text, (size_t)n) != n) {
+		if (fd >= 0) {
+			close(fd);
+		}
+		return -1;
+	}
+	close(fd);
+	return (int)before;
+}
+
 static bool
 shown_to_this_process(int level)
 {
-	if (level >= 2) {
+	if (getenv("B2L_MTL_TEST") != NULL) {
+		return level >= 1;
+	}
+	if (level >= 2 && strcmp(getprogname(), "backboardd") == 0) {
+		int before = backboardd_starts_before();
+		if (before != 0) {
+			say("M3: backboardd %s: not shown the device, Core Animation on OpenGL ES",
+			    before < 0 ? "start marker not written" : "started again in this boot");
+			return false;
+		}
+		say("M3: backboardd's first start in this boot: shown the device (b2l_metal=%d)", level);
 		return true;
 	}
-	return level >= 1 && getenv("B2L_MTL_TEST") != NULL;
+	return level >= 3;
 }
 
 /* ---- Objective-C from C ---- */
@@ -2592,11 +2654,18 @@ cmdbuf_commit(id self, SEL _cmd)
 	s->gpu_start = start;
 	s->gpu_end = start + (double)gpu_us / 1e6;
 	unsigned long n = __atomic_add_fetch(&committed_count, 1, __ATOMIC_RELAXED);
+	/* M3: backboardd draws every frame; errors after the first 32 and the
+	 * rest are counted, with one line every 600 command buffers. */
+	static unsigned long error_count;
+	static unsigned long long gpu_total_us;
+	__atomic_add_fetch(&gpu_total_us, gpu_us, __ATOMIC_RELAXED);
 	if (result != 0) {
 		s->status = CB_ERROR;
 		/* MTLCommandBufferErrorInternal (1) */
 		s->error = objc_retain(make_error("MTLCommandBufferErrorDomain", 1, why));
-		say("command buffer %lu: error: %s", n, why);
+		if (__atomic_add_fetch(&error_count, 1, __ATOMIC_RELAXED) <= 32) {
+			say("command buffer %lu: error: %s", n, why);
+		}
 	} else {
 		s->status = CB_COMPLETED;
 		/* S10 port: labelled buffers too (the test labels markers around
@@ -2610,6 +2679,11 @@ cmdbuf_commit(id self, SEL _cmd)
 			CFStringGetCString((CFStringRef)label, text, sizeof(text), kCFStringEncodingUTF8);
 			say("command buffer %lu \"%s\": done in %llu us", n, text, (unsigned long long)gpu_us);
 		}
+	}
+	if (n % 600 == 0) {
+		say("command buffers: %lu so far, %lu errors, GPU %llu ms in all", n,
+		    __atomic_load_n(&error_count, __ATOMIC_RELAXED),
+		    __atomic_load_n(&gpu_total_us, __ATOMIC_RELAXED) / 1000);
 	}
 	/* the GPU's work is done: the events this buffer signals take their values */
 	for (unsigned i = 0; i < s->num_signals; i++) {
@@ -4497,7 +4571,7 @@ b2l_metal_load(void)
 {
 	int level = metal_level();
 	if (!shown_to_this_process(level)) {
-		say("not shown the device (b2l_metal=%d: 1 is the B2L_MTL_TEST process only, 2 everyone)", level);
+		say("not shown the device (b2l_metal=%d: 1 the B2L_MTL_TEST process, 2 also backboardd, 3 everyone)", level);
 		return;
 	}
 	gDeviceBase = objc_getClass("_MTLDevice");

@@ -181,6 +181,39 @@ class BootTrailerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             pack.wifi_metadata(mac, 0, 64)
 
+    def test_private_clm_follows_the_nvram(self):
+        # S10 port: Wi-Fi mode 19's B2LFW003 attachment, the board CLM blob after the NVRAM.
+        mac = bytes([2,0,0,0,0,1])
+        firmware = bytes((i * 13 + 7) & 255 for i in range(pack.WIFI_FIRMWARE_SIZE))
+        nvram = pack.process_nvram(b"boardtype=0x1234\nboardrev=0x1101\n")
+        clm = b"BLOB" + bytes((i * 7 + 3) & 255 for i in range(pack.WIFI_CLM_SIZE - 4))
+        header = bytearray(pack.make_payload_header(4096, mac))
+        header[288:320] = pack.wifi_metadata(mac, len(firmware), len(nvram), len(clm))
+        self.assertEqual(bytes(header[302:310]), b"B2LFW003")
+        self.assertEqual(struct.unpack_from("<H", header, 318)[0], len(clm) // 4)
+        prefix = self.android_prefix()
+        image = prefix + header + self.kernel() + firmware + nvram + clm
+        with patch.object(pack, 'WIFI_FIRMWARE_SHA256', hashlib.sha256(firmware).hexdigest()):
+            with self.assertRaisesRegex(ValueError, 'CLM'):
+                self.verify(image)  # synthetic bytes are not the pinned blob
+            with patch.object(pack, 'WIFI_CLM_SHA256', hashlib.sha256(clm).hexdigest()):
+                result = self.verify(image)
+                self.assertEqual((result['wifi_nvram_bytes'], result['wifi_clm_bytes']), (len(nvram), len(clm)))
+                for bad in [image[:-4], image + bytes(4), image[:-1] + bytes([image[-1] ^ 1])]:
+                    with self.assertRaises(ValueError):
+                        self.verify(bad)
+                for i in range(14, 32):
+                    for bit in range(8):
+                        broken = bytearray(image)
+                        broken[len(prefix) + 288 + i] ^= 1 << bit
+                        with self.assertRaises(ValueError):
+                            self.verify(bytes(broken))
+        for size in (2, pack.WIFI_CLM_MAX + 4):
+            with self.assertRaises(ValueError):
+                pack.wifi_metadata(mac, len(firmware), len(nvram), size)
+        with self.assertRaises(ValueError):
+            pack.wifi_metadata(mac, len(firmware), 0, 64)
+
     def test_truncated_v2_seed_rejected(self):
         with self.assertRaisesRegex(ValueError, "truncated"):
             self.verify(self.android_prefix() + pack.make_payload_header(4096)[:200])

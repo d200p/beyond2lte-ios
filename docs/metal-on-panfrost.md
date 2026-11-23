@@ -712,3 +712,28 @@ position, at location 0, was right, which is why the geometry always was.
 the driver locations are given, and the vertex elements follow them. The
 label `b2l:all-inputs` skips this, as the control. The earlier controls stay
 and now say which of the other fixes are still needed.
+
+### Boot 81 (build 79): M2c done, and M3 as written
+
+With only the inputs it reads numbered, Core Animation's vertex colour
+reaches the fragment shader. The red layer with Core Animation's own
+constants comes out red (`ffff0000`). `CARenderer`, Core Animation's own
+Metal renderer driven from outside, draws its two layers: red
+`ffff0000` and green `ff00ff00`. 41 of 43 passed. The `b2l:all-inputs`
+control, which keeps the old numbering, is zero again. The two that failed
+used `fc_blend_function` 0, which is not "copy" in Core Animation's
+encoding: that draw is now a control. Most of the other controls ran with
+blend 0 and said nothing. They now use Core Animation's own constants, so
+they say whether the scratch forwarding, the 32-bit varyings and the
+dropped stores are still needed.
+
+M3 (`b2l_metal=2`): the plug-in shows the device to backboardd too, and
+Core Animation's render server draws the lock screen and home screen with
+Metal. `b2l_metal=3` shows it to every process. As the OpenGL ES
+bring-up had one, there is a fallback. Each backboardd start counts itself
+in `/private/var/tmp/b2l-metal-backboardd.starts`, and a backboardd started
+again in the same boot (after a crash, or the watchdog's kill) is not shown
+the device. Core Animation then stays on OpenGL ES. A marker older than the
+boot counts for nothing. Command buffer errors after the first 32 are only
+counted, and every 600 command buffers one line gives the count, the
+errors and the GPU time.

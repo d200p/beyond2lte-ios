@@ -927,3 +927,44 @@ ioctl-response buffers 7 and 8 again as well. An escan refused with
 three reads, prints a console line with an address after each escan (the
 log must show it masked), and has two more cases: `BCME_EPERM` once, then
 results, and `BCME_EPERM` twice.
+
+Result (boot 81, build 79): `"clmver"` answered "API: 20.0, Data:
+Generic.Min" (the firmware's minimal built-in data, compiled 2022-07-19)
+and `"country"` "#n" (the null country), with `"mpc"` 1. The escan was
+refused with `BCME_EPERM` twice. Without the board's CLM data the firmware
+enables no channel, so this is what DHD's `dhd_apply_default_clm` exists for.
+
+## S10: the board's CLM blob (mode 19)
+
+`b2l_wifi_diag=19` loads the board's CLM (regulatory) blob, as DHD does,
+after the MAC and before `WLC_UP`, then runs mode 17 and mode 18:
+
+1. The blob (`bcmdhd_clm.blob` of the same vendor image, 29 464 bytes)
+   follows the NVRAM in the private attachment. Its descriptor is
+   B2LFW003: B2LFW002's fields, then the blob's size in words in the last
+   two bytes. `scripts/package-boot.py` checks it and
+   `scripts/attach-wifi-firmware.py --clm` adds it. Only this blob is
+   accepted (size and SHA-256 pinned, like the firmware). XNU finds it by
+   that size and hash at the end of the attachment, and the NVRAM is what
+   lies before it. The loader and device tree are unchanged, except for the
+   larger attachment bound.
+2. `WLC_SET_VAR "clmload"` in chunks of 1400 bytes (`dhd_download_blob`).
+   Each chunk is a `wl_dload_data_t`: the flag `DLOAD_HANDLER_VER << 12`,
+   with `DL_BEGIN` on the first chunk and `DL_END` on the last;
+   `DL_TYPE_CLM`; the chunk's length; crc 0. The bytes follow, padded to 8.
+   That is 22 ioctls, each waited for only until its completion.
+3. `"clmload_status"`, `"clmver"` and `"country"`. If the country is still
+   "#n", it is set to "XZ" rev 11, the universal code Samsung's DHD uses
+   when it knows no other (`dhd_custom_sec.c`). This is a setting:
+   nothing is transmitted.
+
+The control rings now wrap. Every completion is counted from the start, and
+an item's slot is its count modulo the 64-item ring. The ioctl-response and
+event buffers the firmware holds are tracked, so none is posted twice. The
+mode-18 ring limits are gone. Host memory is 256 KiB, so one chunk's input
+fits. The test's firmware takes the chunks and checks every byte against
+its synthetic blob. It answers "Generic.Min" and "#n" until the blob is
+loaded, and refuses an escan with `BCME_EPERM` until the country is set, as
+the chip did. Its cases are with the MAC set and already right, with no
+blob in the attachment, and with a chunk unanswered; the first two take both
+rings round.

@@ -63,7 +63,7 @@ static uint32_t original_viewport;
 static uint32_t original_endpoint_command, original_bar0;
 static uint64_t enabled_at;
 static uint64_t now_us;
-static char logs[131072];
+static char logs[262144];
 static unsigned log_size;
 static void b2l_early_trace(const char *fmt, ...) {
     va_list args; va_start(args, fmt);
@@ -123,7 +123,7 @@ typedef void *vm_map_t;
 #define VM_KERN_MEMORY_IOKIT 1
 #define ptoa_64(p) ((uint64_t)(p) << PAGE_SHIFT)
 #define HOST13_PA 0x9f000000u
-#define HOST13_BYTES 0x20000u
+#define HOST13_BYTES 0x40000u
 static vm_map_t kernel_map;
 static pmap_t kernel_pmap;
 static _Alignas(16384) uint8_t host_cpu[HOST13_BYTES];
@@ -232,10 +232,10 @@ static void tcm13_write(uint32_t address, uint32_t value) {
         (address >= 0x2f0720 && address < 0x2f072c) || (address >= 0x2f0730 && address < 0x2f073c);
     int shared = address == 0x2f0034 || address == 0x2f0038 || address == 0x2f003c || address == 0x2f0054;
     assert(mode >= 13 && host_allocs == 1 && (ring_mem || index || shared));
-    if (address == 0x2f0700 && value)
-        assert(master13_on() && hostready13 && ((value == 6 && !db0_13) || (mode >= 14 && value == 7 && db0_13 == 1) ||
-            (mode >= 15 && db0_13 >= 2 && value > tcm13(0x2f0700) && value < 64)));
-    else if (address == 0x2f0730 && value)     /* the read index given back, before each repost */
+    if (address == 0x2f0700 && hostready13)  /* mode 19: the indices wrap */
+        assert(master13_on() && ((value == 6 && !db0_13) || (mode >= 14 && value == 7 && db0_13 == 1) ||
+            (mode >= 15 && db0_13 >= 2 && value != tcm13(0x2f0700) && value < 64)));
+    else if (address == 0x2f0730 && hostready13)     /* the read index given back */
         assert(mode >= 15 && master13_on() && db0_13 >= 2 && value == tcm13(0x2f0720));
     else assert(!bme_ever && !hostready13 && (index ? !value : 1));
     tcm11[(address - 0x170000) / 4] = value;
@@ -282,6 +282,10 @@ static unsigned have16, up17, posted15[16], nposted15;
  * BCME_EPERM, 18 both. After an escan the console gains a line naming an
  * address, which must reach the log masked. */
 static unsigned ev18[8], nev18, escan18, scan18_next, escans18;
+/* Mode 19: the CLM bytes taken, chunks, loaded, the country set. Fault 19:
+ * the seventh chunk unanswered. Without the CLM and the country an escan is
+ * refused with BCME_EPERM, as the chip did (boot 81). */
+static unsigned clm19_got, clm19_chunks, clm19_loaded, country19;
 static void console18(const char *line) {
     const unsigned at = tcm13(0x2f0110);
     memcpy((uint8_t *)tcm11 + (0x2f1000 - 0x170000) + at, line, strlen(line));
@@ -299,14 +303,18 @@ static unsigned buffer13(unsigned id) {
     return id <= 2 ? 0x12000 + 0x2000 * (id - 1) : id <= 6 ? 0x16000 + 0x800 * (id - 3) :
         id <= 8 ? 0x18000 + 0x2000 * (id - 7) : id <= 10 ? 0x1e000 + 0x1000 * (id - 9) : 0x1d000 + 0x800 * (id - 11);
 }
+static unsigned d2h_total13, h2d_seen13;   /* mode 19: completions written, submissions read, through wraps */
 static void d2h13(const uint32_t words[6]) {
     const unsigned at = tcm13(0x2f0720);
+    assert(at < 64 && (at + 1) % 64 != tcm13(0x2f0730));     /* a full ring: the chip would wait */
+    if (d2h_total13 % 64 != at) d2h_total13 = at;           /* the first completions, written directly */
     uint32_t w[6];
     memcpy(w, words, sizeof(w));
-    w[0] |= (uint32_t)(at + 1) << 24;   /* the epoch */
+    w[0] |= (uint32_t)((d2h_total13 + 1) % 253) << 24;       /* the epoch */
     w[5] = w[0] ^ w[1] ^ w[2] ^ w[3] ^ w[4];
     memcpy(host_dram + 0x5000 + 24 * at, w, sizeof(w)); memset(host_dev + 0x5000 + 24 * at, 1, sizeof(w));
-    tcm11[(0x2f0720 - 0x170000) / 4] = at + 1;
+    tcm11[(0x2f0720 - 0x170000) / 4] = (at + 1) % 64;
+    d2h_total13++;
 }
 static void scan18_deliver(void) {
     while (escan18 && scan18_next <= 5 && nev18) {
@@ -335,11 +343,13 @@ static void scan18_deliver(void) {
 }
 static void iovar15(uint32_t value) {
     const unsigned w = tcm13(0x2f0700), r = tcm13(0x2f0710);
-    assert(mode >= 15 && value == (0xff000000u | w) && w > r);
+    assert(mode >= 15 && value == (0xff000000u | w) && w != r && w < 64);
+    if (h2d_seen13 % 64 != r) h2d_seen13 = r;              /* before the first wrap */
+    const unsigned end = h2d_seen13 + (w + 64 - r) % 64;   /* one past the newest item, counted through wraps */
     db0_13++; iovar15_db++;
-    const unsigned posts_only = host_dram[40 * (w - 1)] != 9;
-    for (unsigned item = r; item + 1 < w + posts_only; item++) {     /* the reposts */
-        const uint8_t *b = host_dram + 40 * item;
+    const unsigned posts_only = host_dram[40 * ((end - 1) % 64)] != 9;
+    for (unsigned item = h2d_seen13; item + 1 < end + posts_only; item++) {     /* the reposts */
+        const uint8_t *b = host_dram + 40 * (item % 64);
         uint32_t request, low, high;
         memcpy(&request, b + 4, 4); memcpy(&low, b + 16, 4); memcpy(&high, b + 20, 4);
         if (b[0] == 0x0d) {         /* mode 18: an event buffer given back */
@@ -350,7 +360,7 @@ static void iovar15(uint32_t value) {
             ev18[nev18++] = request;
             continue;
         }
-        assert(b[0] == 0x0b && (unsigned)b[3] == item + 1 && request >= 7 && request <= 12);
+        assert(b[0] == 0x0b && (unsigned)b[3] == (254 + item) % 253 && request >= 7 && request <= 12);
         assert((unsigned)(b[8] | b[9] << 8) == (request < 9 ? 0x2000u : request < 11 ? 0x1000u : 0x800u));
         assert(low == HOST13_PA + buffer13(request) && !high && tcm13(0x2f0730) == tcm13(0x2f0720));
         assert(nposted15 < 16); posted15[nposted15++] = request;
@@ -358,16 +368,19 @@ static void iovar15(uint32_t value) {
     if (posts_only) {
         assert(mode >= 18 && escan18);
         tcm11[(0x2f0710 - 0x170000) / 4] = w;
+        h2d_seen13 = end;
         scan18_deliver();
         return;
     }
-    const unsigned item = w - 1;
-    const uint8_t *e = host_dram + 40 * item;
+    const unsigned item = end - 1;
+    const uint8_t *e = host_dram + 40 * (item % 64);
     uint32_t request, cmd, low, high;
     memcpy(&request, e + 4, 4); memcpy(&cmd, e + 8, 4); memcpy(&low, e + 24, 4); memcpy(&high, e + 28, 4);
     const unsigned length = e[14] | e[15] << 8;
-    assert(e[0] == 9 && (unsigned)e[3] == item + 1 && request == 0xfffe && (unsigned)(e[12] | e[13] << 8) == item - 7);
-    assert((unsigned)(e[16] | e[17] << 8) == length && !high && low >= HOST13_PA + 0x1c000 && low < HOST13_PA + 0x1d000);
+    assert(e[0] == 9 && (unsigned)e[3] == (254 + item) % 253 && request == 0xfffe &&
+        (unsigned)(e[12] | e[13] << 8) == item - 7);
+    assert((unsigned)(e[16] | e[17] << 8) == length && !high &&
+        ((low >= HOST13_PA + 0x1c000 && low < HOST13_PA + 0x1d000) || (mode >= 19 && low == HOST13_PA + 0x20000)));
     const char *input = (const char *)host_dram + (low - HOST13_PA);
     static const char version[32] = "wl0: test version 18.41.117";
     const void *data = NULL;
@@ -392,10 +405,32 @@ static void iovar15(uint32_t value) {
         else { data = version; resp = 32; }
     } else if (cmd == 262 && !strcmp(input, "clmver")) {
         static const char clm[64] = "API: 20.0\nData: Model.CLM 1.2\nCreation: test\n";
-        assert(mode >= 18 && length == 512); data = clm; resp = 64;
+        static const char generic[64] = "API: 20.0\nData: Generic.Min\nCreation: test\n";
+        assert(mode >= 18 && length == 512); data = mode >= 19 && !clm19_loaded ? generic : clm; resp = 64;
     } else if (cmd == 262 && !strcmp(input, "country")) {
         static const uint8_t country[12] = { 'X', 'Z', 0, 0, 7, 0, 0, 0, 'X', 'Z', 0, 0 };
-        assert(mode >= 18 && length == 32); data = country; resp = 12;
+        static const uint8_t null[12] = { '#', 'n', 0, 0, 0, 0, 0, 0, '#', 'n', 0, 0 };
+        static const uint8_t xz11[12] = { 'X', 'Z', 0, 0, 11, 0, 0, 0, 'X', 'Z', 0, 0 };
+        assert(mode >= 18 && length == 32); data = mode < 19 ? country : country19 ? xz11 : null; resp = 12;
+    } else if (cmd == 263 && !strcmp(input, "country")) {
+        static const uint8_t xz11[12] = { 'X', 'Z', 0, 0, 11, 0, 0, 0, 'X', 'Z', 0, 0 };
+        assert(mode >= 19 && length == 20 && !memcmp(input + 8, xz11, 12) && clm19_loaded && !country19);
+        country19 = 1;
+    } else if (cmd == 263 && !strcmp(input, "clmload")) {
+        const uint8_t *q = (const uint8_t *)input + 8;
+        const unsigned flag = q[0] | q[1] << 8, type = q[2] | q[3] << 8;
+        uint32_t n, crc;
+        memcpy(&n, q + 4, 4); memcpy(&crc, q + 8, 4);
+        assert(mode >= 19 && type == 2 && !crc && (flag & 0xf001) == 0x1000 && n >= 1 && n <= 1400);
+        assert(length == 8 + ((12 + n + 7) & ~7u) && !!(flag & 2) == !clm19_got && clm19_got + n <= FIXTURE_CLM_BYTES);
+        assert(!memcmp(q + 12, firmware_clm_at() + clm19_got, n));
+        clm19_got += n; clm19_chunks++;
+        assert(!!(flag & 4) == (clm19_got == FIXTURE_CLM_BYTES));
+        if (flag & 4) clm19_loaded = 1;
+        if (host13_fault == 19 && clm19_chunks == 7) answer = 0;
+    } else if (cmd == 262 && !strcmp(input, "clmload_status")) {
+        static const uint32_t ok = 0;
+        assert(mode >= 19 && length == 32 && clm19_loaded); data = &ok; resp = 4;
     } else if (cmd == 262 && !strcmp(input, "mpc")) {
         static const uint32_t mpc = 1;
         assert(mode >= 18 && length == 32); data = &mpc; resp = 4;
@@ -420,17 +455,19 @@ static void iovar15(uint32_t value) {
         if (v2) assert(!q[55] && q[56] == 1 && !q[57] && !q[58] && !q[59]);     /* pad, passive (a word) */
         else assert(q[51] == 1);                                      /* passive (a byte) */
         assert(nprobes == UINT32_MAX && active == UINT32_MAX && passive == 110 && home == UINT32_MAX && !channels);
-        assert(escans18 < (host13_fault == 17 || host13_fault == 18 ? 2u : 1u));
+        assert(escans18 < 2);
         escans18++;
         console18("000001.500 wl0: escan from 00:90:4c:c5:12:38\n");
         if (host13_fault == 12) status = -2;
-        else if (host13_fault == 18 || (host13_fault == 17 && escans18 == 1)) status = -26;   /* BCME_EPERM */
+        else if (host13_fault == 18 || (host13_fault == 17 && escans18 == 1) || (mode >= 19 && !country19))
+            status = -26;   /* BCME_EPERM */
         else start_scan = 1;
     } else {
         assert(0);
     }
     if (!answer) return;
     tcm11[(0x2f0710 - 0x170000) / 4] = w;
+    h2d_seen13 = end;
     assert(nposted15);
     const unsigned id = posted15[--nposted15];  /* the newest posted buffer, as the chip did */
     const uint32_t ack[6] = { 0x0au, 0xfffe, 0x00020000u, 0, 0, 0 };
@@ -929,6 +966,7 @@ static void reset(unsigned which, unsigned failure) {
     firmware_mac_mode = 0; memset(chip16, 0, sizeof(chip16)); have16 = up17 = 0;
     nposted15 = 1; posted15[0] = 2;     /* the first ioctl's answer takes buffer 1 */
     nev18 = 4; ev18[0] = 3; ev18[1] = 4; ev18[2] = 5; ev18[3] = 6; escan18 = scan18_next = escans18 = 0;
+    d2h_total13 = h2d_seen13 = clm19_got = clm19_chunks = clm19_loaded = country19 = 0;
     memset(mask18, 0, 16);
     memset(host_cpu, 0, sizeof(host_cpu)); memset(host_dram, 0, sizeof(host_dram)); memset(host_dev, 0, sizeof(host_dev));
     wifi_host = NULL; wifi_host_pa = 0; wifi_master = 0;
@@ -1437,7 +1475,7 @@ int main(void) {
             assert(strstr(logs, "is not contiguous owned RAM below 4 GiB; kept, not used") && !bme_ever && !cleans);
             continue;
         }
-        assert(strstr(logs, "mode 13: host memory 131072 bytes at pa 0x9f000000: contiguous owned RAM"));
+        assert(strstr(logs, "mode 13: host memory 262144 bytes at pa 0x9f000000: contiguous owned RAM"));
         assert(strstr(logs, "five common rings at pa 0x9f000000, indices zero, scratch at 0x9f011000 (8 bytes), "
             "host_cap 0x801407: written and read back"));
         assert(bme_ever);
@@ -1657,15 +1695,58 @@ int main(void) {
         if (host13_fault == 15) {
             assert(strstr(logs, "mode 18: escan not finished after about 8000 ms\n"));
             assert(strstr(logs, "mode 18: 5 results, 4 networks (2 on 2.4 GHz, 2 on 5/6 GHz), RSSI -80 to -40 dBm; "
-                "0 other events, 0 malformed; 5 event buffers given back, 0 not (ring limits)\n"));
+                "0 other events, 0 malformed; 5 event buffers given back\n"));
             continue;
         }
         assert(strstr(logs, "mode 18: escan finished after about 2100 ms, final status 0\n"));
         assert(strstr(logs, "mode 18: 5 results, 4 networks (2 on 2.4 GHz, 2 on 5/6 GHz), RSSI -80 to -40 dBm; "
-            "0 other events, 0 malformed; 6 event buffers given back, 0 not (ring limits)\n"));
+            "0 other events, 0 malformed; 6 event buffers given back\n"));
         assert(scan18_next == 6 && nev18 == 4);
     }
     puts("Firmware scan: one passive escan, event buffers given back, results by channel and level, no name or address in the log passed");
+    /* S10 port, mode 19: the CLM blob, the country, then WLC_UP and the scan.
+     * With the address right (2) and after the set (0); without a blob in
+     * the attachment; a chunk unanswered (19). */
+    mode = 19;
+    static const unsigned faults19[][3] = { { 0, 2, 1 }, { 0, 0, 1 }, { 0, 2, 0 }, { 19, 2, 1 } };
+    for (unsigned k = 0; k < 4; k++) {
+        reset(8, 0); firmware_fixture_nvram(good, sizeof(good)); nvram_fixture_bytes = sizeof(good);
+        if (faults19[k][2]) firmware_fixture_clm();
+        host13_fault = faults19[k][0]; firmware_mac_mode = faults19[k][1];
+        b2l_wifi_diag_start(); verify_quiet();
+        assert(strstr(logs, "mode 19: deferred run finished") && strstr(logs, "cleanup=verified"));
+        assert(strstr(logs, "bus mastering off again (endpoint, then root port)"));
+        assert(!strstr(logs, "ModelNet") && !strstr(logs, "aa:bb") && !strstr(logs, "00:90:4c") &&
+            !strstr(logs, "0x5e1cb202") && !strstr(logs, "0xc54c9000"));
+        if (!faults19[k][2]) {
+            assert(strstr(logs, "mode 19: no CLM blob in the attachment; none loaded\n") && !clm19_chunks);
+            assert(strstr(logs, "mode 18: clmver (status 0, 64 bytes): API: 20.0 | Data: Generic.Min | Creation: test\n"));
+            assert(strstr(logs, "mode 18: country (status 0, 12 bytes): #n rev 0, ccode #n\n"));
+            assert(strstr(logs, "mode 18: escan v2 once more after 1 s: status -26\n"));
+            continue;
+        }
+        assert(strstr(logs, "private CLM blob verified: bytes=29464 SHA-256 pinned\n"));
+        if (host13_fault == 19) {
+            assert(strstr(logs, "mode 19: clmload chunk 7 (1400 bytes at 8400, flag 0x1000): no answer\n"));
+            assert(clm19_chunks == 7 && !strstr(logs, "WLC_UP"));
+            continue;
+        }
+        assert(strstr(logs, "mode 19: CLM blob sent: 29464 bytes in 22 clmload chunks, every one status 0\n"));
+        assert(clm19_chunks == 22 && clm19_loaded && clm19_got == FIXTURE_CLM_BYTES);
+        assert(strstr(logs, "mode 19: clmload_status (status 0, 4 bytes): 0\n"));
+        assert(strstr(logs, "mode 19: clmver now (status 0, 64 bytes): API: 20.0 | Data: Model.CLM 1.2 | Creation: test\n"));
+        assert(strstr(logs, "mode 19: country now (status 0, 12 bytes): still #n\n"));
+        assert(strstr(logs, "mode 19: country set to XZ rev 11: status 0\n") && country19);
+        assert(strstr(logs, "mode 17: WLC_UP: status 0\n"));
+        assert(strstr(logs, "mode 18: country (status 0, 12 bytes): XZ rev 11, ccode XZ\n"));
+        assert(strstr(logs, "mode 18: escan v2 (passive, every channel, 110 ms each) set: status 0\n"));
+        assert(strstr(logs, "mode 18: 5 results, 4 networks (2 on 2.4 GHz, 2 on 5/6 GHz), RSSI -80 to -40 dBm; "
+            "0 other events, 0 malformed; 6 event buffers given back\n"));
+        assert(strstr(logs, "mode 18: channels heard: 1 6 36 149\n"));
+        assert(d2h_total13 > 64 && h2d_seen13 > 64);    /* both rings went round */
+        assert(scan18_next == 6 && nev18 == 4);
+    }
+    puts("Firmware CLM: the board's blob in chunks as DHD loads it, the country, then the scan, through ring wraps passed");
 }
 '''
 

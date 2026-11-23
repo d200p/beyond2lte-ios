@@ -58,6 +58,14 @@ one range. The NVRAM is not pinned by hash; the verifier and XNU check its
 layout (printable `name=value` entries, NUL padding, last word zero).
 `scripts/attach-wifi-firmware.py --nvram` writes this form.
 
+S10 port, for Wi-Fi mode 19: `B2LFW003` has B2LFW002's fields and puts the
+board CLM blob's size, in words, in the last two bytes. The blob (the vendor
+image's `bcmdhd_clm.blob`) follows the NVRAM and is pinned by size and
+SHA-256 (`WIFI_CLM_SIZE`, `WIFI_CLM_SHA256`). The loader stages the three
+parts as one range, as before. XNU finds the blob by that size and hash at
+the end of the range. `scripts/attach-wifi-firmware.py --nvram ... --clm`
+writes this form.
+
 XNU requires all 256 seed bytes. Packaging obtains those bytes directly from
 `os.urandom(256)`; it does not repeat or pad a shorter seed. The loader rejects
 legacy `B2LXNU01` trailers, which supplied only 64 bytes, with a repackage error.
