@@ -57,7 +57,12 @@
 #include "util/half_float.h"
 #include "util/u_sampler.h"
 #include "util/u_upload_mgr.h"
+#include "util/u_gen_mipmap.h"
+#include "util/macros.h"
+#include "util/blob.h"
+#include "util/mesa-sha1.h"
 #include "compiler/nir/nir.h"
+#include "compiler/nir/nir_serialize.h"
 #include "compiler/nir/nir_builder.h"
 #include "nir_air.h"
 #include "b2l_drm.h"
@@ -141,6 +146,41 @@ struct b2l_mtl_device {
 	struct pipe_sampler_view *zero_view;
 	void *default_sampler, *default_dsa, *default_blend, *default_velems;
 	void *rasterizers[256];                         /* by raster_key() */
+	/*
+	 * M4 (boot 82): backboardd asked for Core Animation's generic fragment
+	 * shader (fixed_frag_lph_cpf, 25,996 NIR instructions) with six pipelines
+	 * that differ only in their colour format; each one translated the AIR
+	 * again (1.4-2.3 s) and compiled it again (20 s), and the first frame came
+	 * at 200 s. Shaders are now kept by what they are: a translated function
+	 * by its bitcode and constants (translated[], under functions_lock), a
+	 * Panfrost shader by the SHA-1 of its final NIR (shaders[], under lock).
+	 * Bifrost's fragment variants do not depend on the colour format (the
+	 * framebuffer fetch reads its conversion at draw time), so one compiled
+	 * shader serves every such pipeline.
+	 */
+	struct shared_shader {
+		unsigned char sha1[20];
+		gl_shader_stage stage;
+		void *cso;                              /* NULL: a free entry */
+		unsigned users;                         /* pipelines holding it; 0: kept for later ones */
+		uint32_t compile_ms;
+	} shaders[128];
+	unsigned shader_hits, shader_saved_ms;
+	pthread_mutex_t functions_lock;
+	struct translated_function {
+		unsigned char sha1[20];
+		struct b2l_mtl_function *function;     /* held */
+	} translated[128];
+	unsigned translated_next, translated_hits, translated_saved_ms;
+	/* M4: IOSurfaces whose rows the Mali cannot use (texture_shadow). */
+	struct surface_shadow {
+		uint32_t sid, width, height;
+		enum pipe_format format;
+		IOSurfaceRef surface;                   /* retained: its ID is not reused while the entry lives */
+		struct pipe_resource *res;              /* held; NULL: a free entry */
+		bool written;                           /* drawn into: newer than the surface */
+	} shadows[64];
+	unsigned shadow_next, shadow_made, shadow_refreshed;
 };
 
 static struct b2l_mtl_device *the_device;
@@ -229,6 +269,7 @@ device_open(char *why, size_t why_size)
 		return NULL;
 	}
 	pthread_mutex_init(&dev->lock, NULL);
+	pthread_mutex_init(&dev->functions_lock, NULL);
 	dev->screen = screen;
 	dev->pipe = pipe;
 	dev->nir_options = screen->get_compiler_options(screen, PIPE_SHADER_IR_NIR, PIPE_SHADER_FRAGMENT);
@@ -595,6 +636,15 @@ texture_new(struct b2l_mtl_device *dev, const struct b2l_mtl_texture_desc *desc,
 	    templat.bind)) {
 		templat.bind &= ~PIPE_BIND_SHADER_IMAGE;
 	}
+	/* M4: generateMipmapsForTexture: draws each level (util_gen_mipmap's
+	 * blits), so a texture of several levels is a render target where the
+	 * format can be one, whatever its usage says. */
+	if (templat.last_level > 0 && !(templat.bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL)) &&
+	    !util_format_is_depth_or_stencil(templat.format) &&
+	    dev->screen->is_format_supported(dev->screen, templat.format, templat.target, samples, samples,
+	    templat.bind | PIPE_BIND_RENDER_TARGET)) {
+		templat.bind |= PIPE_BIND_RENDER_TARGET;
+	}
 	if (!dev->screen->is_format_supported(dev->screen, templat.format, templat.target, samples, samples,
 	    templat.bind)) {
 		pthread_mutex_unlock(&dev->lock);
@@ -614,6 +664,113 @@ texture_new(struct b2l_mtl_device *dev, const struct b2l_mtl_texture_desc *desc,
 	}
 	texture_whole(t);
 	return t;
+}
+
+/*
+ * M4 (boot 82): Core Animation gave backboardd 59 IOSurfaces whose rows the
+ * Mali cannot use in place (480 bytes: 120 pixels of BGRA8), and each texture
+ * was refused, so what they hold (small layers, icons) was not drawn. As the
+ * EAGL layer has done since boot 55, such a surface gets storage of its own,
+ * laid out as the Mali wants and filled from the surface; every texture of
+ * that surface shares it, so what one draws into it the next one samples. A
+ * shadow nothing has drawn into is filled again from the surface when the
+ * next texture of it is made (another process may have drawn it with the
+ * CPU). The surface is not written back.
+ */
+static struct b2l_mtl_texture *
+texture_shadow(struct b2l_mtl_device *dev, const struct b2l_mtl_texture_desc *desc, IOSurfaceRef surface,
+    struct pipe_resource *templat, size_t stride, char *why, size_t why_size)
+{
+	const uint32_t sid = IOSurfaceGetID(surface);
+	const unsigned block = util_format_get_blocksize(templat->format);
+	if (util_format_is_compressed(templat->format) || util_format_is_depth_or_stencil(templat->format) ||
+	    stride < (size_t)templat->width0 * block ||
+	    stride * templat->height0 > IOSurfaceGetAllocSize(surface)) {
+		say(why, why_size, "rows of %zu bytes (the Mali needs multiples of 64), no shadow for %s %ux%u", stride,
+		    util_format_short_name(templat->format), templat->width0, templat->height0);
+		return NULL;
+	}
+	templat->bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
+	struct b2l_mtl_texture *t = calloc(1, sizeof(*t));
+	if (t == NULL) {
+		say(why, why_size, "out of memory");
+		return NULL;
+	}
+	obj_init(&t->base, texture_destroy);
+	t->dev = dev;
+	t->format = templat->format;
+	t->desc = *desc;
+	pthread_mutex_lock(&dev->lock);
+	struct surface_shadow *s = NULL;
+	for (unsigned i = 0; i < ARRAY_SIZE(dev->shadows); i++) {
+		struct surface_shadow *e = &dev->shadows[i];
+		if (e->res != NULL && e->sid == sid && e->width == templat->width0 && e->height == templat->height0 &&
+		    e->format == templat->format) {
+			s = e;
+			break;
+		}
+	}
+	bool fill = s == NULL || !s->written;
+	bool made = s == NULL;
+	if (s == NULL) {
+		struct pipe_resource *res = dev->screen->is_format_supported(dev->screen, templat->format,
+		    PIPE_TEXTURE_2D, 1, 1, templat->bind) ? dev->screen->resource_create(dev->screen, templat) : NULL;
+		if (res == NULL) {
+			pthread_mutex_unlock(&dev->lock);
+			say(why, why_size, "rows of %zu bytes (the Mali needs multiples of 64), and Panfrost made no shadow "
+			    "for %s %ux%u", stride, util_format_short_name(templat->format), templat->width0, templat->height0);
+			free(t);
+			return NULL;
+		}
+		s = &dev->shadows[dev->shadow_next++ % ARRAY_SIZE(dev->shadows)];
+		pipe_resource_reference(&s->res, NULL);         /* the oldest one: its textures keep theirs */
+		if (s->surface != NULL) {
+			CFRelease(s->surface);
+		}
+		s->surface = (IOSurfaceRef)CFRetain(surface);
+		s->res = res;
+		s->sid = sid;
+		s->width = templat->width0;
+		s->height = templat->height0;
+		s->format = templat->format;
+		s->written = false;
+	}
+	pipe_resource_reference(&t->res, s->res);
+	if (fill && IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) == 0) {
+		struct pipe_box box;
+		u_box_2d(0, 0, (int)templat->width0, (int)templat->height0, &box);
+		dev->pipe->texture_subdata(dev->pipe, s->res, 0, PIPE_MAP_WRITE, &box, IOSurfaceGetBaseAddress(surface),
+		    (unsigned)stride, 0);
+		IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+		dev->pending = true;
+	}
+	const unsigned n = made ? ++dev->shadow_made : dev->shadow_made;
+	const unsigned refreshed = !made && fill ? ++dev->shadow_refreshed : dev->shadow_refreshed;
+	pthread_mutex_unlock(&dev->lock);
+	if ((made && (n <= 24 || n % 100 == 0)) || (!made && fill && (refreshed <= 8 || refreshed % 100 == 0))) {
+		b2l_drm_note("mtl M4: IOSurface %u, %s %ux%u, rows of %zu bytes: %s (%u shadows made, %u filled again)", sid,
+		    util_format_short_name(templat->format), templat->width0, templat->height0, stride,
+		    made ? "a shadow of its own as the Mali wants it, filled from the surface" :
+		    "its shadow, not drawn into, filled again from the surface", n, refreshed);
+	}
+	t->surface = (IOSurfaceRef)CFRetain(surface);
+	texture_whole(t);
+	return t;
+}
+
+/* M4: a pass draws into a shadow: from now on it is newer than its surface. */
+static void
+shadow_drawn(struct b2l_mtl_device *dev, const struct pipe_resource *res)
+{
+	if (dev->shadow_made == 0) {
+		return;
+	}
+	for (unsigned i = 0; i < ARRAY_SIZE(dev->shadows); i++) {
+		if (dev->shadows[i].res == res) {
+			dev->shadows[i].written = true;
+			return;
+		}
+	}
 }
 
 static struct b2l_mtl_texture *
@@ -642,6 +799,9 @@ texture_from_iosurface(struct b2l_mtl_device *dev, const struct b2l_mtl_texture_
 		}
 		offset = (size_t)((const char *)IOSurfaceGetBaseAddressOfPlane(surface, plane) -
 		    (const char *)IOSurfaceGetBaseAddress(surface));
+	}
+	if ((stride % 64 || offset % 64) && planes <= 1 && plane == 0) {
+		return texture_shadow(dev, desc, surface, &templat, stride, why, why_size);
 	}
 	if (stride % 64 || offset % 64) {
 		say(why, why_size, "rows of %zu bytes at offset %zu (the Mali needs multiples of 64)", stride, offset);
@@ -1153,6 +1313,9 @@ struct b2l_mtl_function {
 	bool failed;
 	char error[192];
 	uint32_t translate_ms, instructions;
+	/* M4: an earlier function with the same bitcode and constants, held;
+	 * nir and info are then its own (read only, in its memory). */
+	struct b2l_mtl_function *twin;
 };
 
 static void
@@ -1161,6 +1324,7 @@ function_destroy(void *self)
 	struct b2l_mtl_function *f = self;
 	ralloc_free(f->mem);
 	pthread_mutex_destroy(&f->lock);
+	obj_unref(f->twin);
 	obj_unref(f->library);
 	free(f);
 }
@@ -1275,11 +1439,83 @@ tidy(nir_shader *nir)
 	}
 }
 
+/* M4: what a translation depends on, the function's bitcode and the
+ * constants as given (which were supplied, and their bits). */
+static void
+function_key(const struct b2l_mtl_function *f, unsigned char sha1[20])
+{
+	const struct air_metallib_function *mf = &f->library->lib.functions[f->index];
+	struct mesa_sha1 ctx;
+	_mesa_sha1_init(&ctx);
+	_mesa_sha1_update(&ctx, mf->bitcode, mf->bitcode_size);
+	for (unsigned k = 0; k < f->num_constants; k++) {
+		const uint64_t entry[3] = { f->constants[k].index, f->constants[k].bits, f->constants[k].supplied };
+		_mesa_sha1_update(&ctx, entry, sizeof(entry));
+	}
+	_mesa_sha1_final(&ctx, sha1);
+}
+
+/* M4: an earlier translation of the same function with the same constants
+ * (Core Animation makes a new MTLFunction for every pipeline): shared, its
+ * NIR cloned by each pipeline as f's own would be. */
+static bool
+function_share(struct b2l_mtl_device *dev, struct b2l_mtl_function *f, const unsigned char sha1[20])
+{
+	struct b2l_mtl_function *twin = NULL;
+	pthread_mutex_lock(&dev->functions_lock);
+	for (unsigned i = 0; i < ARRAY_SIZE(dev->translated); i++) {
+		if (dev->translated[i].function != NULL && memcmp(dev->translated[i].sha1, sha1, 20) == 0) {
+			twin = obj_ref(dev->translated[i].function);
+			break;
+		}
+	}
+	unsigned hits = twin != NULL ? ++dev->translated_hits : 0;
+	if (twin != NULL) {
+		dev->translated_saved_ms += twin->translate_ms;
+	}
+	unsigned saved = dev->translated_saved_ms;
+	pthread_mutex_unlock(&dev->functions_lock);
+	if (twin == NULL) {
+		return false;
+	}
+	f->twin = twin;
+	f->nir = twin->nir;
+	f->info = twin->info;
+	f->instructions = twin->instructions;
+	f->translate_ms = 0;
+	if (hits <= 40 || hits % 100 == 0) {
+		b2l_drm_note("mtl M4: %s: translated before with the same constants, shared (%u ms saved; %u shared, "
+		    "%u ms in all)", twin->library->lib.functions[twin->index].name, twin->translate_ms, hits, saved);
+	}
+	return true;
+}
+
+static void
+function_keep(struct b2l_mtl_device *dev, struct b2l_mtl_function *f, const unsigned char sha1[20])
+{
+	pthread_mutex_lock(&dev->functions_lock);
+	struct translated_function *slot = &dev->translated[dev->translated_next++ % ARRAY_SIZE(dev->translated)];
+	struct b2l_mtl_function *old = slot->function;
+	memcpy(slot->sha1, sha1, 20);
+	slot->function = obj_ref(f);
+	pthread_mutex_unlock(&dev->functions_lock);
+	obj_unref(old);
+}
+
 /* Translated once, with the function's constants, and kept. */
 static bool
 function_translate(struct b2l_mtl_device *dev, struct b2l_mtl_function *f)
 {
 	pthread_mutex_lock(&f->lock);
+	unsigned char key[20];
+	bool keyed = false;
+	if (f->nir == NULL && !f->failed) {
+		function_key(f, key);
+		keyed = true;
+		if (function_share(dev, f, key)) {
+			keyed = false;
+		}
+	}
 	if (f->nir == NULL && !f->failed) {
 		const struct air_metallib_function *mf = &f->library->lib.functions[f->index];
 		struct air_to_nir_options options;
@@ -1298,6 +1534,9 @@ function_translate(struct b2l_mtl_device *dev, struct b2l_mtl_function *f)
 			f->instructions = count_instrs(f->nir);
 		}
 		f->translate_ms = (uint32_t)((now_us() - t0) / 1000);
+		if (f->nir != NULL && keyed) {
+			function_keep(dev, f, key);
+		}
 	}
 	bool ok = f->nir != NULL;
 	pthread_mutex_unlock(&f->lock);
@@ -1329,9 +1568,115 @@ struct b2l_mtl_render_pipeline {
 	unsigned vb_count;                      /* the highest of them + 1 */
 	int zero_slot;                          /* the slot of the attributes not described, -1: none */
 	bool point_size;                        /* the vertex function writes [[point_size]] */
+	bool vs_shared, fs_shared;              /* M4: vs, fs are entries of dev->shaders */
 	struct stage_bindings bind[2];          /* B2L_MTL_VERTEX, B2L_MTL_FRAGMENT */
 	struct b2l_mtl_render_pipeline_desc desc;
 };
+
+/* M4: a shader's identity, the SHA-1 of its final NIR; false if it could not
+ * be serialized (then it is not shared). */
+static bool
+shader_key(const nir_shader *nir, unsigned char sha1[20])
+{
+	struct blob blob;
+	blob_init(&blob);
+	nir_serialize(&blob, nir, false);
+	bool ok = !blob.out_of_memory;
+	if (ok) {
+		_mesa_sha1_compute(blob.data, blob.size, sha1);
+	}
+	blob_finish(&blob);
+	return ok;
+}
+
+static void
+shader_delete(struct b2l_mtl_device *dev, void *cso, gl_shader_stage stage)
+{
+	if (stage == MESA_SHADER_VERTEX) {
+		dev->pipe->delete_vs_state(dev->pipe, cso);
+	} else {
+		dev->pipe->delete_fs_state(dev->pipe, cso);
+	}
+}
+
+/*
+ * M4: the Panfrost shader for this NIR, which the driver then owns: one made
+ * before for the same NIR if there is one (the NIR is freed), otherwise a new
+ * one, kept for later pipelines while there is room (an entry no pipeline
+ * holds makes room). Under dev->lock. *shared: the shader is an entry
+ * (shader_put gives it back); *ms: the time it took to make, 0 if shared.
+ */
+static void *
+shader_get(struct b2l_mtl_device *dev, nir_shader *nir, const unsigned char *key, bool *shared, bool *hit,
+    uint32_t *ms)
+{
+	const gl_shader_stage stage = nir->info.stage;
+	struct shared_shader *empty = NULL, *idle = NULL;
+	*shared = *hit = false;
+	*ms = 0;
+	for (unsigned i = 0; key != NULL && i < ARRAY_SIZE(dev->shaders); i++) {
+		struct shared_shader *s = &dev->shaders[i];
+		if (s->cso == NULL) {
+			if (empty == NULL) {
+				empty = s;
+			}
+			continue;
+		}
+		if (s->stage == stage && memcmp(s->sha1, key, 20) == 0) {
+			s->users++;
+			dev->shader_hits++;
+			dev->shader_saved_ms += s->compile_ms;
+			*shared = *hit = true;
+			ralloc_free(nir);
+			return s->cso;
+		}
+		if (s->users == 0 && idle == NULL) {
+			idle = s;
+		}
+	}
+	struct pipe_shader_state state;
+	memset(&state, 0, sizeof(state));
+	state.type = PIPE_SHADER_IR_NIR;
+	state.ir.nir = nir;
+	const uint64_t t0 = now_us();
+	void *cso = stage == MESA_SHADER_VERTEX ? dev->pipe->create_vs_state(dev->pipe, &state) :
+	    dev->pipe->create_fs_state(dev->pipe, &state);
+	*ms = (uint32_t)((now_us() - t0) / 1000);
+	struct shared_shader *slot = empty != NULL ? empty : idle;
+	if (cso == NULL || key == NULL || slot == NULL) {
+		return cso;
+	}
+	if (slot->cso != NULL) {
+		shader_delete(dev, slot->cso, slot->stage);
+	}
+	memcpy(slot->sha1, key, 20);
+	slot->stage = stage;
+	slot->cso = cso;
+	slot->users = 1;
+	slot->compile_ms = *ms;
+	*shared = true;
+	return cso;
+}
+
+/* Under dev->lock. */
+static void
+shader_put(struct b2l_mtl_device *dev, void *cso, gl_shader_stage stage, bool shared)
+{
+	if (cso == NULL) {
+		return;
+	}
+	if (shared) {
+		for (unsigned i = 0; i < ARRAY_SIZE(dev->shaders); i++) {
+			if (dev->shaders[i].cso == cso) {
+				if (dev->shaders[i].users != 0) {
+					dev->shaders[i].users--;
+				}
+				return;
+			}
+		}
+	}
+	shader_delete(dev, cso, stage);
+}
 
 static void
 render_pipeline_destroy(void *self)
@@ -1346,12 +1691,8 @@ render_pipeline_destroy(void *self)
 			}
 		}
 	}
-	if (p->vs != NULL) {
-		pipe->delete_vs_state(pipe, p->vs);
-	}
-	if (p->fs != NULL) {
-		pipe->delete_fs_state(pipe, p->fs);
-	}
+	shader_put(p->dev, p->vs, MESA_SHADER_VERTEX, p->vs_shared);
+	shader_put(p->dev, p->fs, MESA_SHADER_FRAGMENT, p->fs_shared);
 	if (p->blend != NULL) {
 		pipe->delete_blend_state(pipe, p->blend);
 	}
@@ -2321,18 +2662,22 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 	}
 
 	struct pipe_context *pipe = dev->pipe;
+	/* M4: the final NIR's identity, outside the lock (a large shader takes
+	 * some milliseconds to serialize). */
+	unsigned char vs_key[20], fs_key[20];
+	const bool vs_keyed = strstr(desc->label, "b2l:no-share") == NULL && shader_key(vs, vs_key);
+	const bool fs_keyed = fs != NULL && strstr(desc->label, "b2l:no-share") == NULL && shader_key(fs, fs_key);
 	pthread_mutex_lock(&dev->lock);
 	uint64_t t1 = now_us();
-	struct pipe_shader_state state;
-	memset(&state, 0, sizeof(state));
-	state.type = PIPE_SHADER_IR_NIR;
-	state.ir.nir = vs;
-	p->vs = pipe->create_vs_state(pipe, &state);    /* the driver owns the NIR now */
+	bool vs_hit = false, fs_hit = false;
+	uint32_t vs_ms = 0, fs_ms = 0;
+	/* the driver owns the NIR now (or it was freed for a shader made before) */
+	p->vs = shader_get(dev, vs, vs_keyed ? vs_key : NULL, &p->vs_shared, &vs_hit, &vs_ms);
 	if (fs != NULL) {
-		state.ir.nir = fs;
-		p->fs = pipe->create_fs_state(pipe, &state);
+		p->fs = shader_get(dev, fs, fs_keyed ? fs_key : NULL, &p->fs_shared, &fs_hit, &fs_ms);
 	}
 	report->compile_ms = (uint32_t)((now_us() - t1) / 1000);
+	const unsigned shader_hits = dev->shader_hits, shader_saved = dev->shader_saved_ms;
 	p->blend = pipe->create_blend_state(pipe, &blend);
 	if (num_elements != 0) {
 		p->velems = pipe->create_vertex_elements_state(pipe, num_elements, elements);
@@ -2366,6 +2711,16 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 	    function_name(desc->vertex), desc->fragment != NULL ? function_name(desc->fragment) : "-",
 	    report->translate_ms, report->compile_ms, report->vs_instructions, report->fs_instructions,
 	    report->varyings_linked, report->varyings_unmatched, report->attributes);
+	if ((vs_hit || fs_hit) && (shader_hits <= 40 || shader_hits % 100 == 0)) {
+		b2l_drm_note("mtl M4: pipeline %s + %s: %s%s%s made before for the same NIR, shared (%u shared, %u ms "
+		    "saved in all)", function_name(desc->vertex), desc->fragment != NULL ? function_name(desc->fragment) : "-",
+		    vs_hit ? "vertex shader" : "", vs_hit && fs_hit ? " and " : "", fs_hit ? "fragment shader" : "",
+		    shader_hits, shader_saved);
+	} else if (fs_ms >= 1000 || vs_ms >= 1000) {
+		b2l_drm_note("mtl M4: pipeline %s + %s: Panfrost compiled the vertex shader in %u ms, the fragment shader "
+		    "in %u ms; kept for the pipelines that need the same", function_name(desc->vertex),
+		    desc->fragment != NULL ? function_name(desc->fragment) : "-", vs_ms, fs_ms);
+	}
 	const struct stage_bindings *bv = &p->bind[B2L_MTL_VERTEX], *bf = &p->bind[B2L_MTL_FRAGMENT];
 	b2l_drm_note("mtl M2: pipeline %s binds: UBOs %u + %u, SSBOs 0x%x + 0x%x, textures 0x%x + 0x%x (null 0x%x), "
 	    "images 0x%x + 0x%x, samplers 0x%x + 0x%x (%u inline), vertex buffers 0x%x (zero slot %d)%s",
@@ -2528,6 +2883,8 @@ enum op_kind {
 	OP_SET_COMPUTE_PIPELINE,
 	OP_SET_THREADGROUP_MEMORY,
 	OP_DISPATCH,
+	/* blit, M4 */
+	OP_GENERATE_MIPMAPS,
 };
 
 struct op {
@@ -2637,6 +2994,7 @@ op_unref(struct op *op)
 		free(op->u.bind.bytes);
 		break;
 	case OP_SET_TEXTURE:
+	case OP_GENERATE_MIPMAPS:
 		obj_unref(op->u.resource.texture);
 		break;
 	case OP_SET_SAMPLER:
@@ -2802,6 +3160,17 @@ cmdbuf_copy_texture_to_buffer(struct b2l_mtl_cmdbuf *cb, struct b2l_mtl_texture 
 {
 	cmdbuf_buffer_texture(cb, OP_TEXTURE_TO_BUFFER, to, offset, bytes_per_row, bytes_per_image, region, from, slice,
 	    level);
+}
+
+/* M4 (boot 82): Core Animation's one command buffer error was
+ * generateMipmapsForTexture:. */
+static void
+cmdbuf_generate_mipmaps(struct b2l_mtl_cmdbuf *cb, struct b2l_mtl_texture *texture)
+{
+	struct op *op = cmdbuf_push(cb, OP_GENERATE_MIPMAPS);
+	if (op != NULL) {
+		op->u.resource.texture = obj_ref(texture);
+	}
 }
 
 static void
@@ -3549,6 +3918,7 @@ exec_pass_begin(struct b2l_mtl_cmdbuf *cb, struct encoder_state *st, const struc
 			continue;
 		}
 		fb.nr_cbufs = i + 1;
+		shadow_drawn(cb->dev, a->texture->res);
 		unsigned l = texture_level(a->texture, a->level);
 		unsigned w = u_minify(a->texture->res->width0, l), h = u_minify(a->texture->res->height0, l);
 		width = width != 0 ? MIN2(width, w) : w;
@@ -3637,6 +4007,80 @@ exec_buffer_texture(struct b2l_mtl_cmdbuf *cb, const struct op *op)
 	}
 }
 
+/* M4: a draw the CPU took long over, most likely Panfrost compiling a shader
+ * variant at the draw (logged for the first 24). */
+static void
+slow_draw(const struct encoder_state *st, uint64_t us)
+{
+	static unsigned noted;
+	if (us < 100000 || st->pipeline == NULL || __atomic_fetch_add(&noted, 1, __ATOMIC_RELAXED) >= 24) {
+		return;
+	}
+	b2l_drm_note("mtl M4: a draw with %s + %s took %llu ms on the CPU (a shader variant made at the draw?)",
+	    function_name(st->pipeline->vertex), st->pipeline->fragment != NULL ? function_name(st->pipeline->fragment) :
+	    "-", (unsigned long long)(us / 1000));
+}
+
+/* M4: where a command buffer's time goes, encoding it (CPU) or waiting for
+ * the GPU at its end; every 600 command buffers, under the device lock. */
+static void
+execute_summary(uint64_t encode_us, uint64_t wait_us, unsigned draws, unsigned ops)
+{
+	static uint64_t encode_total, wait_total, encode_max, wait_max;
+	static unsigned count, draws_total, slow, ops_total;
+	encode_total += encode_us;
+	wait_total += wait_us;
+	encode_max = MAX2(encode_max, encode_us);
+	wait_max = MAX2(wait_max, wait_us);
+	draws_total += draws;
+	ops_total += ops;
+	slow += encode_us + wait_us >= 50000;
+	if (++count < 600) {
+		return;
+	}
+	b2l_drm_note("mtl M4: 600 command buffers: encoding %llu ms (at most %llu), waiting for the GPU %llu ms (at most "
+	    "%llu), %u draws, %u commands, %u of them 50 ms or more", (unsigned long long)(encode_total / 1000),
+	    (unsigned long long)(encode_max / 1000), (unsigned long long)(wait_total / 1000),
+	    (unsigned long long)(wait_max / 1000), draws_total, ops_total, slow);
+	encode_total = wait_total = encode_max = wait_max = 0;
+	count = draws_total = slow = ops_total = 0;
+}
+
+/* M4: every level after the texture's first from the one before, by
+ * Gallium's blits (util_gen_mipmap), linear filtering as Metal does. */
+static void
+exec_mipmaps(struct b2l_mtl_device *dev, struct b2l_mtl_texture *t, char *first, size_t first_size)
+{
+	if (t == NULL || t->levels < 2) {
+		return;         /* one level: nothing to make */
+	}
+	const unsigned base = t->first_level, last = t->first_level + t->levels - 1;
+	if (last > t->res->last_level || util_format_is_compressed(t->format) ||
+	    util_format_is_pure_integer(t->format)) {
+		if (first[0] == 0) {
+			say(first, first_size, "generateMipmapsForTexture: %s, levels %u-%u: not with this format",
+			    util_format_short_name(t->format), base, last);
+		}
+		return;
+	}
+	const unsigned last_layer = t->first_layer + MAX2(t->layers, 1) - 1;
+	if (!util_gen_mipmap(dev->pipe, t->res, t->format, base, last, t->first_layer, last_layer,
+	    PIPE_TEX_FILTER_LINEAR)) {
+		if (first[0] == 0) {
+			say(first, first_size, "generateMipmapsForTexture: Gallium could not make levels %u-%u of %s %ux%u",
+			    base + 1, last, util_format_short_name(t->format), t->res->width0, t->res->height0);
+		}
+		return;
+	}
+	shadow_drawn(dev, t->res);
+	dev->pending = true;
+	static unsigned noted;
+	if (__atomic_fetch_add(&noted, 1, __ATOMIC_RELAXED) < 16) {
+		b2l_drm_note("mtl M4: generateMipmapsForTexture: %s %ux%u, levels %u-%u made", util_format_short_name(t->format),
+		    t->res->width0, t->res->height0, base + 1, last);
+	}
+}
+
 static int
 cmdbuf_execute(struct b2l_mtl_cmdbuf *cb, uint64_t *gpu_us, char *why, size_t why_size)
 {
@@ -3678,9 +4122,12 @@ cmdbuf_execute(struct b2l_mtl_cmdbuf *cb, uint64_t *gpu_us, char *why, size_t wh
 		case OP_SET_BLEND_COLOR:
 			exec_state(st, op);
 			break;
-		case OP_DRAW:
+		case OP_DRAW: {
+			const uint64_t d0 = now_us();
 			exec_draw(dev, st, &op->u.draw, first, sizeof(first));
+			slow_draw(st, now_us() - d0);
 			break;
+		}
 		case OP_COMPUTE_BEGIN:
 		case OP_COMPUTE_END:
 		case OP_SET_COMPUTE_PIPELINE:
@@ -3722,11 +4169,18 @@ cmdbuf_execute(struct b2l_mtl_cmdbuf *cb, uint64_t *gpu_us, char *why, size_t wh
 			pipe->resource_copy_region(pipe, to->res, texture_level(to, op->u.copy_texture.to_level),
 			    op->u.copy_texture.to_x, op->u.copy_texture.to_y, z, from->res,
 			    texture_level(from, op->u.copy_texture.from_level), &box);
+			shadow_drawn(dev, to->res);
 			break;
 		}
 		case OP_BUFFER_TO_TEXTURE:
 		case OP_TEXTURE_TO_BUFFER:
 			exec_buffer_texture(cb, op);
+			if (op->kind == OP_BUFFER_TO_TEXTURE && op->u.buffer_texture.texture != NULL) {
+				shadow_drawn(dev, op->u.buffer_texture.texture->res);
+			}
+			break;
+		case OP_GENERATE_MIPMAPS:
+			exec_mipmaps(dev, op->u.resource.texture, first, sizeof(first));
 			break;
 		case OP_UNSUPPORTED:
 			if (first[0] == 0) {
@@ -3735,7 +4189,9 @@ cmdbuf_execute(struct b2l_mtl_cmdbuf *cb, uint64_t *gpu_us, char *why, size_t wh
 			break;
 		}
 	}
+	const uint64_t t_wait = now_us();
 	settle(dev);
+	execute_summary(t_wait - t0, now_us() - t_wait, st->draws, util_dynarray_num_elements(&cb->ops, struct op));
 	if (st->draws != 0) {
 		unbind_all(dev);
 	}
@@ -3831,10 +4287,13 @@ static const struct b2l_mtl_api api = {
 	.cmdbuf_set_threadgroup_memory = cmdbuf_set_threadgroup_memory,
 	.cmdbuf_dispatch = cmdbuf_dispatch,
 	.texture_view_new = texture_view_new,
+	.cmdbuf_generate_mipmaps = cmdbuf_generate_mipmaps,
 };
 
+/* Version 3 (M4) only adds to the end of version 2's table, so a plug-in
+ * that asks for 2 is given the same table. */
 B2L_EXPORT const struct b2l_mtl_api *
 b2l_mtl_api(uint32_t version)
 {
-	return version == B2L_MTL_API_VERSION ? &api : NULL;
+	return version == B2L_MTL_API_VERSION || version == 2 ? &api : NULL;
 }

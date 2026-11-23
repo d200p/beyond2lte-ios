@@ -968,3 +968,26 @@ loaded, and refuses an escan with `BCME_EPERM` until the country is set, as
 the chip did. Its cases are with the MAC set and already right, with no
 blob in the attachment, and with a chunk unanswered; the first two take both
 rings round.
+
+### Boot 82 (build 80): the first networks heard
+
+The 22 `clmload` chunks were all answered with status 0, and
+`clmload_status` was 0. `clmver` now gives the board's data
+(`9.9.5_BY1LSI`, from the vendor image). The country was not "#n" any
+more: with the CLM loaded the firmware took the NVRAM's `ccode=GB`, rev 0,
+Samsung's default for the European board. On Android the framework then sets
+the country of the network the phone is in. `WLC_UP` gave status 0. The
+passive escan v2 was accepted (status 0) and finished after about 2.9 s with
+3 results: 2 networks, one on channel 1 at -67/-68 dBm and one on channel 58
+(5 GHz) at -74 dBm. Nothing was transmitted. The log has only the channel
+and level of each network, never a name or an address.
+
+Mode 19 now sets the country to "IT" after the CLM, with rev -1. That rev
+lets the firmware take the CLM's default revision for Italy, as DHD's
+`wldev_set_country` does when its table has no entry. The country is then
+read back. "XZ" rev 11 remains the answer when "IT" is refused while the
+country is still "#n". Before the second setting and the read-back, the
+ioctl-response buffers 11 and 12 are posted again. The test's firmware now
+answers "GB" rev 0 once the CLM is loaded and accepts "IT" as rev 4. A new
+case, fault 20, has a CLM that leaves "#n" and refuses "IT", so "XZ" rev 11
+is set.

@@ -1380,9 +1380,10 @@ wifi_host_mac(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb
  * chunks of 1400 bytes, each a wl_dload_data_t: flag (DLOAD_HANDLER_VER << 12,
  * DL_BEGIN on the first, DL_END on the last), DL_TYPE_CLM, the chunk's
  * length, crc 0, the bytes, padded to 8; ioctl-response buffers 11 and 12
- * posted for every two. Then "clmload_status", "clmver" and "country"; when
- * the country is still "#n" it is set to "XZ" rev 11, the universal code
- * Samsung's DHD uses when it knows no other (dhd_custom_sec.c) -- a setting:
+ * posted for every two. Then "clmload_status", "clmver" and "country"; the
+ * country is set to "IT" (boot 82: the NVRAM's GB came with the CLM), and to
+ * "XZ" rev 11, the universal code Samsung's DHD uses when it knows no other
+ * (dhd_custom_sec.c), if "IT" is refused while it is still "#n" -- settings:
  * nothing is transmitted. 0: go on, 1: unanswered, -1: a failed access.
  */
 static int
@@ -1455,14 +1456,55 @@ wifi_host_clm(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb
         WIFI_HOST_IOVAR_IN + 0x600u, &answer, &bytes, &status);
     if (r) goto unanswered;
     const int null_country = status == 0 && bytes >= 12 && answer[0] == '#' && answer[1] == 'n';
+    const int italy = status == 0 && bytes >= 12 && answer[0] == 'I' && answer[1] == 'T' && answer[2] == 0;
     wlog("mode 19: country now (status %d, %u bytes): %s\n", status, bytes,
-        status || bytes < 12 ? "not given" : null_country ? "still #n" : "a country of the CLM's");
-    if (null_country) {
-        static const uint8_t xz[12] = { 'X', 'Z', 0, 0, 11, 0, 0, 0, 'X', 'Z', 0, 0 };   /* wl_country_t */
-        r = wifi_host_var(regions, info, d2h_mb, last, "mode 19", (*next)++, 263, "country", xz, sizeof(xz), 20,
+        status || bytes < 12 ? "not given" : null_country ? "still #n" : italy ? "IT" :
+        "a country of the CLM's (the NVRAM's ccode)");
+    /*
+     * Boot 82: with the CLM the firmware took the NVRAM's ccode=GB (rev 0),
+     * Samsung's default for the European board; Android sets the country of
+     * the network it is in afterwards. This phone is in Italy: "IT" with rev
+     * -1, which lets the firmware take the CLM's default revision for it, as
+     * DHD's wldev_set_country does when its table has no entry. XZ rev 11
+     * stays the answer to a refusal while the country is still "#n". A
+     * setting: nothing is transmitted.
+     */
+    int italy_status = 0;
+    if (!italy) {
+        static const uint8_t it[12] = { 'I', 'T', 0, 0, 0xff, 0xff, 0xff, 0xff, 'I', 'T', 0, 0 };   /* wl_country_t */
+        r = wifi_host_var(regions, info, d2h_mb, last, "mode 19", (*next)++, 263, "country", it, sizeof(it), 20,
             WIFI_HOST_IOVAR_IN + 0x800u, &answer, &bytes, &status);
         if (r) goto unanswered;
+        italy_status = status;
+        wlog("mode 19: country set to IT (rev -1, the CLM's default): status %d\n", status);
+        /* buffers 9 and 10 answered the reading and the setting: 11 and 12
+         * for the XZ setting and the reading back */
+        r = wifi_host_repost(regions, info, last, *next, 11);
+        if (r < 0) goto failed;
+        *next += (unsigned)r;
+    }
+    if (italy_status != 0 && null_country) {
+        static const uint8_t xz[12] = { 'X', 'Z', 0, 0, 11, 0, 0, 0, 'X', 'Z', 0, 0 };   /* wl_country_t */
+        r = wifi_host_var(regions, info, d2h_mb, last, "mode 19", (*next)++, 263, "country", xz, sizeof(xz), 20,
+            WIFI_HOST_IOVAR_IN + 0xa00u, &answer, &bytes, &status);
+        if (r) goto unanswered;
         wlog("mode 19: country set to XZ rev 11: status %d\n", status);
+    }
+    if (!italy) {
+        r = wifi_host_var(regions, info, d2h_mb, last, "mode 19", (*next)++, 262, "country", NULL, 0, 32,
+            WIFI_HOST_IOVAR_IN + 0xc00u, &answer, &bytes, &status);
+        if (r) goto unanswered;
+        if (status == 0 && bytes >= 12) {
+            char abbrev[5], ccode[5];
+            for (unsigned c = 0; c < 4; c++) {
+                abbrev[c] = answer[c] >= 0x20 && answer[c] <= 0x7e ? (char)answer[c] : 0;
+                ccode[c] = answer[8 + c] >= 0x20 && answer[8 + c] <= 0x7e ? (char)answer[8 + c] : 0;
+            }
+            abbrev[4] = ccode[4] = 0;
+            wlog("mode 19: country after the setting: %s rev %d, ccode %s\n", abbrev, (int)wifi_le32(answer + 4), ccode);
+        } else {
+            wlog("mode 19: country after the setting (status %d, %u bytes): not given\n", status, bytes);
+        }
     }
     wifi_quick = 0;
     return 0;

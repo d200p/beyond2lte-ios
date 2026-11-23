@@ -737,3 +737,59 @@ the device. Core Animation then stays on OpenGL ES. A marker older than the
 boot counts for nothing. Command buffer errors after the first 32 are only
 counted, and every 600 command buffers one line gives the count, the
 errors and the GPU time.
+
+### Boot 82 (build 80): M3 reached, and M4 as written
+
+backboardd took the device on its first start and drew the lock screen and
+home screen with Metal: no crash, no fallback to OpenGL ES, more than 600
+command buffers with one error (`generateMipmapsForTexture:`, not
+implemented), about 6.5 ms each. On the phone most things looked right,
+but everything was much slower. The first frame came at about 200 s
+(OpenGL ES, boot 81: 68 s). Core Animation asked for its generic fragment
+shader, `fixed_frag_lph_cpf` with 25 of its 60 constants (`fc_generic=1`,
+25,996 NIR instructions after the clean-up, framebuffer fetch on), in six
+pipelines that differ only in their colour format (71, 81, 80, 43, 70,
+115). Each translated the AIR again (1.4-2.3 s) and Panfrost compiled it
+again (about 20 s); backboardd's CPU was busy for those two minutes. After
+that, 52-151 frames reached the screen per 600 vsyncs (OpenGL ES: 103-165).
+Opening Mesa took 12 s in backboardd, as for OpenGL ES at boot 81.
+backboardd also refused 59 IOSurfaces whose rows are 480 bytes (the Mali
+needs multiples of 64), so what they hold was not drawn.
+
+The test program: 41 of 42 passed. The draw with `fc_perspective=1` still
+comes out near zero. The controls: without the scratch forwarding, the
+32-bit varyings or the vertex input numbering Core Animation's red layer
+is wrong again, so all three stay. Without the dropped stores to colour
+outputs with no attachment it is right, so that one is no longer needed
+(it stays: it costs nothing).
+
+M4, first step (speed, build 81):
+
+- A translated function is kept by its bitcode and constants (SHA-1): the
+  next `MTLFunction` with the same ones uses the same NIR. Core Animation
+  makes a new `MTLFunction` for every pipeline.
+- A Panfrost shader is kept by the SHA-1 of its final NIR (after the
+  per-pipeline fixes): the next pipeline with the same NIR uses the same
+  shader. Bifrost's fragment variants do not depend on the colour format,
+  as the framebuffer fetch reads its conversion at draw time. So the six
+  pipelines above need one compile, not six. Up to 128 shaders are kept,
+  and a shader no pipeline holds makes room. The label `b2l:no-share` turns
+  this off for a pipeline.
+- An IOSurface whose rows the Mali cannot use gets a shadow, as in the EAGL
+  layer since boot 55: storage of its own, filled from the surface. Every
+  texture of the same surface shares it. A shadow nothing has drawn into is
+  filled again when the next texture of it is made. It is not written back.
+- `generateMipmapsForTexture:` through `util_gen_mipmap` (API version 3; a
+  plug-in asking for 2 gets the same table). A texture of several levels is
+  made a render target when its format allows it, so the blits can draw it.
+- Diagnostics: a draw that takes 100 ms or more on the CPU (a shader variant
+  made at the draw), and every 600 command buffers the time spent encoding
+  and waiting for the GPU.
+- Tests: `generateMipmapsForTexture:` (level 3 of a green texture), and a
+  120 x 16 IOSurface with 480-byte rows cleared through one texture and read
+  back through another.
+
+Still to do for M4: a disk cache for the compiled shaders across boots,
+which needs Mesa's `pan_disk_cache.c` adapted to Mach-O (it identifies the
+driver by an ELF build-id), and executing command buffers off the caller's
+thread. Today `commit` waits for the GPU before it returns.

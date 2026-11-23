@@ -23,7 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define B2L_MTL_API_VERSION 2
+#define B2L_MTL_API_VERSION 3
 
 #define B2L_MTL_MAX_COLORS     8
 #define B2L_MTL_MAX_ATTRIBUTES 31
@@ -304,6 +304,10 @@ struct b2l_mtl_api {
 	struct b2l_mtl_texture *(*texture_view_new)(struct b2l_mtl_texture *texture, uint32_t pixel_format,
 	    uint32_t type, uint32_t first_level, uint32_t levels, uint32_t first_slice, uint32_t slices, char *why,
 	    size_t why_size);
+
+	/* Version 3 (M4). A blit: every level of the texture after its first
+	 * made from the one before (generateMipmapsForTexture:). */
+	void (*cmdbuf_generate_mipmaps)(struct b2l_mtl_cmdbuf *cmdbuf, struct b2l_mtl_texture *texture);
 };
 
 /* The table, or NULL if this library does not have that version. */

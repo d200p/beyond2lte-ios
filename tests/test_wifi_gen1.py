@@ -408,14 +408,30 @@ static void iovar15(uint32_t value) {
         static const char generic[64] = "API: 20.0\nData: Generic.Min\nCreation: test\n";
         assert(mode >= 18 && length == 512); data = mode >= 19 && !clm19_loaded ? generic : clm; resp = 64;
     } else if (cmd == 262 && !strcmp(input, "country")) {
+        /* Mode 19, as the chip did at boot 82: with the CLM loaded the
+         * NVRAM's ccode (GB rev 0); "IT" with rev -1 becomes the CLM's
+         * default revision (4 here). Fault 20: a CLM that leaves "#n" and
+         * refuses IT, so XZ rev 11 is set. */
         static const uint8_t country[12] = { 'X', 'Z', 0, 0, 7, 0, 0, 0, 'X', 'Z', 0, 0 };
         static const uint8_t null[12] = { '#', 'n', 0, 0, 0, 0, 0, 0, '#', 'n', 0, 0 };
         static const uint8_t xz11[12] = { 'X', 'Z', 0, 0, 11, 0, 0, 0, 'X', 'Z', 0, 0 };
-        assert(mode >= 18 && length == 32); data = mode < 19 ? country : country19 ? xz11 : null; resp = 12;
+        static const uint8_t gb[12] = { 'G', 'B', 0, 0, 0, 0, 0, 0, 'G', 'B', 0, 0 };
+        static const uint8_t it4[12] = { 'I', 'T', 0, 0, 4, 0, 0, 0, 'I', 'T', 0, 0 };
+        assert(mode >= 18 && length == 32);
+        data = mode < 19 ? country : country19 == 2 ? it4 : country19 == 1 ? xz11 :
+            clm19_loaded && host13_fault != 20 ? gb : null;
+        resp = 12;
     } else if (cmd == 263 && !strcmp(input, "country")) {
         static const uint8_t xz11[12] = { 'X', 'Z', 0, 0, 11, 0, 0, 0, 'X', 'Z', 0, 0 };
-        assert(mode >= 19 && length == 20 && !memcmp(input + 8, xz11, 12) && clm19_loaded && !country19);
-        country19 = 1;
+        static const uint8_t it[12] = { 'I', 'T', 0, 0, 0xff, 0xff, 0xff, 0xff, 'I', 'T', 0, 0 };
+        assert(mode >= 19 && length == 20 && clm19_loaded && !country19);
+        if (!memcmp(input + 8, it, 12)) {
+            if (host13_fault == 20) status = -2;        /* BCME_BADARG */
+            else country19 = 2;
+        } else {
+            assert(!memcmp(input + 8, xz11, 12) && host13_fault == 20);
+            country19 = 1;
+        }
     } else if (cmd == 263 && !strcmp(input, "clmload")) {
         const uint8_t *q = (const uint8_t *)input + 8;
         const unsigned flag = q[0] | q[1] << 8, type = q[2] | q[3] << 8;
@@ -459,7 +475,8 @@ static void iovar15(uint32_t value) {
         escans18++;
         console18("000001.500 wl0: escan from 00:90:4c:c5:12:38\n");
         if (host13_fault == 12) status = -2;
-        else if (host13_fault == 18 || (host13_fault == 17 && escans18 == 1) || (mode >= 19 && !country19))
+        else if (host13_fault == 18 || (host13_fault == 17 && escans18 == 1) ||
+            (mode >= 19 && (!clm19_loaded || (host13_fault == 20 && !country19))))
             status = -26;   /* BCME_EPERM */
         else start_scan = 1;
     } else {
@@ -1708,8 +1725,8 @@ int main(void) {
      * With the address right (2) and after the set (0); without a blob in
      * the attachment; a chunk unanswered (19). */
     mode = 19;
-    static const unsigned faults19[][3] = { { 0, 2, 1 }, { 0, 0, 1 }, { 0, 2, 0 }, { 19, 2, 1 } };
-    for (unsigned k = 0; k < 4; k++) {
+    static const unsigned faults19[][3] = { { 0, 2, 1 }, { 0, 0, 1 }, { 0, 2, 0 }, { 19, 2, 1 }, { 20, 2, 1 } };
+    for (unsigned k = 0; k < 5; k++) {
         reset(8, 0); firmware_fixture_nvram(good, sizeof(good)); nvram_fixture_bytes = sizeof(good);
         if (faults19[k][2]) firmware_fixture_clm();
         host13_fault = faults19[k][0]; firmware_mac_mode = faults19[k][1];
@@ -1735,10 +1752,20 @@ int main(void) {
         assert(clm19_chunks == 22 && clm19_loaded && clm19_got == FIXTURE_CLM_BYTES);
         assert(strstr(logs, "mode 19: clmload_status (status 0, 4 bytes): 0\n"));
         assert(strstr(logs, "mode 19: clmver now (status 0, 64 bytes): API: 20.0 | Data: Model.CLM 1.2 | Creation: test\n"));
-        assert(strstr(logs, "mode 19: country now (status 0, 12 bytes): still #n\n"));
-        assert(strstr(logs, "mode 19: country set to XZ rev 11: status 0\n") && country19);
+        if (host13_fault == 20) {
+            assert(strstr(logs, "mode 19: country now (status 0, 12 bytes): still #n\n"));
+            assert(strstr(logs, "mode 19: country set to IT (rev -1, the CLM's default): status -2\n"));
+            assert(strstr(logs, "mode 19: country set to XZ rev 11: status 0\n") && country19 == 1);
+            assert(strstr(logs, "mode 19: country after the setting: XZ rev 11, ccode XZ\n"));
+            assert(strstr(logs, "mode 18: country (status 0, 12 bytes): XZ rev 11, ccode XZ\n"));
+        } else {
+            assert(strstr(logs, "mode 19: country now (status 0, 12 bytes): a country of the CLM's (the NVRAM's ccode)\n"));
+            assert(strstr(logs, "mode 19: country set to IT (rev -1, the CLM's default): status 0\n") && country19 == 2);
+            assert(!strstr(logs, "XZ rev 11"));
+            assert(strstr(logs, "mode 19: country after the setting: IT rev 4, ccode IT\n"));
+            assert(strstr(logs, "mode 18: country (status 0, 12 bytes): IT rev 4, ccode IT\n"));
+        }
         assert(strstr(logs, "mode 17: WLC_UP: status 0\n"));
-        assert(strstr(logs, "mode 18: country (status 0, 12 bytes): XZ rev 11, ccode XZ\n"));
         assert(strstr(logs, "mode 18: escan v2 (passive, every channel, 110 ms each) set: status 0\n"));
         assert(strstr(logs, "mode 18: 5 results, 4 networks (2 on 2.4 GHz, 2 on 5/6 GHz), RSSI -80 to -40 dBm; "
             "0 other events, 0 malformed; 6 event buffers given back\n"));

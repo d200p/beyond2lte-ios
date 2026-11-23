@@ -663,11 +663,15 @@ mesa_open(void)
 	const struct b2l_mtl_api *(*table)(uint32_t) =
 	    mesa != NULL ? (const struct b2l_mtl_api *(*)(uint32_t))dlsym(mesa, "b2l_mtl_api") : NULL;
 	mtl = table != NULL ? table(B2L_MTL_API_VERSION) : NULL;
+	if (mtl == NULL && table != NULL) {
+		/* M4: a library of version 2 has everything but the mipmaps. */
+		mtl = table(2);
+	}
 	if (mtl == NULL) {
 		const char *error = dlerror();
 		say("%s: %s; the device has no GPU objects", B2L_MESA_LIBRARY,
 		    mesa == NULL ? (error != NULL ? error : "not loaded") :
-		    table == NULL ? "no b2l_mtl_api" : "not API version 1");
+		    table == NULL ? "no b2l_mtl_api" : "not API version 3 or 2");
 		return;
 	}
 	char why[160] = "";
@@ -3768,14 +3772,21 @@ blit_texture_to_buffer(id self, SEL _cmd, id from, unsigned long slice, unsigned
 	    bytes_per_image);
 }
 
+/* M4 (boot 82): Core Animation's one command buffer error. */
 static void
 blit_mipmaps(id self, SEL _cmd, id texture)
 {
-	(void)texture;
 	struct b2l_mtl_cmdbuf *mc = recording(self);
-	if (mc != NULL) {
-		mtl->cmdbuf_unsupported(mc, sel_getName(_cmd));
+	if (mc == NULL) {
+		return;
 	}
+	struct b2l_mtl_texture *t = mesa_texture(texture);
+	if (mtl->version < 3 || t == NULL) {
+		mtl->cmdbuf_unsupported(mc, t == NULL ? "generateMipmapsForTexture: a texture that is not this device's" :
+		    sel_getName(_cmd));
+		return;
+	}
+	mtl->cmdbuf_generate_mipmaps(mc, t);
 }
 
 static void

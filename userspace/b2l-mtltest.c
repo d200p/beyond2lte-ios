@@ -178,9 +178,9 @@ at(id array, unsigned long index)
 }
 
 static IOSurfaceRef
-make_surface(void)
+make_surface_sized(int width, int height, int row)
 {
-	int values[] = { SIDE, SIDE, 4, ROW, 0x42475241 /* 'BGRA' */, ROW * SIDE };
+	int values[] = { width, height, 4, row, 0x42475241 /* 'BGRA' */, row * height };
 	const void *keys[] = {
 		kIOSurfaceWidth, kIOSurfaceHeight, kIOSurfaceBytesPerElement, kIOSurfaceBytesPerRow,
 		kIOSurfacePixelFormat, kIOSurfaceAllocSize,
@@ -197,6 +197,33 @@ make_surface(void)
 		CFRelease(numbers[i]);
 	}
 	return surface;
+}
+
+static IOSurfaceRef
+make_surface(void)
+{
+	return make_surface_sized(SIDE, SIDE, ROW);
+}
+
+/* Pixels of a w x h BGRA8 image that are not `bgra` (each channel within one). */
+static unsigned
+wrong_in(const uint8_t *rows, size_t row_bytes, unsigned w, unsigned h, const uint8_t bgra[4], uint32_t *first)
+{
+	unsigned wrong = 0;
+	for (unsigned y = 0; y < h; y++) {
+		for (unsigned x = 0; x < w; x++) {
+			const uint8_t *p = rows + y * row_bytes + x * 4;
+			bool bad = false;
+			for (unsigned c = 0; c < 4; c++) {
+				int d = (int)p[c] - (int)bgra[c];
+				bad |= d < -1 || d > 1;
+			}
+			if (bad && wrong++ == 0) {
+				*first = (uint32_t)p[3] << 24 | (uint32_t)p[2] << 16 | (uint32_t)p[1] << 8 | p[0];
+			}
+		}
+	}
+	return wrong;
 }
 
 /* A render encoder on `cb` whose pass first clears `texture`. */
@@ -1314,6 +1341,85 @@ b2l_mtl_test_run(void)
 		wrong = wrong_pixels(back, ROW, blue, &first);
 		verdict("blit: copyFromTexture:toTexture:", status == 4 && wrong == 0,
 		    "status %lu, %u pixels wrong (first 0x%08x), %llu ms %s", status, wrong, first, (unsigned long long)ms, why);
+	}
+
+	/* M4 (boot 82): generateMipmapsForTexture:, Core Animation's one command
+	 * buffer error. Seven levels of 64x64 BGRA8, the first green; the blit
+	 * makes the others, and level 3 (8x8) is read back. */
+	{
+		static const uint8_t green[4] = { 0, 255, 0, 255 };
+		static uint8_t level0[ROW * SIDE];
+		uint8_t level3[8 * 8 * 4];
+		memset(level3, 0, sizeof(level3));
+		for (unsigned i = 0; i < SIDE * SIDE; i++) {
+			memcpy(level0 + i * 4, green, 4);
+		}
+		id md = MSG(id, unsigned long, unsigned long, unsigned long, bool)(cls("MTLTextureDescriptor"),
+		    S("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), 80, SIDE, SIDE, true);
+		MSG(void, unsigned long)(md, S("setUsage:"), 1 | 4);
+		id mt = MSG(id, id)(device, S("newTextureWithDescriptor:"), md);
+		unsigned long levels = mt != nil ? MSG(unsigned long)(mt, S("mipmapLevelCount")) : 0;
+		unsigned long st = 0;
+		char mwhy[200] = "";
+		uint64_t mms = 0;
+		if (mt != nil && levels == 7) {
+			MSG(void, region_t, unsigned long, const void *, unsigned long)(mt,
+			    S("replaceRegion:mipmapLevel:withBytes:bytesPerRow:"), whole, 0, level0, ROW);
+			id mcb = MSG(id)(queue, S("commandBuffer"));
+			id mblit = MSG(id)(mcb, S("blitCommandEncoder"));
+			MSG(void, id)(mblit, S("generateMipmapsForTexture:"), mt);
+			MSG(void)(mblit, S("endEncoding"));
+			st = run(mcb, mwhy, sizeof(mwhy), &mms);
+			region_t r3 = { { 0, 0, 0 }, { 8, 8, 1 } };
+			MSG(void, void *, unsigned long, region_t, unsigned long)(mt, S("getBytes:bytesPerRow:fromRegion:mipmapLevel:"),
+			    level3, 8 * 4, r3, 3);
+		}
+		uint32_t mfirst = 0;
+		unsigned mwrong = wrong_in(level3, 8 * 4, 8, 8, green, &mfirst);
+		verdict("blit: generateMipmapsForTexture:", mt != nil && levels == 7 && st == 4 && mwrong == 0,
+		    "%lu levels, status %lu, %u of 64 pixels of level 3 wrong (first 0x%08x), %llu ms %s", levels, st, mwrong,
+		    mfirst, (unsigned long long)mms, mwhy);
+	}
+
+	/* M4 (boot 82): an IOSurface whose rows the Mali cannot use in place
+	 * (120 pixels, 480 bytes, as backboardd's 59 refused ones): its texture
+	 * gets a shadow, one pass clears it green, and a second texture of the
+	 * same surface reads the green back (the two share the shadow). */
+	{
+		static const uint8_t green[4] = { 0, 255, 0, 255 };
+		static uint8_t odd_back[480 * 16];
+		memset(odd_back, 0, sizeof(odd_back));
+		IOSurfaceRef odd = make_surface_sized(120, 16, 480);
+		size_t odd_row = odd != NULL ? IOSurfaceGetBytesPerRow(odd) : 0;
+		id od = MSG(id, unsigned long, unsigned long, unsigned long, bool)(cls("MTLTextureDescriptor"),
+		    S("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), 80, 120, 16, false);
+		MSG(void, unsigned long)(od, S("setUsage:"), 1 | 4);
+		id o1 = odd != NULL ? MSG(id, id, IOSurfaceRef, unsigned long)(device,
+		    S("newTextureWithDescriptor:iosurface:plane:"), od, odd, 0) : nil;
+		unsigned long st = 0;
+		char owhy[200] = "";
+		uint64_t oms = 0;
+		id o2 = nil;
+		if (o1 != nil) {
+			id ocb = MSG(id)(queue, S("commandBuffer"));
+			clear_pass(ocb, o1, (clear_color){ 0.0, 1.0, 0.0, 1.0 });
+			st = run(ocb, owhy, sizeof(owhy), &oms);
+			o2 = MSG(id, id, IOSurfaceRef, unsigned long)(device, S("newTextureWithDescriptor:iosurface:plane:"), od,
+			    odd, 0);
+		}
+		if (o2 != nil) {
+			region_t r = { { 0, 0, 0 }, { 120, 16, 1 } };
+			MSG(void, void *, unsigned long, region_t, unsigned long)(o2, S("getBytes:bytesPerRow:fromRegion:mipmapLevel:"),
+			    odd_back, 480, r, 0);
+		}
+		uint32_t ofirst = 0;
+		unsigned owrong = wrong_in(odd_back, 480, 120, 16, green, &ofirst);
+		verdict("IOSurface with rows of 480 bytes: drawn, read through a second texture", o1 != nil && o2 != nil &&
+		    st == 4 && owrong == 0, "surface rows %zu bytes, status %lu, %u of 1920 pixels wrong (first 0x%08x), %llu ms %s",
+		    odd_row, st, owrong, ofirst, (unsigned long long)oms, owhy);
+		if (odd != NULL) {
+			CFRelease(odd);
+		}
 	}
 
 	/* a sampler */
