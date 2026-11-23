@@ -906,3 +906,25 @@ Added for build 84:
 - The 600-buffer summary splits the encoding time: draws, Panfrost's
   `draw_vbo` alone, and the textures on buffers (copied in, unchanged,
   written back).
+
+### Boot 88 (build 84): the same crash, without mipmaps
+
+The disk cache now lives in `/private/var/mobile/Library/Caches/b2l-mesa-cache`
+and is writable. chronod and WidgetRenderer_Default were shown the device.
+backboardd died again while the user swiped between home screen pages, at
+the same place: `pan_preload_fb_part+0x4fc`, from `cmdbuf_execute`'s flush,
+this time with no mipmaps before it. The faulting instruction (decoded from
+the unstripped library) is a store, `str w8, [x0, #0x108]`. Panfrost was
+packing a descriptor (stores at +0x0 to +0x10c) whose start lies 0xa0 bytes
+before a 16 KB page boundary. The next page was unmapped (boot 87) or
+protected (boot 88), so the write landed about 0x6c bytes past the end of a
+CPU mapping.
+
+Added for build 85:
+
+- Every buffer object the CPU can map is made one 16 KB page larger than
+  asked (if the kernel can give it), so such an overrun lands inside the
+  object. `b2l_drm_mmap` logs a mapping shorter than its object.
+- A colour attachment with `MTLLoadActionDontCare` is cleared to zero, not
+  preloaded: undefined contents allow it. This also saves the preload's
+  full-screen pass.

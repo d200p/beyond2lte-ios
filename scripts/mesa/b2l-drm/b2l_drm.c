@@ -351,10 +351,23 @@ bo_get(uint32_t handle)
 static int
 bo_create(struct drm_panfrost_create_bo *args)
 {
-	uint64_t in[2] = { args->size, args->flags }, out[2] = { 0, 0 };
+	/* M4 (boots 87-88): backboardd died twice writing a descriptor 0x6c bytes
+	 * past the end of a CPU mapping, across a 16 KB page (pan_preload_fb_part,
+	 * str w8, [x0, #0x108]). Every object the CPU can map gets one more 16 KB
+	 * page from the kernel, so that a write that runs over by less lands in it;
+	 * b2l_drm_mmap says when a mapping is shorter than the object. Without
+	 * room for the page, the object is made as asked. */
+	const bool pad = !(args->flags & PANFROST_BO_HEAP);
+	uint64_t in[2] = { args->size + (pad ? 16384u : 0u), args->flags }, out[2] = { 0, 0 };
 	uint32_t count = 2;
-	if (IOConnectCallMethod(drm.connection, kB2LMaliBoCreate, in, 2, NULL, 0, out, &count, NULL, NULL) !=
-	    KERN_SUCCESS || out[0] == 0 || out[0] > B2L_MALI_MAX_BOS) {
+	kern_return_t kr = IOConnectCallMethod(drm.connection, kB2LMaliBoCreate, in, 2, NULL, 0, out, &count, NULL,
+	    NULL);
+	if (pad && (kr != KERN_SUCCESS || out[0] == 0)) {
+		in[0] = args->size;
+		count = 2;
+		kr = IOConnectCallMethod(drm.connection, kB2LMaliBoCreate, in, 2, NULL, 0, out, &count, NULL, NULL);
+	}
+	if (kr != KERN_SUCCESS || out[0] == 0 || out[0] > B2L_MALI_MAX_BOS) {
 		return fail(ENOMEM);
 	}
 	struct bo *bo = &drm.bos[out[0]];
@@ -421,6 +434,11 @@ b2l_drm_mmap(void *addr, size_t length, int prot, int flags, int fd, int64_t off
 			if (IOConnectMapMemory64(drm.connection, B2L_MALI_BO_MEMORY(handle), mach_task_self(),
 			    &address, &size, options) == KERN_SUCCESS) {
 				bo->cpu = (uint8_t *)address;
+				static unsigned short_maps;
+				if (size < bo->size && short_maps++ < 16) {
+					b2l_drm_note("libdrm: BO %u mapped %llu bytes of %llu (flags 0x%x)", handle,
+					    (unsigned long long)size, (unsigned long long)bo->size, bo->flags);
+				}
 			}
 		}
 		if (bo->cpu != NULL) {

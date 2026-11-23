@@ -4354,14 +4354,19 @@ exec_pass_begin(struct b2l_mtl_cmdbuf *cb, struct encoder_state *st, const struc
 	pipe->set_framebuffer_state(pipe, &fb);
 	for (unsigned i = 0; i < fb.nr_cbufs; i++) {
 		const struct b2l_mtl_attachment *a = &pass->color[i];
-		if (fb.cbufs[i] == NULL || a->load != 2) {
+		/* M4 (boots 87-88): backboardd died twice in Panfrost's preload of a
+		 * pass's attachments (pan_preload_fb_part). MTLLoadActionDontCare (0)
+		 * leaves the contents undefined: a clear to zero, which needs no
+		 * preload (and saves its full-screen pass), is as good. */
+		const bool dont_care = a->load == 0;
+		if (fb.cbufs[i] == NULL || (a->load != 2 && !dont_care)) {
 			continue;
 		}
 		union pipe_color_union color;
 		memset(&color, 0, sizeof(color));
 		bool is_sint = util_format_is_pure_sint(a->texture->format);
 		bool is_uint = util_format_is_pure_uint(a->texture->format);
-		for (unsigned c = 0; c < 4; c++) {
+		for (unsigned c = 0; c < 4 && !dont_care; c++) {
 			if (is_sint) {
 				color.i[c] = (int32_t)a->clear[c];
 			} else if (is_uint) {
