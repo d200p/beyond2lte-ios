@@ -1028,3 +1028,13 @@ Networks are counted once over the three passes, and of each the log notes
 only whether it has a name, never the name or the address. The test's
 firmware lists `idsup`, answers `sup_wpa` 1, checks that the third escan is
 the active one, and replays its results.
+
+### Boot 90 (build 85): the first transmission
+
+The active escan was accepted and finished (status 0). It found one network
+the passive passes had not heard, so the three passes heard 4 networks in
+all: 3 on 2.4 GHz and 1 on 5 GHz, all with a name, from -93 to -64 dBm.
+`sup_wpa` is not supported (`BCME_UNSUPPORTED`, -23), so this firmware has no
+WPA supplicant of its own: a join needs one on the host, as UniXNU's iPadOS
+port runs `wpa_supplicant` beside the stock `wifid`. `cap` answered
+`BCME_BUFTOOSHORT` (-14) in 512 bytes, and is now asked in 2048.

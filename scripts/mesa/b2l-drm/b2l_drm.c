@@ -357,7 +357,9 @@ bo_create(struct drm_panfrost_create_bo *args)
 	 * page from the kernel, so that a write that runs over by less lands in it;
 	 * b2l_drm_mmap says when a mapping is shorter than the object. Without
 	 * room for the page, the object is made as asked. */
-	const bool pad = !(args->flags & PANFROST_BO_HEAP);
+	/* Boot 90: a page on every object ran Metal's 768 MiB out; only
+	 * Panfrost's 64 KiB pool slabs, where descriptors are packed, get it. */
+	const bool pad = !(args->flags & PANFROST_BO_HEAP) && args->size == 65536;
 	uint64_t in[2] = { args->size + (pad ? 16384u : 0u), args->flags }, out[2] = { 0, 0 };
 	uint32_t count = 2;
 	kern_return_t kr = IOConnectCallMethod(drm.connection, kB2LMaliBoCreate, in, 2, NULL, 0, out, &count, NULL,

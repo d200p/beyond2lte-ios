@@ -158,7 +158,7 @@ extern "C" pmap_t get_task_pmap(task_t task);
 #define B2L_RT_BO_VA           0xa0000000ull   /* buffer objects: after the draw client's buffers, */
 #define B2L_RT_BO_END          0x100000000ull  /* under 4 GiB like Linux panfrost's range */
 #define B2L_RT_BO_PAGES        ((B2L_RT_BO_END - B2L_RT_BO_VA) >> 12)
-#define B2L_RT_BO_LIMIT        (768ull << 20)  /* resident bytes of all buffer objects */
+#define B2L_RT_BO_LIMIT        (1024ull << 20) /* resident bytes of all buffer objects (boot 90: 768 MiB ran out under Metal) */
 #define B2L_RT_BO_CODE_PAGES   4096            /* executable objects stay inside 16 MiB */
 #define B2L_GPU_BOOST_KHZ      433000          /* the stock tree's sustainable level */
 #define B2L_GPU_UNGUARDED_KHZ  325000          /* the most without a temperature */

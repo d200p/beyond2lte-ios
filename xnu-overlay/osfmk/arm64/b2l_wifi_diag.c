@@ -1852,10 +1852,10 @@ wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
         r = wifi_host_repost(regions, info, last, *next, 9);
         if (r < 0) return -1;
         *next += (unsigned)r;
-        r = wifi_host_var(regions, info, d2h_mb, last, "mode 21", (*next)++, 262, "cap", NULL, 0, 512,
+        r = wifi_host_var(regions, info, d2h_mb, last, "mode 21", (*next)++, 262, "cap", NULL, 0, 2048,
             WIFI_HOST_IOVAR_IN + 0x600u, &answer, &bytes, &status);
         if (r) return r < 0 ? -1 : 0;
-        char caps[220];
+        char caps[401];    /* the first 400 characters; boot 90: 512 bytes were too short for the answer */
         unsigned cn = 0;
         int idsup = 0;
         for (unsigned k = 0; status == 0 && k < bytes && answer[k] && cn + 1 < sizeof(caps); k++)

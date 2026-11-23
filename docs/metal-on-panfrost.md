@@ -950,3 +950,14 @@ Added (build 85, with the BO page and DontCare changes above):
 - The Metal test child runs only with `b2l_mtl_test=1`. The M2c NIR dump is
   gone. The two lines every pipeline wrote are kept for the first 40, every
   100th, and any slow one.
+
+### Boot 90 (build 85): GPU memory ran out
+
+After 11 minutes backboardd died in `texture_replace` <
+`u_default_texture_subdata` < `panfrost_ptr_map`, at NULL + 0x148. Just
+before it, Panfrost refused full-screen textures (`resource_create refused
+b8g8r8a8_unorm 1112x2432`). B2LMali's limit on resident buffer objects
+(768 MiB) had been reached, sooner because every mappable object carried
+16 KiB more. The limit is now 1 GiB (the objects' GPU range is 1.5 GiB), and
+only Panfrost's 64 KiB pool slabs get the extra page. No mapping shorter than
+its object was logged.

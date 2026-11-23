@@ -398,7 +398,7 @@ static void iovar15(uint32_t value) {
         assert(mode >= 17 && length == 4 && !memcmp(input, zero, 4)); up17 = 1; answer = host13_fault != 11;
     } else if (cmd == 262 && !strcmp(input, "cap")) {
         static const char cap[64] = "ap sta wme 802.11d 802.11h rm idsup sae";
-        assert(mode >= 21 && length == 512); data = cap; resp = sizeof(cap);
+        assert(mode >= 21 && length == 2048); data = cap; resp = sizeof(cap);
     } else if (cmd == 262 && !strcmp(input, "sup_wpa")) {
         static const uint32_t one = 1;
         assert(mode >= 21 && length == 32); data = &one; resp = 4;
