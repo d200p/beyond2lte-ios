@@ -96,6 +96,9 @@
 #define B2L_MALI_MMU_IRQ_RAWSTAT   0x2000
 #define B2L_MALI_MMU_IRQ_CLEAR     0x2004
 #define B2L_MALI_MMU_IRQ_MASK      0x2008
+#define B2L_MALI_MMU_AS0_FAULT     ((1u << 0) | (1u << 16))   /* page fault, bus error of AS0 */
+/* run_job's answer for a job stopped on a fault of its address space. */
+#define B2L_MALI_STATUS_MMU_FAULT  0x100u
 #define B2L_MALI_AS0               0x2400
 #define B2L_MALI_AS_TRANSTAB_LO    0x00
 #define B2L_MALI_AS_TRANSTAB_HI    0x04
@@ -284,6 +287,13 @@ struct b2l_mali_io {
 	uint32_t (*read)(void *ctx, uint32_t offset);
 	void (*write)(void *ctx, uint32_t offset, uint32_t value);
 	void (*delay_us)(void *ctx, uint32_t us);
+	/*
+	 * Microseconds of a clock that runs on its own, or NULL. Boot 91: a delay
+	 * may sleep longer than asked (B2LMali sleeps at least 50 us and the
+	 * scheduler adds to it), so counting 10 us a loop made the 1 s job
+	 * timeout 8.8 s of a frozen screen. With a clock a wait ends on time.
+	 */
+	uint64_t (*now_us)(void *ctx);
 };
 
 static inline uint32_t
@@ -305,6 +315,18 @@ b2l_mali_wait(const struct b2l_mali_io *io, uint32_t offset, uint32_t mask,
 {
 	uint32_t waited;
 
+	if (io->now_us != NULL) {
+		const uint64_t start = io->now_us(io->ctx);
+		for (;;) {
+			if ((b2l_mali_r(io, offset) & mask) == value) {
+				return 1;
+			}
+			if (io->now_us(io->ctx) - start > timeout_us) {
+				return 0;
+			}
+			io->delay_us(io->ctx, 10);
+		}
+	}
 	for (waited = 0; waited <= timeout_us; waited += 10) {
 		if ((b2l_mali_r(io, offset) & mask) == value) {
 			return 1;
@@ -312,6 +334,25 @@ b2l_mali_wait(const struct b2l_mali_io *io, uint32_t offset, uint32_t mask,
 		io->delay_us(io->ctx, 10);
 	}
 	return 0;
+}
+
+/* Wait until any bit of mask is set in the register; 0 on timeout. */
+static inline int
+b2l_mali_wait_any(const struct b2l_mali_io *io, uint32_t offset, uint32_t mask, uint32_t timeout_us)
+{
+	const uint64_t start = io->now_us != NULL ? io->now_us(io->ctx) : 0;
+	uint32_t waited = 0;
+
+	for (;;) {
+		if (b2l_mali_r(io, offset) & mask) {
+			return 1;
+		}
+		if (io->now_us != NULL ? io->now_us(io->ctx) - start > timeout_us : waited > timeout_us) {
+			return 0;
+		}
+		io->delay_us(io->ctx, 10);
+		waited += 10;
+	}
 }
 
 static inline void
@@ -439,8 +480,15 @@ b2l_mali_flush_everything(const struct b2l_mali_io *io, unsigned log2_bytes)
 
 /*
  * Run one job chain on a slot in address space 0 and wait for it. Returns the
- * JS_STATUS exception code (1 is done), or 0 after a timeout, in which case the
- * job has been hard-stopped.
+ * JS_STATUS exception code (1 is done), 0 after a timeout, or
+ * B2L_MALI_STATUS_MMU_FAULT plus the AS_FAULTSTATUS exception type when the
+ * job faulted in the MMU; in both of the last two the job has been
+ * hard-stopped and the address space needs a reset before the next job.
+ *
+ * Boot 91: a job that reads an unmapped address does not finish. It waits on
+ * its page fault (MMU_IRQ_RAWSTAT, AS0) until somebody answers; nobody did,
+ * and the timeout (8.8 s, see now_us) froze the screen three times. A fault
+ * now stops the job at once.
  */
 static inline uint32_t
 b2l_mali_run_job(const struct b2l_mali_io *io, unsigned slot, uint64_t job_va, uint32_t timeout_us)
@@ -451,21 +499,41 @@ b2l_mali_run_job(const struct b2l_mali_io *io, unsigned slot, uint64_t job_va, u
 	uint32_t status;
 
 	b2l_mali_w(io, B2L_MALI_JOB_IRQ_CLEAR, 0xffffffffu);
+	b2l_mali_w(io, B2L_MALI_MMU_IRQ_CLEAR, B2L_MALI_MMU_AS0_FAULT);
 	b2l_mali_w(io, js + B2L_MALI_JS_HEAD_NEXT_LO, (uint32_t)job_va);
 	b2l_mali_w(io, js + B2L_MALI_JS_HEAD_NEXT_HI, (uint32_t)(job_va >> 32));
 	b2l_mali_w(io, js + B2L_MALI_JS_AFFINITY_NEXT_LO, shader);
 	b2l_mali_w(io, js + B2L_MALI_JS_AFFINITY_NEXT_HI, 0);
 	b2l_mali_w(io, js + B2L_MALI_JS_CONFIG_NEXT, B2L_MALI_JS_CONFIG);
 	b2l_mali_w(io, js + B2L_MALI_JS_COMMAND_NEXT, B2L_MALI_JS_START);
-	if (b2l_mali_wait(io, B2L_MALI_JOB_IRQ_RAWSTAT, finished, B2L_MALI_JOB_DONE(slot), timeout_us)) {
-		return 1;
+	/* As b2l_mali_wait, but a fault of the address space ends the wait too. */
+	const uint64_t start = io->now_us != NULL ? io->now_us(io->ctx) : 0;
+	uint32_t waited = 0, irq;
+	for (;;) {
+		irq = b2l_mali_r(io, B2L_MALI_JOB_IRQ_RAWSTAT);
+		if ((irq & finished) == B2L_MALI_JOB_DONE(slot)) {
+			return 1;
+		}
+		if (irq & finished) {
+			status = b2l_mali_r(io, js + B2L_MALI_JS_STATUS);
+			return status ? status : 1;
+		}
+		if (b2l_mali_r(io, B2L_MALI_MMU_IRQ_RAWSTAT) & B2L_MALI_MMU_AS0_FAULT) {
+			uint32_t fault = b2l_mali_r(io, B2L_MALI_AS0 + B2L_MALI_AS_FAULTSTATUS);
+			b2l_mali_w(io, js + B2L_MALI_JS_COMMAND, B2L_MALI_JS_HARD_STOP);
+			b2l_mali_wait_any(io, B2L_MALI_JOB_IRQ_RAWSTAT, finished, 2000);
+			return B2L_MALI_STATUS_MMU_FAULT | (fault & 0xffu);
+		}
+		if (io->now_us != NULL ? io->now_us(io->ctx) - start > timeout_us : waited > timeout_us) {
+			break;
+		}
+		io->delay_us(io->ctx, 10);
+		waited += 10;
 	}
-	if (b2l_mali_r(io, B2L_MALI_JOB_IRQ_RAWSTAT) & finished) {
-		status = b2l_mali_r(io, js + B2L_MALI_JS_STATUS);
-		return status ? status : 1;
-	}
+	/* Boot 91: this waited for DONE and FAILED both, which a stopped job never
+	 * raises (FAILED only), so every timeout added the whole 100 ms. */
 	b2l_mali_w(io, js + B2L_MALI_JS_COMMAND, B2L_MALI_JS_HARD_STOP);
-	b2l_mali_wait(io, B2L_MALI_JOB_IRQ_RAWSTAT, finished, finished, 100000);
+	b2l_mali_wait_any(io, B2L_MALI_JOB_IRQ_RAWSTAT, finished, 100000);
 	return 0;
 }
 

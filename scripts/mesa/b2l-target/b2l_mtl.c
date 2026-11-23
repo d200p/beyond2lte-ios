@@ -90,6 +90,48 @@ say(char *why, size_t why_size, const char *format, ...)
 	va_end(ap);
 }
 
+/*
+ * M4 (boot 91): Metal's own GPU memory, alive in this process. backboardd's
+ * textures were refused when the GPU's buffer objects ran out (768 MiB, the
+ * kernel's limit) and nothing said who held them. Textures count the
+ * resource they made (not views, not imported IOSurfaces), buffers their
+ * length; the 600-command-buffer summary and a refusal say the totals.
+ */
+static uint64_t alive_textures, alive_texture_bytes, alive_buffers, alive_buffer_bytes;
+static uint64_t cpu_tiled_textures;             /* written by the CPU: no AFBC (texture_new_bind) */
+static uint64_t upload_count, upload_bytes, upload_us;  /* replaceRegion since the last summary */
+
+static void
+alive_add(uint64_t *count, uint64_t *bytes, int64_t n, int64_t size)
+{
+	__atomic_add_fetch(count, (uint64_t)n, __ATOMIC_RELAXED);
+	__atomic_add_fetch(bytes, (uint64_t)size, __ATOMIC_RELAXED);
+}
+
+static void
+alive_say(char *out, size_t size)
+{
+	snprintf(out, size, "%llu textures %llu MB (%llu linear, CPU-written), %llu buffers %llu MB",
+	    (unsigned long long)__atomic_load_n(&alive_textures, __ATOMIC_RELAXED),
+	    (unsigned long long)(__atomic_load_n(&alive_texture_bytes, __ATOMIC_RELAXED) >> 20),
+	    (unsigned long long)__atomic_load_n(&cpu_tiled_textures, __ATOMIC_RELAXED),
+	    (unsigned long long)__atomic_load_n(&alive_buffers, __ATOMIC_RELAXED),
+	    (unsigned long long)(__atomic_load_n(&alive_buffer_bytes, __ATOMIC_RELAXED) >> 20));
+}
+
+/* The bytes of a resource's levels, layers and samples (its layout's padding aside). */
+static uint64_t
+resource_bytes(const struct pipe_resource *r)
+{
+	uint64_t total = 0;
+	for (unsigned l = 0; l <= r->last_level; l++) {
+		total += (uint64_t)util_format_get_nblocksx(r->format, u_minify(r->width0, l)) *
+		    util_format_get_nblocksy(r->format, u_minify(r->height0, l)) *
+		    util_format_get_blocksize(r->format) * u_minify(r->depth0, l);
+	}
+	return total * MAX2(r->array_size, 1) * MAX2(r->nr_samples, 1);
+}
+
 static uint64_t
 now_us(void)
 {
@@ -485,6 +527,9 @@ buffer_destroy(void *self)
 	if (b->transfer != NULL) {
 		pipe_buffer_unmap(b->dev->pipe, b->transfer);
 	}
+	if (b->res != NULL && b->map != NULL) {
+		alive_add(&alive_buffers, &alive_buffer_bytes, -1, -(int64_t)b->length);
+	}
 	pipe_resource_reference(&b->res, NULL);
 	pthread_mutex_unlock(&b->dev->lock);
 	free(b);
@@ -532,6 +577,7 @@ buffer_new(struct b2l_mtl_device *dev, uint64_t length, const void *bytes, char 
 		obj_unref(b);
 		return NULL;
 	}
+	alive_add(&alive_buffers, &alive_buffer_bytes, 1, (int64_t)b->length);
 	if (bytes != NULL) {
 		memcpy(b->map, bytes, (size_t)length);
 		if (size > length) {
@@ -585,6 +631,8 @@ struct b2l_mtl_texture {
 	 * 1.5 MB at every command buffer otherwise). */
 	uint8_t *linear_copy;
 	size_t linear_packed_row;
+	uint64_t own_bytes;             /* M4 (boot 91): counted in alive_texture_bytes */
+	bool cpu_tiled;                 /* made without AFBC, for the CPU's writes */
 };
 
 static void
@@ -612,6 +660,12 @@ texture_destroy(void *self)
 	pipe_sampler_view_reference(&t->view, NULL);
 	pipe_resource_reference(&t->res, NULL);
 	pthread_mutex_unlock(&t->dev->lock);
+	if (t->own_bytes != 0) {
+		alive_add(&alive_textures, &alive_texture_bytes, -1, -(int64_t)t->own_bytes);
+	}
+	if (t->cpu_tiled) {
+		__atomic_sub_fetch(&cpu_tiled_textures, 1, __ATOMIC_RELAXED);
+	}
 	if (t->surface != NULL) {
 		CFRelease(t->surface);
 	}
@@ -706,14 +760,38 @@ texture_new_bind(struct b2l_mtl_device *dev, const struct b2l_mtl_texture_desc *
 		free(t);
 		return NULL;
 	}
+	/*
+	 * M4 (boot 91): a texture the CPU fills (Shared or Managed storage) and
+	 * never renders into is not made AFBC. Each replaceRegion of an AFBC
+	 * texture goes through a staging texture of GPU memory and a blit job
+	 * (panfrost_ptr_map/unmap), which is what ran out under Photos'
+	 * thumbnails. PIPE_BIND_CONST_BW makes it linear (Panfrost tiles only
+	 * the binds it knows, panfrost_should_tile): replaceRegion copies
+	 * straight into the buffer object, with no staging texture and no
+	 * malloc'd tiling copy. A render target added above for
+	 * generateMipmaps draws into linear levels.
+	 */
+	if (desc->storage_mode <= 1 && desc->usage != 0 && !(desc->usage & 4) &&
+	    !(templat.bind & (PIPE_BIND_DEPTH_STENCIL | PIPE_BIND_LINEAR))) {
+		templat.bind |= PIPE_BIND_CONST_BW;
+		t->cpu_tiled = true;
+	}
 	t->res = dev->screen->resource_create(dev->screen, &templat);
 	pthread_mutex_unlock(&dev->lock);
 	if (t->res == NULL) {
-		say(why, why_size, "resource_create refused %s %ux%ux%u, %u levels, %u layers",
-		    util_format_short_name(templat.format), templat.width0, templat.height0, templat.depth0,
-		    templat.last_level + 1, templat.array_size);
+		say(why, why_size, "resource_create refused %s %ux%ux%u, %u levels, %u layers; here %llu MB in %llu "
+		    "textures, %llu MB in buffers", util_format_short_name(templat.format), templat.width0, templat.height0,
+		    templat.depth0, templat.last_level + 1, templat.array_size,
+		    (unsigned long long)(__atomic_load_n(&alive_texture_bytes, __ATOMIC_RELAXED) >> 20),
+		    (unsigned long long)__atomic_load_n(&alive_textures, __ATOMIC_RELAXED),
+		    (unsigned long long)(__atomic_load_n(&alive_buffer_bytes, __ATOMIC_RELAXED) >> 20));
 		free(t);
 		return NULL;
+	}
+	t->own_bytes = MAX2(resource_bytes(t->res), 1);
+	alive_add(&alive_textures, &alive_texture_bytes, 1, (int64_t)t->own_bytes);
+	if (t->cpu_tiled) {
+		__atomic_add_fetch(&cpu_tiled_textures, 1, __ATOMIC_RELAXED);
 	}
 	texture_whole(t);
 	return t;
@@ -1106,10 +1184,15 @@ texture_replace(struct b2l_mtl_texture *t, const struct b2l_mtl_region *region, 
 	struct pipe_box box;
 	texture_box(t, region, slice, &box);
 	uint64_t image = bytes_per_image != 0 ? bytes_per_image : bytes_per_row * (uint64_t)box.height;
+	const uint64_t u0 = now_us();
 	pthread_mutex_lock(&t->dev->lock);
 	t->dev->pipe->texture_subdata(t->dev->pipe, t->res, texture_level(t, level), PIPE_MAP_WRITE, &box, bytes,
 	    (unsigned)bytes_per_row, (uintptr_t)image);
 	pthread_mutex_unlock(&t->dev->lock);
+	__atomic_add_fetch(&upload_count, 1, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&upload_bytes, (uint64_t)box.width * box.height * box.depth *
+	    util_format_get_blocksize(t->format), __ATOMIC_RELAXED);
+	__atomic_add_fetch(&upload_us, now_us() - u0, __ATOMIC_RELAXED);
 }
 
 /* Rows of a mapped texture into memory laid out as the caller asked. */
@@ -1530,9 +1613,10 @@ function_new(struct b2l_mtl_library *l, uint32_t index, const struct b2l_mtl_con
 		bool found = false;
 		for (unsigned k = 0; want >= 0 && k < f->num_constants; k++) {
 			if (f->constants[k].index == (unsigned)want) {
-				uint64_t bits = 0;
-				memcpy(&bits, given[i].bytes, MIN2(given[i].size, sizeof(bits)));
-				f->constants[k].bits = bits;
+				uint64_t bits[2] = { 0, 0 };     /* up to a float4 (boot 91) */
+				memcpy(bits, given[i].bytes, MIN2(given[i].size, sizeof(bits)));
+				f->constants[k].bits = bits[0];
+				f->constants[k].bits_hi = bits[1];
 				f->constants[k].supplied = true;
 				found = true;
 			}
@@ -1614,6 +1698,9 @@ function_key(const struct b2l_mtl_function *f, unsigned char sha1[20])
 	for (unsigned k = 0; k < f->num_constants; k++) {
 		const uint64_t entry[3] = { f->constants[k].index, f->constants[k].bits, f->constants[k].supplied };
 		_mesa_sha1_update(&ctx, entry, sizeof(entry));
+		if (f->constants[k].bits_hi != 0) {     /* a wider value; the key of others unchanged */
+			_mesa_sha1_update(&ctx, &f->constants[k].bits_hi, sizeof(f->constants[k].bits_hi));
+		}
 	}
 	_mesa_sha1_final(&ctx, sha1);
 }
@@ -4783,14 +4870,23 @@ execute_summary(struct b2l_mtl_device *dev, uint64_t encode_us, uint64_t wait_us
 	if (++count < 600) {
 		return;
 	}
+	/* Boot 91: one line was cut at 255 characters, the textures on buffers
+	 * lost; three lines now. */
 	b2l_drm_note("mtl M4: 600 command buffers: encoding %llu ms (at most %llu), waiting for the GPU %llu ms (at most "
-	    "%llu), %u draws, %u commands, %u of them 50 ms or more; state calls %lu made, %lu skipped; draws %llu ms, of "
-	    "which Panfrost's draw_vbo %llu ms; textures on buffers %llu ms (%u copied in, %u unchanged, %u written back)",
+	    "%llu), %u draws, %u commands, %u of them 50 ms or more",
 	    (unsigned long long)(encode_total / 1000), (unsigned long long)(encode_max / 1000),
-	    (unsigned long long)(wait_total / 1000), (unsigned long long)(wait_max / 1000), draws_total, ops_total, slow,
+	    (unsigned long long)(wait_total / 1000), (unsigned long long)(wait_max / 1000), draws_total, ops_total, slow);
+	b2l_drm_note("mtl M4: ... state calls %lu made, %lu skipped; draws %llu ms, of which Panfrost's draw_vbo %llu ms; "
+	    "textures on buffers %llu ms (%u copied in, %u unchanged, %u written back)",
 	    dev->state_set, dev->state_skipped, (unsigned long long)(dev->draw_us / 1000),
 	    (unsigned long long)(dev->draw_vbo_us / 1000), (unsigned long long)(dev->linear_us / 1000), dev->linear_uploads,
 	    dev->linear_unchanged, dev->linear_writebacks);
+	char alive[160];
+	alive_say(alive, sizeof(alive));
+	b2l_drm_note("mtl M4: ... replaceRegion %llu times, %llu MB in %llu ms; alive: %s",
+	    (unsigned long long)__atomic_exchange_n(&upload_count, 0, __ATOMIC_RELAXED),
+	    (unsigned long long)(__atomic_exchange_n(&upload_bytes, 0, __ATOMIC_RELAXED) >> 20),
+	    (unsigned long long)(__atomic_exchange_n(&upload_us, 0, __ATOMIC_RELAXED) / 1000), alive);
 	dev->state_set = dev->state_skipped = 0;
 	dev->draw_us = dev->draw_vbo_us = dev->linear_us = 0;
 	dev->linear_uploads = dev->linear_unchanged = dev->linear_writebacks = 0;

@@ -28,6 +28,7 @@ static uint8_t *pa_ptr(uint64_t pa) {
 struct gpu {
  uint32_t regs[0x5000 / 4], l2, tiler, shader, irq, job_irq, reset_seen, jobs, tiler_jobs;
  uint64_t transtab; int as_valid, hang, fault_va, ignore_reset, ignore_shader;
+ uint32_t mmu_irq, delays; int mmu_stall;   /* boot 91: a job waiting on its page fault */
  uint32_t reads_before_ready;
 } g;
 static int walk(uint64_t va, uint64_t *pa, int write) {
@@ -88,6 +89,7 @@ static uint32_t r(void *c, uint32_t o) {
  case B2L_MALI_SHADER_READY: return g.shader;
  case B2L_MALI_GPU_IRQ_RAWSTAT: return g.irq;
  case B2L_MALI_JOB_IRQ_RAWSTAT: return g.job_irq;
+ case B2L_MALI_MMU_IRQ_RAWSTAT: return g.mmu_irq;
  }
  return g.regs[o / 4];
 }
@@ -103,6 +105,7 @@ static void w(void *c, uint32_t o, uint32_t v) {
   break;
  case B2L_MALI_GPU_IRQ_CLEAR: g.irq &= ~v; break;
  case B2L_MALI_JOB_IRQ_CLEAR: g.job_irq &= ~v; break;
+ case B2L_MALI_MMU_IRQ_CLEAR: g.mmu_irq &= ~v; break;
  case B2L_MALI_L2_PWRON: g.l2 |= v; break;
  case B2L_MALI_TILER_PWRON: assert(g.l2); g.tiler |= v; break;
  case B2L_MALI_SHADER_PWRON: assert(g.l2 && g.tiler); if (!g.ignore_shader) g.shader |= v; break;
@@ -122,6 +125,10 @@ static void w(void *c, uint32_t o, uint32_t v) {
   assert(!(cfg & 15) && (cfg & (1u << 10)) && ((cfg >> 8) & 3) == 3 && ((cfg >> 12) & 3) == 3);
   assert(g.regs[(B2L_MALI_JS0 + B2L_MALI_JS_AFFINITY_NEXT_LO) / 4] == g.shader);
   if (g.hang) break;
+  if (g.mmu_stall) {   /* the real GPU: no JOB_FAILED, the job waits on the MMU */
+   g.mmu_irq |= 1u; g.regs[(B2L_MALI_AS0 + B2L_MALI_AS_FAULTSTATUS) / 4] = 0xa4002c1u;
+   break;
+  }
   uint64_t va = g.regs[(B2L_MALI_JS0 + B2L_MALI_JS_HEAD_NEXT_LO) / 4] |
    ((uint64_t)g.regs[(B2L_MALI_JS0 + B2L_MALI_JS_HEAD_NEXT_HI) / 4] << 32);
   g.jobs++;
@@ -142,8 +149,13 @@ static void w(void *c, uint32_t o, uint32_t v) {
   break;
  }
 }
-static void d(void *c, uint32_t us) { (void)c; (void)us; }
-static const struct b2l_mali_io io = { NULL, r, w, d };
+static void d(void *c, uint32_t us) { (void)c; (void)us; g.delays++; }
+static const struct b2l_mali_io io = { NULL, r, w, d, NULL };
+/* Boot 91: a delay that sleeps 88 us whatever it is asked, and a clock. */
+static uint64_t clock_us;
+static void d88(void *c, uint32_t us) { (void)c; (void)us; clock_us += 88; g.delays++; }
+static uint64_t now(void *c) { (void)c; return clock_us; }
+static const struct b2l_mali_io io_clock = { NULL, r, w, d88, now };
 static uint64_t alloc_next;
 static uint64_t pa_alloc(unsigned pages) { uint64_t p = alloc_next; alloc_next += pages * 4096ull; return p; }
 int main(void) {
@@ -208,7 +220,25 @@ int main(void) {
  /* A hung job is hard-stopped and reported as a timeout. */
  g.hang = 1;
  assert(b2l_mali_run_job(&io, B2L_MALI_SLOT_FRAGMENT, JOB, 100) == 0);
+ /* Boot 91: counting 10 us a loop made 1 s 8.8 s; with a clock 1000 us is
+  * 12 delays of 88 us (and the hard stop's wait none), not 100. */
+ g.delays = 0;
+ assert(b2l_mali_run_job(&io_clock, B2L_MALI_SLOT_FRAGMENT, JOB, 1000) == 0);
+ assert(g.delays >= 11 && g.delays <= 13);
+ g.delays = 0;
+ assert(!b2l_mali_wait(&io_clock, B2L_MALI_GPU_IRQ_RAWSTAT, 1u << 30, 1u << 30, 1000));
+ assert(g.delays >= 11 && g.delays <= 13);
  g.hang = 0;
+ /* Boot 91: a job waiting on a page fault is stopped at once and says so,
+  * with the fault's exception type, whatever the timeout. */
+ g.mmu_stall = 1; g.delays = 0;
+ assert(b2l_mali_run_job(&io_clock, B2L_MALI_SLOT_FRAGMENT, JOB, 1000000) == (B2L_MALI_STATUS_MMU_FAULT | 0xc1));
+ assert(g.delays == 0);
+ g.mmu_stall = 0; g.mmu_irq = 0;
+ /* A fault left from an earlier job does not stop the next one. */
+ g.mmu_irq = 1;
+ assert(b2l_mali_run_job(&io, B2L_MALI_SLOT_TILER, JOB, 1000) == 1);
+ assert(g.mmu_irq == 0);
  b2l_mali_power_off(&io);
  assert(!g.l2 && !g.tiler && !g.shader);
 

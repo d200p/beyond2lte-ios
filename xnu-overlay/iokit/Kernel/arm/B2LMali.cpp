@@ -222,6 +222,7 @@ class B2LMali : public IOService {
 	static uint32_t ioRead(void *ctx, uint32_t offset);
 	static void ioWrite(void *ctx, uint32_t offset, uint32_t value);
 	static void ioDelay(void *ctx, uint32_t us);
+	static uint64_t ioNow(void *ctx);
 	static void acpmDelay(void *ctx, uint32_t us);
 	static void threadMain(void *owner, wait_result_t result);
 	static void clusterMain(void *owner, wait_result_t result);
@@ -302,6 +303,8 @@ private:
 	struct b2l_mali_bo *bos;
 	uint64_t *boPages;              /* one bit per 4 KiB page of the BO range */
 	uint64_t boBytes, boJobs, boFaults;
+	uint64_t boPeak, boRefusals;            /* most resident at once; creates refused */
+	void boRefused(void *owner, uint64_t bytes, uint64_t flags, const char *why);
 	uint64_t boRunNS, boCleanBeforeNS, boCleanAfterNS, boCleanBytes, boCleanSkips, powerUps, powerUpNS;
 	uint64_t boPagesTotal, boPagesDevice;   /* BO pages created; those outside the DRAM span */
 	/* Per selector (B2LMaliUserClient::externalMethod): calls, time under the lock, the
@@ -437,6 +440,15 @@ B2LMali::ioDelay(void *ctx __unused, uint32_t us)
 	IODelay(us);
 }
 
+/* Boot 91: the clock b2l_mali_wait ends its waits by (see now_us). */
+uint64_t
+B2LMali::ioNow(void *ctx __unused)
+{
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	return ns / 1000;
+}
+
 /* ACPM mailbox waits: short, keep spinning. */
 void
 B2LMali::acpmDelay(void *ctx __unused, uint32_t us)
@@ -485,7 +497,7 @@ B2LMali::identify()
 		return false;
 	}
 	base = (volatile uint32_t *)regs->getVirtualAddress();
-	io = { this, ioRead, ioWrite, ioDelay };
+	io = { this, ioRead, ioWrite, ioDelay, ioNow };
 
 	/* A stall on this read means the block is unclocked: date it in the log. */
 	b2l_diag_record("B2L GPU: reading GPU_ID\n");
@@ -1806,6 +1818,7 @@ B2LMali::boCreate(void *owner, uint64_t bytes, uint64_t flags, uint64_t *handle,
 	bool exec = !heap && !(flags & B2L_MALI_BO_NOEXEC);
 	uint64_t resident = heap && bytes > B2L_MALI_BO_HEAP_RESIDENT ? B2L_MALI_BO_HEAP_RESIDENT : bytes;
 	if (boBytes + resident > B2L_RT_BO_LIMIT) {
+		boRefused(owner, bytes, flags, "over the limit");
 		return kIOReturnNoMemory;
 	}
 	unsigned index = 0;
@@ -1814,9 +1827,11 @@ B2LMali::boCreate(void *owner, uint64_t bytes, uint64_t flags, uint64_t *handle,
 	}
 	uint64_t first = 0;
 	if (index == B2L_MALI_MAX_BOS) {
+		boRefused(owner, bytes, flags, "no free handle");
 		return kIOReturnNoResources;
 	}
 	if (!boReserve(bytes >> 12, exec, &first)) {
+		boRefused(owner, bytes, flags, "no free GPU address range");
 		return kIOReturnNoSpace;
 	}
 	/*
@@ -1832,6 +1847,7 @@ B2LMali::boCreate(void *owner, uint64_t bytes, uint64_t flags, uint64_t *handle,
 	if (memory == NULL || memory->prepare() != kIOReturnSuccess) {
 		OSSafeReleaseNULL(memory);
 		boRelease(first, bytes >> 12);
+		boRefused(owner, bytes, flags, "no pages");
 		return kIOReturnNoMemory;
 	}
 	for (uint64_t off = 0; off < resident; off += 4096) {
@@ -1852,6 +1868,7 @@ B2LMali::boCreate(void *owner, uint64_t bytes, uint64_t flags, uint64_t *handle,
 		boRelease(first, bytes >> 12);
 		memory->complete();
 		memory->release();
+		boRefused(owner, bytes, flags, "GPU page tables full");
 		return kIOReturnNoSpace;
 	}
 	flushTables();
@@ -1864,9 +1881,46 @@ B2LMali::boCreate(void *owner, uint64_t bytes, uint64_t flags, uint64_t *handle,
 	bo->resident = resident;
 	bo->flags = (uint32_t)flags;
 	boBytes += resident;
+	if (boBytes > boPeak) {
+		boPeak = boBytes;
+	}
 	*handle = index + 1;
 	*va = base;
 	return kIOReturnSuccess;
+}
+
+/*
+ * Boot 91: backboardd's textures were refused (resource_create), Mesa then
+ * wrote descriptors with a NULL buffer and the GPU faulted at 0, and nothing
+ * said why. Which limit, how much the caller holds and how much everyone
+ * does: the first 12 refusals, then every 100th.
+ */
+void
+B2LMali::boRefused(void *owner, uint64_t bytes, uint64_t flags, const char *why)
+{
+	boRefusals++;
+	if (boRefusals > 12 && boRefusals % 100 != 0) {
+		return;
+	}
+	uint64_t mine = 0, imported = 0;
+	unsigned objects = 0, mineObjects = 0;
+	for (unsigned i = 0; bos != NULL && i < B2L_MALI_MAX_BOS; i++) {
+		if (bos[i].memory == NULL) {
+			continue;
+		}
+		objects++;
+		if (bos[i].surface != NULL) {
+			imported += bos[i].resident;
+		}
+		if (bos[i].owner == owner) {
+			mineObjects++;
+			mine += bos[i].surface == NULL ? bos[i].resident : 0;
+		}
+	}
+	b2l_diag_record("B2L GPU BO: create of %llu KB (flags 0x%llx) refused, %s (%llu so far): pid %d holds %llu MB "
+	    "in %u objects; all %llu MB of %llu MB in %u objects (peak %llu MB), %llu MB of surfaces imported\n",
+	    bytes >> 10, flags, why, boRefusals, proc_selfpid(), mine >> 20, mineObjects, boBytes >> 20,
+	    (uint64_t)B2L_RT_BO_LIMIT >> 20, objects, boPeak >> 20, imported >> 20);
 }
 
 /* A client mapping keeps the memory alive; the GPU loses it here. */
@@ -2102,9 +2156,10 @@ B2LMali::jobSubmit(uint64_t jc, uint64_t requirements, uint64_t *out)
 	boJobs++;
 	if (boJobs % 500 == 0) {
 		b2l_diag_record("B2L GPU BO: %llu jobs: last 500 ran %llu ms, surface cleaning %llu ms before + %llu ms after"
-		    " (%llu MB, %llu skipped unchanged), %u surfaces imported, %llu power-ups (%llu ms)\n", boJobs,
+		    " (%llu MB, %llu skipped unchanged), %u surfaces imported, %llu power-ups (%llu ms); %llu MB resident"
+		    " (peak %llu MB, %llu creates refused)\n", boJobs,
 		    boRunNS / 1000000, boCleanBeforeNS / 1000000, boCleanAfterNS / 1000000, boCleanBytes >> 20, boCleanSkips,
-		    boSurfaces, powerUps, powerUpNS / 1000000);
+		    boSurfaces, powerUps, powerUpNS / 1000000, boBytes >> 20, boPeak >> 20, boRefusals);
 		/* Calls since the last line: count/total ms/longest us, per kind. */
 		b2l_diag_record("B2L GPU CALLS: create %llu/%llu/%llu free %llu/%llu/%llu import %llu/%llu/%llu"
 		    " submit %llu/%llu/%llu other %llu/%llu; lock wait %llu ms (longest %llu us)\n",
@@ -2126,8 +2181,9 @@ B2LMali::jobSubmit(uint64_t jc, uint64_t requirements, uint64_t *out)
 	}
 	if (status != B2L_MALI_STATUS_DONE) {
 		if (boFaults++ < 16) {
-			b2l_diag_record("B2L GPU BO: job 0x%llx slot %u status 0x%x js_status=0x%x\n", jc, slot, status,
-			    b2l_mali_r(&io, B2L_MALI_JS0 + slot * B2L_MALI_JS_STRIDE + B2L_MALI_JS_STATUS));
+			b2l_diag_record("B2L GPU BO: job 0x%llx slot %u status 0x%x js_status=0x%x after %llu us%s\n", jc, slot,
+			    status, b2l_mali_r(&io, B2L_MALI_JS0 + slot * B2L_MALI_JS_STRIDE + B2L_MALI_JS_STATUS), ran / 1000,
+			    (status & B2L_MALI_STATUS_MMU_FAULT) ? ", stopped on an MMU fault" : status == 0 ? ", timed out" : "");
 			reportFault((unsigned)boJobs);
 		}
 		/* A faulted address space stays stopped until the GPU is reset. */

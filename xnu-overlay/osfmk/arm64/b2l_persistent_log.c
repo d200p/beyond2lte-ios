@@ -252,6 +252,11 @@ static void b2l_pcs_report(void)
  * stack it called from. Each 30 s window prints the busiest stacks:
  *   B2L STACK: app=NAME samples=N stacks=N lost=N misses=N slide=0x...
  *   B2L STACK: #i n=count f=pc lr ret ret ... (user addresses, slid)
+ * Boot 91: backboardd spent 43-82% of its rendering in libsystem_malloc and
+ * single PCs cannot say who called it. b2l_stack_thread=TEXT follows the
+ * first thread whose name contains TEXT (Core Animation's render thread is
+ * com.apple.coreanimation.display.primary) instead of the main one; the
+ * report line then says thread=TEXT, or thread=main when none matched.
  */
 #define B2L_STK_DEPTH   32
 #define B2L_STK_SLOTS   768u
@@ -280,15 +285,43 @@ static task_t b2l_stack_find(const char *app, size_t size)
     return found;
 }
 
+#define B2L_STK_NAME 64                         /* MAXTHREADNAMESIZE */
+static char b2l_stack_want[B2L_STK_NAME];       /* b2l_stack_thread: a part of the name */
+static bool b2l_stack_matched;                  /* the last sample's thread had it */
+
+static bool b2l_stack_name_has(const char *name, const char *part)
+{
+    size_t n = strlen(part);
+    if (n == 0) return false;
+    for (const char *c = name; *c; c++)
+        if (strncmp(c, part, n) == 0) return true;
+    return false;
+}
+
 static unsigned b2l_stack_sample(task_t task, uint64_t *f)
 {
     thread_t thread = THREAD_NULL;
+    bool matched = false;
     task_lock(task);
     if (!queue_empty(&task->threads)) {
         thread = (thread_t)queue_first(&task->threads);
+        if (b2l_stack_want[0]) {
+            thread_t th;
+            queue_iterate(&task->threads, th, thread_t, task_threads) {
+                char name[B2L_STK_NAME] = { 0 };
+                thread_get_thread_name(th, name);
+                name[sizeof(name) - 1] = 0;
+                if (b2l_stack_name_has(name, b2l_stack_want)) {
+                    thread = th;
+                    matched = true;
+                    break;
+                }
+            }
+        }
         thread_reference(thread);
     }
     task_unlock(task);
+    b2l_stack_matched = matched;
     if (thread == THREAD_NULL) return 0;
     uint64_t pc = 0, lr = 0, fp = 0;
     thread_mtx_lock(thread);
@@ -339,8 +372,8 @@ static void b2l_stack_report(task_t task, const char *app, uint32_t samples, uin
         }
     }
     if (samples == 0) return;
-    b2l_early_trace("B2L STACK: app=%s samples=%u stacks=%u lost=%u misses=%u slide=0x%x\n",
-        app, samples, b2l_stack_used, lost, misses, slide);
+    b2l_early_trace("B2L STACK: app=%s thread=%s samples=%u stacks=%u lost=%u misses=%u slide=0x%x\n",
+        app, b2l_stack_matched ? b2l_stack_want : "main", samples, b2l_stack_used, lost, misses, slide);
     static bool shown[B2L_STK_SLOTS];
     memset(shown, 0, sizeof(shown));
     for (unsigned rank = 0; rank < B2L_STK_SHOW; rank++) {
@@ -371,6 +404,8 @@ static void b2l_stack_thread(void *arg __unused, wait_result_t result __unused)
     char app[20] = "MobileNotes";
     char given[20] = { 0 };
     if (PE_parse_boot_argn("b2l_pcs_app", given, sizeof(given)) && given[0]) strlcpy(app, given, sizeof(app));
+    (void)PE_parse_boot_argn("b2l_stack_thread", b2l_stack_want, sizeof(b2l_stack_want));
+    b2l_stack_want[sizeof(b2l_stack_want) - 1] = 0;
     task_t task = TASK_NULL;
     uint32_t samples = 0, lost = 0, misses = 0, tick = 0;
     uint64_t window = mach_absolute_time();

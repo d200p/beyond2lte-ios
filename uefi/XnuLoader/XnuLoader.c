@@ -476,6 +476,11 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * screen are drawn by Metal; a backboardd started again in the
                  * same boot is not shown it and draws with OpenGL ES. */
                 "b2l_metal=2 "
+                /* M4 (boot 91: backboardd's rendering spent 43-82% of its
+                 * time in libsystem_malloc): the PC sampler and the stack
+                 * sampler follow backboardd, the stacks its Core Animation
+                 * render thread (b2l_persistent_log.c), to say who calls it. */
+                "b2l_pcs_app=backboardd b2l_stack_thread=coreanimation.display "
                 /* S10: the per-syscall/IPC boundary diagnostics are off in
                  * the working system. With b2l_diag=1 every system call of
                  * backboardd, SpringBoard and Settings went through them, and

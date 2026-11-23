@@ -88,6 +88,9 @@ python3 "$repo/scripts/mesa/b2l-drm/patch_pan_shader_idvs.py" "$src/src/gallium/
 python3 "$repo/scripts/mesa/b2l-drm/patch_pan_jm_barrier.py" "$src/src/gallium/drivers/panfrost/pan_jm.c"
 # A refused IOSurface import returns NULL instead of crashing (boot 58): see the script.
 python3 "$repo/scripts/mesa/b2l-drm/patch_pan_bo_import.py" "$src/src/gallium/drivers/panfrost/pan_bo.c"
+# A refused staging texture fails the map instead of crashing (boot 91): see the script.
+python3 "$repo/scripts/mesa/b2l-drm/patch_pan_resource_staging.py" \
+  "$src/src/gallium/drivers/panfrost/pan_resource.c"
 # M4 (boot 83): Panfrost's disk shader cache (shader-cache=enabled above), the
 # driver named by a SHA-1 of the Mesa release and every file under
 # scripts/mesa instead of an ELF build-id: see the script.

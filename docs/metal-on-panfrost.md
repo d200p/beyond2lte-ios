@@ -961,3 +961,52 @@ b8g8r8a8_unorm 1112x2432`). B2LMali's limit on resident buffer objects
 16 KiB more. The limit is now 1 GiB (the objects' GPU range is 1.5 GiB), and
 only Panfrost's 64 KiB pool slabs get the extra page. No mapping shorter than
 its object was logged.
+
+### Boot 91 (build 85, a plain restart): freezes, then the same crash
+
+The disk cache now holds the AIR translations too: 24 of them came back in
+1 to 75 ms each, where boot 89 spent 40 s translating. The user opened the
+share menu in Photos: everything froze for several seconds, then backboardd
+died as in boot 90 (`panfrost_ptr_map`, NULL + 0x148). Freeform quit with
+SIGABRT: Metal is shown to backboardd only (`b2l_metal=2`).
+
+- The freezes: three GPU jobs faulted in the MMU, two reading or writing
+  address 0 and one at 0x3d4400. These are the descriptors of buffers that
+  were never allocated, because the GPU memory was used up. A faulted job
+  waits on its page fault and never finishes, so only the timeout ends it.
+  The 1 s timeout counted 100,000 waits of 10 us, but each wait sleeps about
+  88 us (B2LMali sleeps at least 50 us), so it lasted 8.8 s. After the hard
+  stop, the code waited for the DONE and FAILED bits together, which a
+  stopped job never raises, so another 0.9 s went by.
+- The crash: backboardd's `replaceRegion` into an AFBC texture goes through
+  a staging texture of GPU memory. With the memory used up,
+  `pan_alloc_staging` returned NULL and Mesa only asserts on it.
+- backboardd held about 700 MB in 1561 objects when it died: 67 MB stayed
+  resident with the other clients.
+- In 600 command buffers, Panfrost's `draw_vbo` took 8.1 s of 9.0 s of
+  draws (0.19 ms a draw). The profiler put backboardd's rendering in
+  `libsystem_malloc` for 43-82 % of its samples.
+- Widgets: besides `uber_vertex`, `plane_color_fragment` was refused, for
+  a float4 function constant (128 bits, one word allowed).
+
+Added (build 86, with build 85's 1 GiB limit):
+
+- Waits end by a clock (`now_us`). A job whose address space faults is
+  hard-stopped at once (`B2L_MALI_STATUS_MMU_FAULT` plus the fault type),
+  and the GPU is reset. The wait after a hard stop takes either bit.
+- B2LMali logs each refused buffer object: which limit, how much the
+  caller and everyone hold, and the peak. The 500-job line has the
+  resident and peak MB.
+- Panfrost's map fails instead of crashing when the staging texture is
+  refused (`patch_pan_resource_staging.py`).
+- A texture the CPU fills (Shared storage, no RenderTarget usage) is made
+  linear (`PIPE_BIND_CONST_BW`). `replaceRegion` then writes straight into
+  it, with no staging texture and no blit job.
+- The 600-command-buffer summary is three lines (one was cut at 255
+  characters). It now also gives the `replaceRegion` count and time, and
+  the textures and buffers alive in the process.
+- Function constants up to 128 bits (`bits_hi`), for the widgets'
+  `plane_color_fragment`.
+- The kernel's PC and stack samplers follow backboardd. The stacks follow
+  its `coreanimation.display` thread (`b2l_stack_thread`), to show who
+  calls malloc.

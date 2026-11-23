@@ -422,6 +422,7 @@ struct air_sampler_state air_decode_sampler_state(uint64_t word);
 struct air_constant_value {
    unsigned index;     /* the function constant's index */
    uint64_t bits;      /* its value, as the bits of its type */
+   uint64_t bits_hi;   /* bits 64 to 127 of a wider value (a float4: boot 91) */
 
    /*
     * Whether the PIPELINE actually supplied that value, which is not the same question
