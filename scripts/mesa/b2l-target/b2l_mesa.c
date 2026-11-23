@@ -30,6 +30,7 @@
 #include "panfrost/pan_public.h"
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <unistd.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include "frontend/winsys_handle.h"
 #include "drm-uapi/drm_fourcc.h"
@@ -37,6 +38,8 @@
 #include "b2l_drm.h"
 
 #define B2L_EXPORT __attribute__((visibility("default")))
+/* M4: Panfrost's disk shader cache (b2l_fscreen). */
+#define B2L_SHADER_CACHE_DIR "/private/var/tmp/b2l-mesa-cache"
 
 B2L_EXPORT int b2l_mesa_probe(void);
 #define PROBE_SIZE 64
@@ -112,6 +115,12 @@ b2l_fscreen(void)
 	}
 	driParseOptionInfo(&b2l.info, pan_driconf, ARRAY_SIZE(pan_driconf));
 	struct pipe_screen_config config = { false, &b2l.options, &b2l.info };
+	/* M4 (boot 83): Panfrost's disk shader cache (patch_pan_disk_cache.py),
+	 * where backboardd can write (its Metal start marker lives there too) and
+	 * what outlives a boot; Mesa makes the directory. The probe's screens
+	 * turn it off for themselves. */
+	setenv("MESA_SHADER_CACHE_DIR", B2L_SHADER_CACHE_DIR, 0);
+	setenv("MESA_SHADER_CACHE_MAX_SIZE", "256M", 0);
 	struct pipe_screen *screen = panfrost_drm_screen_create(b2l.fd, &config);
 	if (screen == NULL) {
 		b2l_drm_note("mesa: panfrost screen creation failed");
@@ -120,6 +129,10 @@ b2l_fscreen(void)
 	b2l.fscreen.screen = screen;
 	b2l.fscreen.get_param = fscreen_get_param;
 	b2l_drm_note("mesa: screen %s / %s", screen->get_name(screen), screen->get_vendor(screen));
+	const bool cache = screen->get_disk_shader_cache != NULL && screen->get_disk_shader_cache(screen) != NULL;
+	const char *dir = getenv("MESA_SHADER_CACHE_DIR");
+	b2l_drm_note("mesa: disk shader cache %s, %s (%s)", cache ? "on" : "OFF", dir != NULL ? dir : "no directory",
+	    dir != NULL && access(dir, W_OK) == 0 ? "writable" : "not writable or not there");
 	return &b2l.fscreen;
 }
 
@@ -642,6 +655,7 @@ b2l_mesa_probe(void)
 		}
 	}
 	unsetenv("PAN_MESA_DEBUG");
+	unsetenv("MESA_SHADER_CACHE_DISABLE");      /* M4: only the probe's screens */
 	unsetenv("B2L_DRM_FLUSH");
 	unsetenv("B2L_DRM_DUMP");
 	unsetenv("B2L_IDVS");

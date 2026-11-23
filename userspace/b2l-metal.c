@@ -985,6 +985,32 @@ device_new_texture_iosurface(id self, SEL _cmd, id descriptor, IOSurfaceRef surf
 	return texture_wrap(mt, &desc, surface, (uint32_t)plane, msg_u(descriptor, "resourceOptions"));
 }
 
+/* M4 (boot 83): -[MTLBuffer newLinearTextureWithDescriptor:offset:bytesPerRow:
+ * bytesPerImage:], which backboardd asked once and was answered nil. The
+ * texture is kept in step with the buffer by libb2l-mesa (API version 4). */
+static id
+buffer_new_linear_texture(id self, SEL _cmd, id descriptor, unsigned long offset, unsigned long bytes_per_row,
+    unsigned long bytes_per_image)
+{
+	(void)bytes_per_image;          /* one 2D level */
+	if (!gpu_ready(sel_getName(_cmd))) {
+		return nil;
+	}
+	struct b2l_mtl_texture_desc desc;
+	texture_desc_of(descriptor, &desc);
+	struct b2l_mtl_buffer *mb = mesa_buffer(self);
+	char why[160] = "";
+	struct b2l_mtl_texture *mt = mtl->version >= 4 && mb != NULL ?
+	    mtl->texture_from_buffer(mb, &desc, offset, bytes_per_row, why, sizeof(why)) : NULL;
+	if (mt == NULL) {
+		say("newLinearTextureWithDescriptor: %ux%u format %u at %lu, rows of %lu bytes: %s", desc.width, desc.height,
+		    desc.pixel_format, offset, bytes_per_row, mtl->version < 4 ? "libb2l-mesa older than API version 4" :
+		    mb == NULL ? "not this device's buffer" : why);
+		return nil;
+	}
+	return texture_wrap(mt, &desc, NULL, 0, msg_u(descriptor, "resourceOptions"));
+}
+
 /* MTLRegion: an MTLOrigin and an MTLSize, NSUIntegers. */
 typedef struct {
 	unsigned long x, y, z;
@@ -4171,6 +4197,8 @@ register_object_classes(Class device)
 		class_addMethod(c, S("allocatedSize"), (IMP)buffer_allocated_size, "Q@:");
 		class_addMethod(c, S("didModifyRange:"), (IMP)buffer_did_modify, "v@:{_NSRange=QQ}");
 		class_addMethod(c, S("gpuAddress"), (IMP)buffer_gpu_address, "Q@:");
+		class_addMethod(c, S("newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:"),
+		    (IMP)buffer_new_linear_texture, "@@:@QQQ");
 		class_addMethod(c, S("setPurgeableState:"), (IMP)object_non_volatile, "Q@:Q");
 		class_addMethod(c, S("isAliasable"), (IMP)object_no, "B@:");
 		class_addMethod(c, S("makeAliasable"), (IMP)object_nothing, "v@:");

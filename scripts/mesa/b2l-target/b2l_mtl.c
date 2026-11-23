@@ -536,6 +536,11 @@ struct b2l_mtl_texture {
 	 * level and layer offsets; a texture of its own has them at 0. */
 	unsigned first_level, levels, first_layer, layers;
 	enum pipe_texture_target target;
+	/* M4 (boot 83): a texture on a buffer's memory (newLinearTexture...),
+	 * held: its own storage, filled from the buffer before each command
+	 * buffer that uses it and written back after one that draws into it. */
+	struct b2l_mtl_buffer *linear_buffer;
+	uint64_t linear_offset, linear_row;
 };
 
 static void
@@ -566,6 +571,7 @@ texture_destroy(void *self)
 	if (t->surface != NULL) {
 		CFRelease(t->surface);
 	}
+	obj_unref(t->linear_buffer);    /* after the lock: a buffer takes it to go */
 	free(t);
 }
 
@@ -663,6 +669,83 @@ texture_new(struct b2l_mtl_device *dev, const struct b2l_mtl_texture_desc *desc,
 		return NULL;
 	}
 	texture_whole(t);
+	return t;
+}
+
+static void texture_read_locked(struct b2l_mtl_texture *t, const struct pipe_box *box, uint32_t level, uint8_t *out,
+    uint64_t bytes_per_row, uint64_t bytes_per_image);
+
+/* M4: the texture's pixels from its buffer, or back into it. Under dev->lock. */
+static void
+linear_sync(struct b2l_mtl_texture *t, bool to_buffer)
+{
+	struct b2l_mtl_buffer *b = t->linear_buffer;
+	if (b == NULL || b->map == NULL) {
+		return;
+	}
+	struct pipe_box box;
+	u_box_2d(0, 0, (int)t->res->width0, (int)t->res->height0, &box);
+	if (to_buffer) {
+		texture_read_locked(t, &box, 0, b->map + t->linear_offset, t->linear_row, 0);
+	} else {
+		t->dev->pipe->texture_subdata(t->dev->pipe, t->res, 0, PIPE_MAP_WRITE, &box, b->map + t->linear_offset,
+		    (unsigned)t->linear_row, 0);
+	}
+}
+
+/*
+ * M4 (boot 83): -[MTLBuffer newLinearTextureWithDescriptor:offset:bytesPerRow:
+ * bytesPerImage:], asked by backboardd once and answered nil. Metal's texture
+ * shares the buffer's memory; here it has storage of its own (the Mali's
+ * linear rows need 64-byte strides and Panfrost cannot alias a buffer), filled
+ * from the buffer now and before each command buffer that uses it, and
+ * written back after each one that draws or copies into it (cmdbuf_execute).
+ * One 2D level, no samples.
+ */
+static struct b2l_mtl_texture *
+texture_from_buffer(struct b2l_mtl_buffer *b, const struct b2l_mtl_texture_desc *desc, uint64_t offset,
+    uint64_t bytes_per_row, char *why, size_t why_size)
+{
+	if (b == NULL || desc == NULL) {
+		say(why, why_size, "no buffer");
+		return NULL;
+	}
+	struct b2l_mtl_texture_desc d = *desc;
+	d.mip_levels = 1;
+	d.array_length = 1;
+	d.depth = 1;
+	d.sample_count = 1;
+	const enum pipe_format format = pixel_format(d.pixel_format);
+	if (d.type != 2 || format == PIPE_FORMAT_NONE || util_format_is_compressed(format) || d.width == 0 ||
+	    d.height == 0) {
+		say(why, why_size, "a linear texture is one 2D level of an uncompressed format (type %u, format %u)", d.type,
+		    d.pixel_format);
+		return NULL;
+	}
+	const uint64_t row = (uint64_t)d.width * util_format_get_blocksize(format);
+	if (bytes_per_row < row || offset + bytes_per_row * (d.height - 1) + row > b->length) {
+		say(why, why_size, "%ux%u %s, rows of %llu bytes at %llu: outside the buffer's %llu bytes", d.width, d.height,
+		    util_format_short_name(format), (unsigned long long)bytes_per_row, (unsigned long long)offset,
+		    (unsigned long long)b->length);
+		return NULL;
+	}
+	struct b2l_mtl_texture *t = texture_new(b->dev, &d, why, why_size);
+	if (t == NULL) {
+		return NULL;
+	}
+	t->linear_buffer = obj_ref(b);
+	t->linear_offset = offset;
+	t->linear_row = bytes_per_row;
+	pthread_mutex_lock(&b->dev->lock);
+	linear_sync(t, false);
+	b->dev->pending = true;
+	pthread_mutex_unlock(&b->dev->lock);
+	static unsigned noted;
+	if (__atomic_fetch_add(&noted, 1, __ATOMIC_RELAXED) < 16) {
+		b2l_drm_note("mtl M4: a linear texture on a buffer: %ux%u %s, rows of %llu bytes at %llu (storage of its own, "
+		    "synchronised at each command buffer)", d.width, d.height, util_format_short_name(format),
+		    (unsigned long long)bytes_per_row, (unsigned long long)offset);
+	}
 	return t;
 }
 
@@ -4007,6 +4090,68 @@ exec_buffer_texture(struct b2l_mtl_cmdbuf *cb, const struct op *op)
 	}
 }
 
+/* M4: the textures on buffers (texture_from_buffer) a command buffer uses, at
+ * most LINEAR_MAX, and which of them it may write. */
+#define LINEAR_MAX 16
+static unsigned
+linear_collect(struct b2l_mtl_cmdbuf *cb, struct b2l_mtl_texture **list, bool *written)
+{
+	unsigned n = 0;
+	util_dynarray_foreach(&cb->ops, struct op, op) {
+		struct b2l_mtl_texture *used[B2L_MTL_MAX_COLORS + 2];
+		bool writes[B2L_MTL_MAX_COLORS + 2];
+		unsigned k = 0;
+		switch (op->kind) {
+		case OP_SET_TEXTURE:
+			/* a compute kernel may write it as an image */
+			used[k] = op->u.resource.texture;
+			writes[k++] = op->u.resource.stage == B2L_MTL_COMPUTE;
+			break;
+		case OP_GENERATE_MIPMAPS:
+			used[k] = op->u.resource.texture;
+			writes[k++] = true;
+			break;
+		case OP_PASS_BEGIN:
+			for (unsigned i = 0; i < B2L_MTL_MAX_COLORS; i++) {
+				used[k] = op->u.pass.color[i].texture;
+				writes[k++] = true;
+			}
+			break;
+		case OP_COPY_TEXTURE:
+			used[k] = op->u.copy_texture.from;
+			writes[k++] = false;
+			used[k] = op->u.copy_texture.to;
+			writes[k++] = true;
+			break;
+		case OP_BUFFER_TO_TEXTURE:
+		case OP_TEXTURE_TO_BUFFER:
+			used[k] = op->u.buffer_texture.texture;
+			writes[k++] = op->kind == OP_BUFFER_TO_TEXTURE;
+			break;
+		default:
+			break;
+		}
+		for (unsigned j = 0; j < k; j++) {
+			if (used[j] == NULL || used[j]->linear_buffer == NULL) {
+				continue;
+			}
+			unsigned at = 0;
+			while (at < n && list[at] != used[j]) {
+				at++;
+			}
+			if (at == n) {
+				if (n == LINEAR_MAX) {
+					continue;
+				}
+				list[n] = used[j];
+				written[n++] = false;
+			}
+			written[at] |= writes[j];
+		}
+	}
+	return n;
+}
+
 /* M4: a draw the CPU took long over, most likely Panfrost compiling a shader
  * variant at the draw (logged for the first 24). */
 static void
@@ -4099,6 +4244,13 @@ cmdbuf_execute(struct b2l_mtl_cmdbuf *cb, uint64_t *gpu_us, char *why, size_t wh
 	}
 	pthread_mutex_lock(&dev->lock);
 	uint64_t t0 = now_us();
+	/* M4: textures on buffers take what the CPU wrote there since. */
+	struct b2l_mtl_texture *linear[LINEAR_MAX];
+	bool linear_written[LINEAR_MAX];
+	const unsigned linears = linear_collect(cb, linear, linear_written);
+	for (unsigned i = 0; i < linears; i++) {
+		linear_sync(linear[i], false);
+	}
 	util_dynarray_foreach(&cb->ops, struct op, op) {
 		struct pipe_box box;
 		switch (op->kind) {
@@ -4192,6 +4344,11 @@ cmdbuf_execute(struct b2l_mtl_cmdbuf *cb, uint64_t *gpu_us, char *why, size_t wh
 	const uint64_t t_wait = now_us();
 	settle(dev);
 	execute_summary(t_wait - t0, now_us() - t_wait, st->draws, util_dynarray_num_elements(&cb->ops, struct op));
+	for (unsigned i = 0; i < linears; i++) {
+		if (linear_written[i]) {
+			linear_sync(linear[i], true);   /* the GPU is done: back into the buffer */
+		}
+	}
 	if (st->draws != 0) {
 		unbind_all(dev);
 	}
@@ -4288,12 +4445,13 @@ static const struct b2l_mtl_api api = {
 	.cmdbuf_dispatch = cmdbuf_dispatch,
 	.texture_view_new = texture_view_new,
 	.cmdbuf_generate_mipmaps = cmdbuf_generate_mipmaps,
+	.texture_from_buffer = texture_from_buffer,
 };
 
-/* Version 3 (M4) only adds to the end of version 2's table, so a plug-in
- * that asks for 2 is given the same table. */
+/* Versions 3 and 4 (M4) only add to the end of version 2's table, so a
+ * plug-in that asks for 2 or 3 is given the same table. */
 B2L_EXPORT const struct b2l_mtl_api *
 b2l_mtl_api(uint32_t version)
 {
-	return version == B2L_MTL_API_VERSION || version == 2 ? &api : NULL;
+	return version >= 2 && version <= B2L_MTL_API_VERSION ? &api : NULL;
 }

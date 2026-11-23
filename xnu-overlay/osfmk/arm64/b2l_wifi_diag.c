@@ -1643,6 +1643,75 @@ wifi_scan_event(struct wifi_scan *s, const uint8_t *packet, unsigned length)
 }
 
 /*
+ * Mode 18: the escan's events until its final status (or 6 s more): each
+ * MSG_TYPE_WL_EVENT read and its buffer posted again. *at: the completions
+ * read so far, *ms: the time waited. -1: a failed access.
+ */
+static int
+wifi_scan_wait(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb, struct wifi_host_view *last,
+    unsigned *next, struct wifi_scan *s, uint32_t *at, unsigned *ms)
+{
+    uint64_t deadline;
+    uint32_t read_back = UINT32_MAX;
+    for (unsigned tick = 0; ; tick++) {
+        const uint32_t w = last->d2h_count;
+        unsigned posted = 0;
+        if (w - *at >= wifi_rings[2].items) {
+            wlog("mode 18: %u completions since the last read, more than the ring; stopped\n", w - *at);
+            break;
+        }
+        if (w != *at) FlushPoC_DcacheRegion((vm_offset_t)wifi_host, WIFI_HOST_BYTES);
+        for (; *at < w; (*at)++) {
+            const uint8_t *c = wifi_host + wifi_rings[2].offset + wifi_rings[2].size * (*at % wifi_rings[2].items);
+            if (c[0] != 0x0e) continue;
+            const uint32_t id = wifi_le32(c + 4);
+            const unsigned length = c[12] | c[13] << 8;
+            if (id < 3 || id > 6) {
+                wlog("mode 18: event in buffer id %#x, not an event buffer of ours\n", id);
+                continue;
+            }
+            if (length >= 72 && length <= 0x800u) wifi_scan_event(s, wifi_host + wifi_host_buffer(id), length);
+            else s->malformed++;
+            wifi_host_event_post((*next)++, id);
+            posted++;
+            s->given++;
+        }
+        wifi_d2h_parsed = *at;
+        clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+        if (last->d2h_write[0] != read_back && wifi_tcm_set(regions, info[4], last->d2h_write[0], deadline)) return -1;
+        read_back = last->d2h_write[0];
+        if (posted) {
+            const unsigned windex = *next % wifi_rings[0].items;
+            CleanPoC_DcacheRegion((vm_offset_t)wifi_host + wifi_rings[0].offset,
+                (unsigned long)wifi_rings[0].items * wifi_rings[0].size);
+            if (wifi_tcm_set(regions, info[1], windex, deadline) ||
+                wifi_bp_write(regions, WIFI_PCIE_CORE + WIFI_H2D_DB0, 0xff000000u | windex, deadline)) {
+                wlog("mode 18: event buffer write index or DB0 failed\n");
+                return -1;
+            }
+        }
+        if (s->done || tick >= 60) break;
+        delay_for_interval(100, NSEC_PER_MSEC);
+        *ms += 100;
+        clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+        if (wifi_host_view(regions, info, d2h_mb, last, deadline)) {
+            wlog("mode 18: the link/BAR guard was lost while scanning\n");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void
+wifi_channel_list(const uint32_t *bits, char *list, unsigned size)
+{
+    unsigned n = 0;
+    list[0] = 0;
+    for (unsigned ch = 1; ch < 256 && n + 5 < size; ch++)
+        if (bits[ch / 32] & (1u << (ch % 32))) n += (unsigned)snprintf(list + n, size - n, " %u", ch);
+}
+
+/*
  * S10 port, mode 18: one passive scan, the radio's first work on air, and
  * listening only: escan with the passive scan type sends no probe request,
  * so nothing is transmitted. First the ioctl-response buffers 7 to 12 are
@@ -1658,7 +1727,7 @@ wifi_scan_event(struct wifi_scan *s, const uint8_t *packet, unsigned length)
  */
 static int
 wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb, struct wifi_host_view *last,
-    unsigned *next)
+    unsigned *next, unsigned mode)
 {
     const uint8_t *answer = NULL;
     unsigned bytes = 0;
@@ -1745,6 +1814,33 @@ wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
     } else {
         wlog("mode 18: event_msgs (status %d, %u bytes): mask not read, left as it is\n", status, bytes);
     }
+    if (mode >= 20) {
+        /* Boot 83: with the country IT the scan heard only 2 weak networks on
+         * channel 2. Mode 20: the channels the firmware allows now, ioctl
+         * WLC_GET_VALID_CHANNELS (217): a wl_uint32_list_t, count then the
+         * channels; in, the room for them (64). */
+        static const uint8_t room[4] = { 64, 0, 0, 0 };
+        r = wifi_host_repost(regions, info, last, *next, 11);
+        if (r < 0) return -1;
+        *next += (unsigned)r;
+        r = wifi_host_var(regions, info, d2h_mb, last, "mode 20", (*next)++, 217, "WLC_GET_VALID_CHANNELS", room, 4,
+            260, WIFI_HOST_IOVAR_IN + 0x400u, &answer, &bytes, &status);
+        if (r) return r < 0 ? -1 : 0;
+        const unsigned count = status == 0 && bytes >= 4 ? wifi_le32(answer) : 0;
+        uint32_t allowed[8] = { 0 };
+        unsigned in_24 = 0, in_5 = 0;
+        for (unsigned k = 0; k < count && 4u + 4u * (k + 1) <= bytes; k++) {
+            const unsigned ch = wifi_le32(answer + 4 + 4 * k);
+            if (ch == 0 || ch > 255) continue;
+            allowed[ch / 32] |= 1u << (ch % 32);
+            if (ch <= 14) in_24++;
+            else in_5++;
+        }
+        char list[200];
+        wifi_channel_list(allowed, list, sizeof(list));
+        wlog("mode 20: valid channels (status %d, %u bytes): %u (%u on 2.4 GHz, %u on 5 GHz):%s\n", status, bytes,
+            count, in_24, in_5, count ? list : " none");
+    }
     /* wl_escan_params_t (ESCAN_REQ_VERSION 1) or wl_escan_params_v2_t (2):
      * version, action, sync_id, then the scan parameters at 8. Version 1's
      * wl_scan_params_t: SSID at 0, BSSID at 36, bss_type at 42, scan_type
@@ -1795,58 +1891,9 @@ wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
     s.rssi_min = 1000;
     s.rssi_max = -1000;
     unsigned ms = 2000;                 /* the escan's own 2 s of polling */
-    uint32_t read_back = UINT32_MAX;
-    for (unsigned tick = 0; ; tick++) {
-        const uint32_t w = last->d2h_count;
-        unsigned posted = 0;
-        if (w - at >= wifi_rings[2].items) {
-            wlog("mode 18: %u completions since the last read, more than the ring; stopped\n", w - at);
-            break;
-        }
-        if (w != at) FlushPoC_DcacheRegion((vm_offset_t)wifi_host, WIFI_HOST_BYTES);
-        for (; at < w; at++) {
-            const uint8_t *c = wifi_host + wifi_rings[2].offset + wifi_rings[2].size * (at % wifi_rings[2].items);
-            if (c[0] != 0x0e) continue;
-            const uint32_t id = wifi_le32(c + 4);
-            const unsigned length = c[12] | c[13] << 8;
-            if (id < 3 || id > 6) {
-                wlog("mode 18: event in buffer id %#x, not an event buffer of ours\n", id);
-                continue;
-            }
-            if (length >= 72 && length <= 0x800u) wifi_scan_event(&s, wifi_host + wifi_host_buffer(id), length);
-            else s.malformed++;
-            wifi_host_event_post((*next)++, id);
-            posted++;
-            s.given++;
-        }
-        wifi_d2h_parsed = at;
-        clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
-        if (last->d2h_write[0] != read_back && wifi_tcm_set(regions, info[4], last->d2h_write[0], deadline)) return -1;
-        read_back = last->d2h_write[0];
-        if (posted) {
-            const unsigned windex = *next % wifi_rings[0].items;
-            CleanPoC_DcacheRegion((vm_offset_t)wifi_host + wifi_rings[0].offset,
-                (unsigned long)wifi_rings[0].items * wifi_rings[0].size);
-            if (wifi_tcm_set(regions, info[1], windex, deadline) ||
-                wifi_bp_write(regions, WIFI_PCIE_CORE + WIFI_H2D_DB0, 0xff000000u | windex, deadline)) {
-                wlog("mode 18: event buffer write index or DB0 failed\n");
-                return -1;
-            }
-        }
-        if (s.done || tick >= 60) break;
-        delay_for_interval(100, NSEC_PER_MSEC);
-        ms += 100;
-        clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
-        if (wifi_host_view(regions, info, d2h_mb, last, deadline)) {
-            wlog("mode 18: the link/BAR guard was lost while scanning\n");
-            return -1;
-        }
-    }
+    if (wifi_scan_wait(regions, info, d2h_mb, last, next, &s, &at, &ms)) return -1;
     char list[120];
-    unsigned n = 0;
-    list[0] = 0;
-    for (unsigned ch = 1; ch < 256 && n + 5 < sizeof(list); ch++)
-        if (s.channels[ch / 32] & (1u << (ch % 32))) n += (unsigned)snprintf(list + n, sizeof(list) - n, " %u", ch);
+    wifi_channel_list(s.channels, list, sizeof(list));
     if (s.done)
         wlog("mode 18: escan finished after about %u ms, final status %u\n", ms, s.final_status);
     else
@@ -1855,7 +1902,33 @@ wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
         "%u malformed; %u event buffers given back\n", s.results, s.networks,
         s.networks - s.networks_5g, s.networks_5g, s.results ? s.rssi_min : 0, s.results ? s.rssi_max : 0, s.others,
         s.malformed, s.given);
-    wlog("mode 18: channels heard:%s\n", n ? list : " none");
+    wlog("mode 18: channels heard:%s\n", list[0] ? list : " none");
+    if (mode < 20 || !s.done) return 0;
+    /* Mode 20: a second pass, the same escan 1 s later, so that one missed
+     * beacon does not decide what is heard; networks are counted once over
+     * both passes. Still listening only. */
+    delay_for_interval(1000, NSEC_PER_MSEC);
+    clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+    if (wifi_host_view(regions, info, d2h_mb, last, deadline)) return -1;
+    r = wifi_host_repost(regions, info, last, *next, 9);
+    if (r < 0) return -1;
+    *next += (unsigned)r;
+    r = wifi_host_var(regions, info, d2h_mb, last, "mode 20", (*next)++, 263, "escan", params, size, size + 6,
+        WIFI_HOST_IOVAR_IN + 0x200u, &answer, &bytes, &status);
+    if (r) return r < 0 ? -1 : 0;
+    wlog("mode 20: second escan set: status %d\n", status);
+    if (status) return 0;
+    const unsigned results = s.results, networks = s.networks;
+    s.done = 0;
+    s.final_status = 0;
+    ms = 2000;
+    if (wifi_scan_wait(regions, info, d2h_mb, last, next, &s, &at, &ms)) return -1;
+    wifi_channel_list(s.channels, list, sizeof(list));
+    wlog("mode 20: second escan %s after about %u ms (final status %u): %u results, %u networks not heard in the "
+        "first\n", s.done ? "finished" : "not finished", ms, s.final_status, s.results - results, s.networks - networks);
+    wlog("mode 20: both passes: %u networks (%u on 2.4 GHz, %u on 5/6 GHz, %u of them new in the second), RSSI %d "
+        "to %d dBm; channels heard:%s\n", s.networks, s.networks - s.networks_5g, s.networks_5g,
+        (s.networks - networks), s.results ? s.rssi_min : 0, s.results ? s.rssi_max : 0, list[0] ? list : " none");
     return 0;
 }
 
@@ -1911,7 +1984,7 @@ wifi_host_hello(struct wifi_region *regions, uint32_t mode, const uint32_t *info
     }
     r = wifi_host_up(regions, info, d2h_mb, last, &next);
     if (r) return r < 0 ? -1 : 0;   /* unanswered, or WLC_UP refused: no scan */
-    return mode >= 18 && wifi_host_scan(regions, info, d2h_mb, last, &next) < 0 ? -1 : 0;
+    return mode >= 18 && wifi_host_scan(regions, info, d2h_mb, last, &next, mode) < 0 ? -1 : 0;
 }
 
 /*
@@ -2739,7 +2812,7 @@ void
 b2l_wifi_diag_start(void)
 {
     uint32_t mode = 0;
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 19) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 20) {
         wlog("diagnostic disabled; no MMIO access\n");
         return;
     }

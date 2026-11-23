@@ -68,7 +68,7 @@ for kv in platforms= egl=disabled glx=disabled gbm=disabled gallium-drivers=panf
     opengl=true gles1=disabled gles2=enabled llvm=disabled shared-llvm=disabled valgrind=disabled \
     libunwind=disabled lmsensors=disabled zstd=disabled xmlconfig=disabled expat=disabled \
     build-tests=false tools= gallium-va=disabled gallium-vdpau=disabled gallium-mediafoundation=disabled \
-    gallium-rusticl=false android-libbacktrace=disabled shader-cache=disabled; do
+    gallium-rusticl=false android-libbacktrace=disabled shader-cache=enabled; do
   name=${kv%%=*}
   if grep -q "option('$name'\|option(\"$name\"\|^  '$name'" "$options_file"; then args+=("-D$kv"); else echo "skipping -D$kv (not in this release)"; fi
 done
@@ -88,6 +88,14 @@ python3 "$repo/scripts/mesa/b2l-drm/patch_pan_shader_idvs.py" "$src/src/gallium/
 python3 "$repo/scripts/mesa/b2l-drm/patch_pan_jm_barrier.py" "$src/src/gallium/drivers/panfrost/pan_jm.c"
 # A refused IOSurface import returns NULL instead of crashing (boot 58): see the script.
 python3 "$repo/scripts/mesa/b2l-drm/patch_pan_bo_import.py" "$src/src/gallium/drivers/panfrost/pan_bo.c"
+# M4 (boot 83): Panfrost's disk shader cache (shader-cache=enabled above), the
+# driver named by a SHA-1 of the Mesa release and every file under
+# scripts/mesa instead of an ELF build-id: see the script.
+cache_id=$( { basename "$src"; cd "$repo" && find scripts/mesa -type f ! -name '*.pyc' | LC_ALL=C sort |
+  while IFS= read -r f; do shasum -a 1 "$f"; done; } | shasum -a 1 | cut -c1-40 )
+echo "disk shader cache id: $cache_id" | tee "$build/cache-id.txt"
+python3 "$repo/scripts/mesa/b2l-drm/patch_pan_disk_cache.py" "$src/src/gallium/drivers/panfrost/pan_disk_cache.c" \
+  "$cache_id"
 # The AIR (Metal shader) frontend, HakiOS's (scripts/mesa/air, MIT): it lives
 # in src/compiler/air and one subdir() after spirv's reaches it, as HakiOS's
 # tools/mesa/air-frontend.patch does (docs/metal-on-panfrost.md).

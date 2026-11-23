@@ -23,7 +23,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define B2L_MTL_API_VERSION 3
+#define B2L_MTL_API_VERSION 4
 
 #define B2L_MTL_MAX_COLORS     8
 #define B2L_MTL_MAX_ATTRIBUTES 31
@@ -308,6 +308,13 @@ struct b2l_mtl_api {
 	/* Version 3 (M4). A blit: every level of the texture after its first
 	 * made from the one before (generateMipmapsForTexture:). */
 	void (*cmdbuf_generate_mipmaps)(struct b2l_mtl_cmdbuf *cmdbuf, struct b2l_mtl_texture *texture);
+
+	/* Version 4 (M4). A texture on a buffer's memory (newLinearTextureWith-
+	 * Descriptor:offset:bytesPerRow:bytesPerImage:): one 2D level, kept in
+	 * step with the buffer at each command buffer. NULL with the reason. */
+	struct b2l_mtl_texture *(*texture_from_buffer)(struct b2l_mtl_buffer *buffer,
+	    const struct b2l_mtl_texture_desc *desc, uint64_t offset, uint64_t bytes_per_row, char *why,
+	    size_t why_size);
 };
 
 /* The table, or NULL if this library does not have that version. */

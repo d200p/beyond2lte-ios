@@ -453,8 +453,11 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * Mode 19 (boots 79-81: the escan was refused, the firmware
                  * had only "Generic.Min" CLM data and the country "#n"):
                  * first the board's CLM blob from the attachment (B2LFW003)
-                 * with "clmload", as DHD loads it, and the country XZ/11. */
-                "b2l_wifi_diag=19 "
+                 * with "clmload", as DHD loads it, and the country XZ/11.
+                 * Mode 20 (boots 82-83: the CLM loaded; with GB 2 networks
+                 * at -67/-74 dBm, with IT 2 at -91/-93): the country IT,
+                 * the channels the firmware allows, and a second pass. */
+                "b2l_wifi_diag=20 "
                 /* S10 port: test boots come back to TWRP by themselves 8 min
                  * after start (after Metal's test and Wi-Fi's deferred run),
                  * synced like the volume-key chord (B2LPower.cpp). */

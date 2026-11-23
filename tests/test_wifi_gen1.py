@@ -396,6 +396,12 @@ static void iovar15(uint32_t value) {
     } else if (cmd == 2) {
         static const uint8_t zero[4];
         assert(mode >= 17 && length == 4 && !memcmp(input, zero, 4)); up17 = 1; answer = host13_fault != 11;
+    } else if (cmd == 217) {
+        /* mode 20: WLC_GET_VALID_CHANNELS, a wl_uint32_list_t; in, its room */
+        static const uint32_t valid[22] = { 21, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+                                            36, 40, 44, 48, 52, 56, 60, 64 };
+        assert(mode >= 20 && length == 260 && (uint8_t)input[0] == 64 && !input[1]);
+        data = valid; resp = sizeof(valid);
     } else if (cmd == 262 && !strcmp(input, "isup")) {
         assert(mode >= 17 && length == 32 && up17); data = &up17; resp = 4;
     } else if (cmd == 262 && !strcmp(input, "scan_ver")) {
@@ -462,7 +468,9 @@ static void iovar15(uint32_t value) {
         uint32_t version, nprobes, active, passive, home, channels;
         memcpy(&version, q, 4); memcpy(&nprobes, q + times, 4); memcpy(&active, q + times + 4, 4);
         memcpy(&passive, q + times + 8, 4); memcpy(&home, q + times + 12, 4); memcpy(&channels, q + times + 16, 4);
-        assert(mode >= 18 && length == (v2 ? 86u : 78u) && (mask18[8] & 0x20) && !escan18);
+        /* mode 20: the second pass starts after the first one's final event */
+        assert(mode >= 18 && length == (v2 ? 86u : 78u) && (mask18[8] & 0x20) &&
+            (!escan18 || (mode >= 20 && scan18_next == 6)));
         assert(version == (v2 ? 2u : 1u) && q[4] == 1 && !q[5] && q[6] == 0x18 && q[7] == 0x53);
         if (v2) assert(q[8] == 2 && !q[9] && q[10] == 76 && !q[11]);  /* wl_scan_params_v2_t version, length */
         for (unsigned b = ssid; b < ssid + 36; b++) assert(!q[b]);    /* no SSID */
@@ -471,7 +479,7 @@ static void iovar15(uint32_t value) {
         if (v2) assert(!q[55] && q[56] == 1 && !q[57] && !q[58] && !q[59]);     /* pad, passive (a word) */
         else assert(q[51] == 1);                                      /* passive (a byte) */
         assert(nprobes == UINT32_MAX && active == UINT32_MAX && passive == 110 && home == UINT32_MAX && !channels);
-        assert(escans18 < 2);
+        assert(escans18 < (mode >= 20 ? 3u : 2u));      /* mode 20: a second pass */
         escans18++;
         console18("000001.500 wl0: escan from 00:90:4c:c5:12:38\n");
         if (host13_fault == 12) status = -2;
@@ -507,6 +515,7 @@ static void iovar15(uint32_t value) {
     }
     if (start_scan) {
         escan18 = 1;
+        scan18_next = 0;
         scan18_deliver();
     }
 }
@@ -1774,6 +1783,26 @@ int main(void) {
         assert(scan18_next == 6 && nev18 == 4);
     }
     puts("Firmware CLM: the board's blob in chunks as DHD loads it, the country, then the scan, through ring wraps passed");
+    /* S10 port, mode 20: mode 19, then the valid channels and a second pass. */
+    mode = 20;
+    reset(8, 0); firmware_fixture_nvram(good, sizeof(good)); nvram_fixture_bytes = sizeof(good);
+    firmware_fixture_clm();
+    host13_fault = 0; firmware_mac_mode = 2;
+    b2l_wifi_diag_start(); verify_quiet();
+    assert(strstr(logs, "mode 19: deferred run finished") || strstr(logs, "mode 20: deferred run finished"));
+    assert(strstr(logs, "cleanup=verified") && strstr(logs, "bus mastering off again (endpoint, then root port)"));
+    assert(!strstr(logs, "ModelNet") && !strstr(logs, "aa:bb") && !strstr(logs, "00:90:4c"));
+    assert(strstr(logs, "mode 19: country after the setting: IT rev 4, ccode IT\n"));
+    assert(strstr(logs, "mode 20: valid channels (status 0, 88 bytes): 21 (13 on 2.4 GHz, 8 on 5 GHz): "
+        "1 2 3 4 5 6 7 8 9 10 11 12 13 36 40 44 48 52 56 60 64\n"));
+    assert(strstr(logs, "mode 18: 5 results, 4 networks (2 on 2.4 GHz, 2 on 5/6 GHz), RSSI -80 to -40 dBm; "
+        "0 other events, 0 malformed; 6 event buffers given back\n"));
+    assert(strstr(logs, "mode 20: second escan set: status 0\n"));
+    assert(strstr(logs, "(final status 0): 5 results, 0 networks not heard in the first\n"));
+    assert(strstr(logs, "mode 20: both passes: 4 networks (2 on 2.4 GHz, 2 on 5/6 GHz, 0 of them new in the second), "
+        "RSSI -80 to -40 dBm; channels heard: 1 6 36 149\n"));
+    assert(escans18 == 2 && scan18_next == 6 && nev18 == 4);
+    puts("Firmware scan, mode 20: the country IT, the valid channels, two passes counted once passed");
 }
 '''
 

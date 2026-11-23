@@ -1422,6 +1422,44 @@ b2l_mtl_test_run(void)
 		}
 	}
 
+	/* M4 (boot 83): -[MTLBuffer newLinearTextureWithDescriptor:offset:
+	 * bytesPerRow:bytesPerImage:]. A 64x16 BGRA8 texture on a buffer at offset
+	 * 256, rows of 256 bytes: it reads what the buffer holds, and a pass that
+	 * clears it green leaves the buffer green. */
+	{
+		static const uint8_t green[4] = { 0, 255, 0, 255 };
+		static uint8_t lback[256 * 16];
+		id lb = MSG(id, unsigned long, unsigned long)(device, S("newBufferWithLength:options:"), 256 + 256 * 16, 0);
+		uint8_t *lp = lb != nil ? MSG(void *)(lb, S("contents")) : NULL;
+		for (unsigned i = 0; lp != NULL && i < 256 + 256 * 16; i++) {
+			lp[i] = (uint8_t)(i * 7 + 5);
+		}
+		id ld = MSG(id, unsigned long, unsigned long, unsigned long, bool)(cls("MTLTextureDescriptor"),
+		    S("texture2DDescriptorWithPixelFormat:width:height:mipmapped:"), 80, 64, 16, false);
+		MSG(void, unsigned long)(ld, S("setUsage:"), 1 | 4);
+		id lt = lb != nil ? MSG(id, id, unsigned long, unsigned long, unsigned long)(lb,
+		    S("newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:"), ld, 256, 256, 256 * 16) : nil;
+		bool same = false;
+		unsigned long st = 0;
+		char lwhy[200] = "";
+		uint64_t lms = 0;
+		if (lt != nil) {
+			region_t r = { { 0, 0, 0 }, { 64, 16, 1 } };
+			MSG(void, void *, unsigned long, region_t, unsigned long)(lt, S("getBytes:bytesPerRow:fromRegion:mipmapLevel:"),
+			    lback, 256, r, 0);
+			same = memcmp(lback, lp + 256, sizeof(lback)) == 0;
+			id lcb = MSG(id)(queue, S("commandBuffer"));
+			clear_pass(lcb, lt, (clear_color){ 0.0, 1.0, 0.0, 1.0 });
+			st = run(lcb, lwhy, sizeof(lwhy), &lms);
+		}
+		uint32_t lfirst = 0;
+		unsigned lwrong = lp != NULL ? wrong_in(lp + 256, 256, 64, 16, green, &lfirst) : 1024;
+		verdict("buffer: newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:", lt != nil && same &&
+		    st == 4 && lwrong == 0, "%s, the buffer's pixels %s, status %lu, %u of 1024 pixels of the buffer not green "
+		    "(first 0x%08x), %llu ms %s", name_of(lt), same ? "read" : "NOT read", st, lwrong, lfirst,
+		    (unsigned long long)lms, lwhy);
+	}
+
 	/* a sampler */
 	id sd = make("MTLSamplerDescriptor");
 	MSG(void, unsigned long)(sd, S("setMinFilter:"), 1);

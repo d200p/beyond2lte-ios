@@ -243,13 +243,13 @@ static void reset(int requested, unsigned fail) {
     memset(memory, 0, sizeof(memory)); memset(logs, 0, sizeof(logs));
 }
 int main(void) {
-    const int disabled[] = {-1, 0, 20, 21, -2};
+    const int disabled[] = {-1, 0, 21, 22, -2};
     for (unsigned i = 0; i < sizeof(disabled)/sizeof(disabled[0]); i++) {
         reset(disabled[i], 0); b2l_wifi_diag_start();
         assert(!maps && !reads && !writes && !unmapped && strstr(logs, "disabled"));
     }
-    /* Modes 10 to 19 need the staged private input before any MMIO or thread. */
-    for (int m = 10; m <= 19; m++) {
+    /* Modes 10 to 20 need the staged private input before any MMIO or thread. */
+    for (int m = 10; m <= 20; m++) {
         reset(m, 0); b2l_wifi_diag_start();
         assert(!maps && !reads && !writes && !thread_starts && strstr(logs, "firmware input absent/invalid"));
     }

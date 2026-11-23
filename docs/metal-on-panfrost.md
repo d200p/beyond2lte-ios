@@ -793,3 +793,37 @@ Still to do for M4: a disk cache for the compiled shaders across boots,
 which needs Mesa's `pan_disk_cache.c` adapted to Mach-O (it identifies the
 driver by an ELF build-id), and executing command buffers off the caller's
 thread. Today `commit` waits for the GPU before it returns.
+
+### Boot 83 (build 81): one compile, and M4's second step
+
+The shaders were shared. backboardd compiled Core Animation's generic
+fragment shader once (21 s, done at 86 s after start). Every later pipeline
+used it, which saved about 105 s of Panfrost compiling by 101 s. Shared
+translations saved about 12 s more. The first frame reached the screen at
+about 110 s (boot 82: 200 s; OpenGL ES at boot 81: 68 s). The panel then went
+to sleep at 119 s (the lock screen's idle time) and was not woken, so this
+boot says nothing about the frame rate. The test program: 43 of 44, with
+the mipmap and 480-byte-row IOSurface tests passing; the perspective draw
+still fails. backboardd asked one selector the plug-in did not have,
+`-[MTLBuffer newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:]`,
+and was answered nil.
+
+Added for build 82:
+
+- Panfrost's disk shader cache. The build enables Mesa's `shader-cache`
+  (zlib is there). `patch_pan_disk_cache.py` names the driver by a SHA-1 of
+  the Mesa release and every file under `scripts/mesa`, as a Mach-O library
+  has no ELF build-id note. That build-id lookup is what upstream uses, and
+  without the note a release build would read through a null pointer.
+  `B2L_IDVS` joins the cache key, as it changes the programs. The cache
+  lives in `/private/var/tmp/b2l-mesa-cache`, 256 MB at most. backboardd can
+  write there (its Metal start marker is there too), and it outlives a boot.
+  The log line `mesa: disk shader cache on/OFF` says which. The probe's
+  screens still compile everything. The first boot fills the cache; from
+  the second one, the 21 s compile should be a disk read.
+- `newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:` (API
+  version 4). The texture has storage of its own, as the Mali's linear rows
+  need 64-byte strides and Panfrost cannot alias a buffer. It is filled from
+  the buffer when made and before each command buffer that uses it, and
+  written back after each one that draws, copies or computes into it. A
+  test checks both directions.

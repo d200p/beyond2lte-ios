@@ -991,3 +991,18 @@ ioctl-response buffers 11 and 12 are posted again. The test's firmware now
 answers "GB" rev 0 once the CLM is loaded and accepts "IT" as rev 4. A new
 case, fault 20, has a CLM that leaves "#n" and refuses "IT", so "XZ" rev 11
 is set.
+
+### Boot 83 (build 81): the country Italy, and mode 20
+
+"IT" with rev -1 was accepted, and read back as IT rev 0. The passive scan
+then heard 2 networks, both on channel 2 at -91/-93 dBm, and nothing on
+5 GHz. At boot 82, with GB, it had heard channel 1 at -67/-68 dBm and
+channel 58 at -74 dBm. One scan cannot tell whether that is the country, the
+phone's position or a missed beacon (110 ms a channel catches about one).
+
+Mode 20 (build 82) is mode 19 and two more things, still listening only.
+First, before the escan, `WLC_GET_VALID_CHANNELS` (ioctl 217) gives the
+channels the firmware allows for the country. Second, after the first pass,
+the same escan runs again 1 s later, and networks are counted once over
+both passes. The test's firmware answers 13 channels on 2.4 GHz and 8 on
+5 GHz and replays its results, so the second pass finds nothing new.
