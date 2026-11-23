@@ -1595,6 +1595,7 @@ wifi_host_event_post(unsigned item, unsigned id)
 /* What mode 18 heard. Addresses are kept only to count networks once. */
 struct wifi_scan {
     unsigned results, networks, networks_5g, others, malformed, given, logged, done;
+    unsigned named, hidden;             /* mode 21: networks with a name or without (never the name) */
     int rssi_min, rssi_max;
     uint32_t final_status, channels[8];
     uint8_t seen[48][6];
@@ -1631,6 +1632,8 @@ wifi_scan_event(struct wifi_scan *s, const uint8_t *packet, unsigned length)
     if (!again) {
         if (s->networks < 48) memcpy(s->seen[s->networks], bi + 8, 6);
         s->networks++;
+        if (bi[18] != 0) s->named++;        /* wl_bss_info_t SSID_len: counted, the name never read */
+        else s->hidden++;
         s->networks_5g += band[0] != '2';
     }
     s->results++;
@@ -1841,6 +1844,32 @@ wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
         wlog("mode 20: valid channels (status %d, %u bytes): %u (%u on 2.4 GHz, %u on 5 GHz):%s\n", status, bytes,
             count, in_24, in_5, count ? list : " none");
     }
+    if (mode >= 21) {
+        /* Mode 21: what the firmware can do ("cap", a list of words) and
+         * whether its own WPA supplicant is on ("sup_wpa"), which decides how
+         * a join can be done: with an in-firmware supplicant ("idsup") the
+         * passphrase goes to the firmware and it does the 4-way handshake. */
+        r = wifi_host_repost(regions, info, last, *next, 9);
+        if (r < 0) return -1;
+        *next += (unsigned)r;
+        r = wifi_host_var(regions, info, d2h_mb, last, "mode 21", (*next)++, 262, "cap", NULL, 0, 512,
+            WIFI_HOST_IOVAR_IN + 0x600u, &answer, &bytes, &status);
+        if (r) return r < 0 ? -1 : 0;
+        char caps[220];
+        unsigned cn = 0;
+        int idsup = 0;
+        for (unsigned k = 0; status == 0 && k < bytes && answer[k] && cn + 1 < sizeof(caps); k++)
+            caps[cn++] = answer[k] >= 0x20 && answer[k] <= 0x7e ? (char)answer[k] : ' ';
+        caps[cn] = 0;
+        for (unsigned k = 0; k + 5 <= cn; k++)
+            if (!memcmp(caps + k, "idsup", 5) && (k == 0 || caps[k - 1] == ' ')) idsup = 1;
+        wlog("mode 21: cap (status %d, %u bytes): %s\n", status, bytes, cn ? caps : "(none)");
+        r = wifi_host_var(regions, info, d2h_mb, last, "mode 21", (*next)++, 262, "sup_wpa", NULL, 0, 32,
+            WIFI_HOST_IOVAR_IN + 0x800u, &answer, &bytes, &status);
+        if (r) return r < 0 ? -1 : 0;
+        wlog("mode 21: in-firmware supplicant: %s; sup_wpa (status %d): %u\n", idsup ? "listed (idsup)" : "not listed",
+            status, status == 0 && bytes >= 4 ? wifi_le32(answer) : 0);
+    }
     /* wl_escan_params_t (ESCAN_REQ_VERSION 1) or wl_escan_params_v2_t (2):
      * version, action, sync_id, then the scan parameters at 8. Version 1's
      * wl_scan_params_t: SSID at 0, BSSID at 36, bss_type at 42, scan_type
@@ -1929,6 +1958,39 @@ wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
     wlog("mode 20: both passes: %u networks (%u on 2.4 GHz, %u on 5/6 GHz, %u of them new in the second), RSSI %d "
         "to %d dBm; channels heard:%s\n", s.networks, s.networks - s.networks_5g, s.networks_5g,
         (s.networks - networks), s.results ? s.rssi_min : 0, s.results ? s.rssi_max : 0, list[0] ? list : " none");
+    if (mode < 21 || !s.done) return 0;
+    /*
+     * Mode 21: the radio's first transmission. The same escan, active: the
+     * firmware sends probe requests where the CLM lets it for the country
+     * (IT) and listens elsewhere, and access points answer, hidden ones
+     * included. Networks are counted once over all three passes; of each,
+     * only whether it has a name is noted, never the name or address.
+     */
+    delay_for_interval(1000, NSEC_PER_MSEC);
+    clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+    if (wifi_host_view(regions, info, d2h_mb, last, deadline)) return -1;
+    r = wifi_host_repost(regions, info, last, *next, 11);
+    if (r < 0) return -1;
+    *next += (unsigned)r;
+    if (v2) wifi_put(params + q + 48, 0, 4);     /* scan_type 0: active */
+    else params[q + 43] = 0;
+    r = wifi_host_var(regions, info, d2h_mb, last, "mode 21", (*next)++, 263, "escan", params, size, size + 6,
+        WIFI_HOST_IOVAR_IN + 0x200u, &answer, &bytes, &status);
+    if (r) return r < 0 ? -1 : 0;
+    wlog("mode 21: active escan (probe requests where the CLM allows them) set: status %d\n", status);
+    if (status) return 0;
+    const unsigned passive_results = s.results, passive_networks = s.networks;
+    s.done = 0;
+    s.final_status = 0;
+    ms = 2000;
+    if (wifi_scan_wait(regions, info, d2h_mb, last, next, &s, &at, &ms)) return -1;
+    wifi_channel_list(s.channels, list, sizeof(list));
+    wlog("mode 21: active escan %s after about %u ms (final status %u): %u results, %u networks not heard "
+        "passively\n", s.done ? "finished" : "not finished", ms, s.final_status, s.results - passive_results,
+        s.networks - passive_networks);
+    wlog("mode 21: all three passes: %u networks (%u on 2.4 GHz, %u on 5/6 GHz; %u with a name, %u hidden), RSSI %d "
+        "to %d dBm; channels heard:%s\n", s.networks, s.networks - s.networks_5g, s.networks_5g, s.named, s.hidden,
+        s.results ? s.rssi_min : 0, s.results ? s.rssi_max : 0, list[0] ? list : " none");
     return 0;
 }
 
@@ -2812,7 +2874,7 @@ void
 b2l_wifi_diag_start(void)
 {
     uint32_t mode = 0;
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 20) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 21) {
         wlog("diagnostic disabled; no MMIO access\n");
         return;
     }

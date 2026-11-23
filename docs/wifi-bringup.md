@@ -1014,3 +1014,17 @@ With the country IT the firmware allows 37 channels: 13 on 2.4 GHz and 24 on
 passes heard the same 2 networks as boot 82 with GB: channel 1 at -70/-72
 dBm and channel 58. The second pass found nothing new. So boot 83's 2 weak
 networks on channel 2 were chance or the phone's position, not the country.
+
+## S10: capabilities and the first transmission (mode 21)
+
+Mode 21 is mode 20 and two more steps. Before the escan, it reads the
+firmware's capability words (`cap`) and `sup_wpa`. These say whether the
+firmware has its own WPA supplicant (`idsup`), which can take a passphrase
+and do the 4-way handshake itself; that decides how the join will be done.
+After the two passive passes it runs one active escan, the radio's first
+transmission. The firmware sends probe requests where the CLM allows them for
+the country (IT) and listens elsewhere, so hidden networks answer too.
+Networks are counted once over the three passes, and of each the log notes
+only whether it has a name, never the name or the address. The test's
+firmware lists `idsup`, answers `sup_wpa` 1, checks that the third escan is
+the active one, and replays its results.

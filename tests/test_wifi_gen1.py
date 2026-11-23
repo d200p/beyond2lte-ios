@@ -396,6 +396,12 @@ static void iovar15(uint32_t value) {
     } else if (cmd == 2) {
         static const uint8_t zero[4];
         assert(mode >= 17 && length == 4 && !memcmp(input, zero, 4)); up17 = 1; answer = host13_fault != 11;
+    } else if (cmd == 262 && !strcmp(input, "cap")) {
+        static const char cap[64] = "ap sta wme 802.11d 802.11h rm idsup sae";
+        assert(mode >= 21 && length == 512); data = cap; resp = sizeof(cap);
+    } else if (cmd == 262 && !strcmp(input, "sup_wpa")) {
+        static const uint32_t one = 1;
+        assert(mode >= 21 && length == 32); data = &one; resp = 4;
     } else if (cmd == 217) {
         /* mode 20: WLC_GET_VALID_CHANNELS, a wl_uint32_list_t; in, its room */
         static const uint32_t valid[22] = { 21, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13,
@@ -476,10 +482,11 @@ static void iovar15(uint32_t value) {
         for (unsigned b = ssid; b < ssid + 36; b++) assert(!q[b]);    /* no SSID */
         for (unsigned b = ssid + 36; b < ssid + 42; b++) assert(q[b] == 0xff);     /* the broadcast BSSID */
         assert(q[ssid + 42] == 2);                                    /* any BSS type */
-        if (v2) assert(!q[55] && q[56] == 1 && !q[57] && !q[58] && !q[59]);     /* pad, passive (a word) */
-        else assert(q[51] == 1);                                      /* passive (a byte) */
+        const unsigned want_passive = !(mode >= 21 && escans18 == 2);   /* mode 21: the third escan is active */
+        if (v2) assert(!q[55] && q[56] == want_passive && !q[57] && !q[58] && !q[59]);  /* pad, scan type (a word) */
+        else assert(q[51] == want_passive);                           /* scan type (a byte) */
         assert(nprobes == UINT32_MAX && active == UINT32_MAX && passive == 110 && home == UINT32_MAX && !channels);
-        assert(escans18 < (mode >= 20 ? 3u : 2u));      /* mode 20: a second pass */
+        assert(escans18 < (mode >= 21 ? 4u : mode >= 20 ? 3u : 2u));  /* mode 20: a second pass, 21: an active one */
         escans18++;
         console18("000001.500 wl0: escan from 00:90:4c:c5:12:38\n");
         if (host13_fault == 12) status = -2;
@@ -1803,6 +1810,22 @@ int main(void) {
         "RSSI -80 to -40 dBm; channels heard: 1 6 36 149\n"));
     assert(escans18 == 2 && scan18_next == 6 && nev18 == 4);
     puts("Firmware scan, mode 20: the country IT, the valid channels, two passes counted once passed");
+    /* S10 port, mode 21: the capabilities, the supplicant, then an active third pass. */
+    mode = 21;
+    reset(8, 0); firmware_fixture_nvram(good, sizeof(good)); nvram_fixture_bytes = sizeof(good);
+    firmware_fixture_clm();
+    host13_fault = 0; firmware_mac_mode = 2;
+    b2l_wifi_diag_start(); verify_quiet();
+    assert(strstr(logs, "cleanup=verified") && !strstr(logs, "ModelNet") && !strstr(logs, "aa:bb"));
+    assert(strstr(logs, "mode 21: cap (status 0, 64 bytes): ap sta wme 802.11d 802.11h rm idsup sae\n"));
+    assert(strstr(logs, "mode 21: in-firmware supplicant: listed (idsup); sup_wpa (status 0): 1\n"));
+    assert(strstr(logs, "mode 20: second escan set: status 0\n"));
+    assert(strstr(logs, "mode 21: active escan (probe requests where the CLM allows them) set: status 0\n"));
+    assert(strstr(logs, "(final status 0): 5 results, 0 networks not heard passively\n"));
+    assert(strstr(logs, "mode 21: all three passes: 4 networks (2 on 2.4 GHz, 2 on 5/6 GHz; 4 with a name, 0 hidden), "
+        "RSSI -80 to -40 dBm; channels heard: 1 6 36 149\n"));
+    assert(escans18 == 3 && scan18_next == 6 && nev18 == 4);
+    puts("Firmware scan, mode 21: the capabilities, the supplicant, an active pass, names never logged passed");
 }
 '''
 

@@ -456,8 +456,11 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * with "clmload", as DHD loads it, and the country XZ/11.
                  * Mode 20 (boots 82-83: the CLM loaded; with GB 2 networks
                  * at -67/-74 dBm, with IT 2 at -91/-93): the country IT,
-                 * the channels the firmware allows, and a second pass. */
-                "b2l_wifi_diag=20 "
+                 * the channels the firmware allows, and a second pass.
+                 * Mode 21 (boot 84: 37 channels allowed, the same 2
+                 * networks in both passes): the firmware's capabilities and
+                 * supplicant, then one active scan, the first transmission. */
+                "b2l_wifi_diag=21 "
                 /* S10 port: no b2l_recovery_after any more (boot 85, the
                  * user's request): the phone stays in iOS; both volume keys
                  * held for 3 s sync the log and restart into TWRP
