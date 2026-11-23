@@ -2217,10 +2217,17 @@ B2LMali::clientBegin(bool draw)
 	if (!runtimeReady || (draw && drawOpen)) {
 		return kIOReturnExclusiveAccess;
 	}
+	/* Boot 91: the first call of every boot waited about 12 s for the
+	 * runtime lock, which the first client holds while the runtime starts
+	 * (tables, reset, ACPM): how long that takes. */
+	const uint64_t begun = nowNS();
 	if (clients == 0 && !runtimeBegin()) {
 		runtimeEnd();
 		b2l_diag_record("B2L GPU: runtime start failed\n");
 		return kIOReturnNotReady;
+	}
+	if (clients == 0) {
+		b2l_diag_record("B2L GPU: runtime started in %llu ms\n", (nowNS() - begun) / 1000000);
 	}
 	clients++;
 	clientOpen = true;

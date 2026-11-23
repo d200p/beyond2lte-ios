@@ -1038,3 +1038,31 @@ all: 3 on 2.4 GHz and 1 on 5 GHz, all with a name, from -93 to -64 dBm.
 WPA supplicant of its own: a join needs one on the host, as UniXNU's iPadOS
 port runs `wpa_supplicant` beside the stock `wifid`. `cap` answered
 `BCME_BUFTOOSHORT` (-14) in 512 bytes, and is now asked in 2048.
+
+### Boot 91 (build 85, a plain restart)
+
+The same as boot 90: the country IT with 37 channels, the active pass
+accepted, 4 networks over the three passes, all with a name.
+
+## S10: the receive path, nothing sent (mode 22)
+
+A join with a host supplicant needs the firmware's association events, the
+security settings as they stand, and somewhere for received frames to land.
+Mode 22 runs after mode 21's three passes and transmits nothing:
+
+- `event_msgs` is read. SET_SSID, JOIN, AUTH, DEAUTH, DEAUTH_IND, ASSOC,
+  REASSOC, DISASSOC, DISASSOC_IND, LINK and PSK_SUP are switched on, and the
+  mask is read back.
+- `wsec` and `wpa_auth` are read as they are.
+- 32 receive buffers of 2 KiB go on the H2D rx post ring (ring 1, item
+  `host_rxbuf_post_t`, as `dhd_prot_rxbuf_post`). Their request ids start
+  at 0x100, apart from the control buffers' 1 to 12. The log says how many
+  the firmware takes within a second, and how many rx completions it wrote:
+  none are expected before a join.
+
+The test's firmware checks every item and buffer and takes all 32, or 16 in
+a second run.
+
+The next step is the join itself. It needs the network's name and password
+in a private file next to the firmware, which the user writes; neither is
+ever in the repository or the log.

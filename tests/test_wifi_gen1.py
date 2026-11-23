@@ -237,6 +237,8 @@ static void tcm13_write(uint32_t address, uint32_t value) {
             (mode >= 15 && db0_13 >= 2 && value != tcm13(0x2f0700) && value < 64)));
     else if (address == 0x2f0730 && hostready13)     /* the read index given back */
         assert(mode >= 15 && master13_on() && db0_13 >= 2 && value == tcm13(0x2f0720));
+    else if (address == 0x2f0704 && hostready13)     /* mode 22: the rx post ring, once */
+        assert(mode >= 22 && master13_on() && value == 32 && !tcm13(0x2f0704) && !tcm13(0x2f0714));
     else assert(!bme_ever && !hostready13 && (index ? !value : 1));
     tcm11[(address - 0x170000) / 4] = value;
 }
@@ -292,6 +294,7 @@ static void console18(const char *line) {
     tcm11_put(0x2f0110, at + (unsigned)strlen(line));
 }
 static uint8_t mask18[16];
+static unsigned rx22_db, rx22_take;     /* mode 22: rx post doorbells; how many the chip takes */
 static const struct { uint8_t bssid[6]; uint16_t chanspec; int16_t rssi; } scan18[5] = {
     { { 0x00, 0x11, 0x22, 0xaa, 0xbb, 0x01 }, 0x1001, -40 },
     { { 0x00, 0x11, 0x22, 0xaa, 0xbb, 0x02 }, 0x1006, -67 },
@@ -466,8 +469,14 @@ static void iovar15(uint32_t value) {
         assert(mode >= 18 && length == 32); data = mask18; resp = 16;
     } else if (cmd == 263 && !strcmp(input, "event_msgs")) {
         assert(mode >= 18 && length == 27 && (uint8_t)input[11 + 8] == 0x20);
-        for (unsigned b = 0; b < 16; b++) assert(b == 8 || !input[11 + b]);
+        const unsigned assoc = (uint8_t)input[11] != 0;    /* mode 22: the association events */
+        assert(!assoc || (mode >= 22 && (uint8_t)input[11] == 0xeb && (uint8_t)input[12] == 0x1a &&
+            (uint8_t)input[13] == 0x01 && (uint8_t)input[16] == 0x40));
+        for (unsigned b = 0; b < 16; b++) assert(b == 8 || !input[11 + b] || (assoc && (b <= 2 || b == 5)));
         memcpy(mask18, input + 11, 16);
+    } else if (cmd == 262 && (!strcmp(input, "wsec") || !strcmp(input, "wpa_auth"))) {
+        static const uint32_t none = 0;
+        assert(mode >= 22 && length == 32); data = &none; resp = 4;
     } else if (cmd == 263 && !strcmp(input, "escan")) {
         const uint8_t *q = (const uint8_t *)input + 6;
         const unsigned v2 = host13_fault != 16, ssid = v2 ? 12 : 8, times = v2 ? 60 : 52;
@@ -526,6 +535,20 @@ static void iovar15(uint32_t value) {
         scan18_deliver();
     }
 }
+static void rxpost22(uint32_t value) {
+    assert(mode >= 22 && value == 0xff000020u && tcm13(0x2f0704) == 32 && !tcm13(0x2f0714) && !rx22_db++);
+    for (unsigned i = 0; i < 32; i++) {
+        const uint8_t *b = host_dram + 0x1000 + 32 * i;
+        uint32_t request, meta_low, meta_high, low, high;
+        memcpy(&request, b + 4, 4); memcpy(&meta_low, b + 16, 4); memcpy(&meta_high, b + 20, 4);
+        memcpy(&low, b + 24, 4); memcpy(&high, b + 28, 4);
+        assert(b[0] == 0x11 && !b[1] && !b[2] && b[3] == 1 + i && request == 0x100 + i);
+        assert(!(b[8] | b[9]) && (b[10] | b[11] << 8) == 2048 && !b[12] && !b[13] && !b[14] && !b[15]);
+        assert(!meta_low && !meta_high && !high && low == HOST13_PA + 0x30000 + 2048 * i);
+        for (unsigned k = 0; k < 2048; k++) assert(!host_dram[0x30000 + 2048 * i + k] && host_dev[0x30000 + 2048 * i + k] == 0);
+    }
+    tcm11[(0x2f0714 - 0x170000) / 4] = rx22_take;
+}
 static void pcie13_write(unsigned off, uint32_t value) {
     static const uint32_t rings[5][3] = { { 0x00000, 64, 40 }, { 0x01000, 512, 32 }, { 0x05000, 64, 24 },
                                           { 0x06000, 1024, 24 }, { 0x0c000, 512, 40 } };
@@ -544,6 +567,7 @@ static void pcie13_write(unsigned off, uint32_t value) {
         return;
     }
     assert(off == 0x140 && hostready13);
+    if (mode >= 22 && tcm13(0x2f0704) != tcm13(0x2f0714) && !rx22_db) { rxpost22(value); return; }
     if (db0_13 == 1) { ioctl14(value); return; }
     if (db0_13 >= 2) { iovar15(value); return; }
     assert(value == 0xff000006 && !db0_13++ && tcm13(0x2f0700) == 6);
@@ -1001,6 +1025,7 @@ static void reset(unsigned which, unsigned failure) {
     nev18 = 4; ev18[0] = 3; ev18[1] = 4; ev18[2] = 5; ev18[3] = 6; escan18 = scan18_next = escans18 = 0;
     d2h_total13 = h2d_seen13 = clm19_got = clm19_chunks = clm19_loaded = country19 = 0;
     memset(mask18, 0, 16);
+    rx22_db = 0; rx22_take = 32;
     memset(host_cpu, 0, sizeof(host_cpu)); memset(host_dram, 0, sizeof(host_dram)); memset(host_dev, 0, sizeof(host_dev));
     wifi_host = NULL; wifi_host_pa = 0; wifi_master = 0;
     memset(tcm11, 0, sizeof(tcm11)); vector0 = 0; r4_io = 0x21; r4_reset = 0;
@@ -1061,7 +1086,7 @@ static void verify_quiet(void) {
     if (strstr(logs, "Gen1 probe begin:"))
         assert(!(memory[4][0xc/4] | memory[4][0x10/4] | memory[4][0x14/4]));
     assert(unmaps == (mode >= 6 ? 11u : mode + 5) && link_polls <= 500 &&
-        now_us < (mode >= 18 ? 60000000u : mode >= 16 ? 40000000u : mode >= 11 ? 20000000u : mode == 10 ? 7000000u :
+        now_us < (mode >= 22 ? 70000000u : mode >= 18 ? 60000000u : mode >= 16 ? 40000000u : mode >= 11 ? 20000000u : mode == 10 ? 7000000u :
                   1000000u));
     if (mode >= 11) assert(!r4_running && !r4_reset && r4_io == 0x21); /* Halted before power-off. */
     if (mode >= 5) {
@@ -1826,6 +1851,28 @@ int main(void) {
         "RSSI -80 to -40 dBm; channels heard: 1 6 36 149\n"));
     assert(escans18 == 3 && scan18_next == 6 && nev18 == 4);
     puts("Firmware scan, mode 21: the capabilities, the supplicant, an active pass, names never logged passed");
+    /* S10 port, mode 22: the association events, wsec and wpa_auth, the receive buffers. */
+    for (unsigned take = 32; take >= 16; take -= 16) {
+        mode = 22;
+        reset(8, 0); firmware_fixture_nvram(good, sizeof(good)); nvram_fixture_bytes = sizeof(good);
+        firmware_fixture_clm();
+        host13_fault = 0; firmware_mac_mode = 2; rx22_take = take;
+        b2l_wifi_diag_start(); verify_quiet();
+        assert(strstr(logs, "cleanup=verified") && !strstr(logs, "ModelNet") && !strstr(logs, "aa:bb"));
+        assert(strstr(logs, "mode 21: all three passes: 4 networks"));
+        assert(strstr(logs, "mode 22: association events (SET_SSID JOIN AUTH DEAUTH DEAUTH_IND ASSOC REASSOC DISASSOC "
+            "DISASSOC_IND LINK PSK_SUP): 0 of 11 were on; set: status 0\n"));
+        assert(strstr(logs, "mode 22: event_msgs read back (status 0): 11 of the 11 association events on\n"));
+        assert(strstr(logs, "mode 22: wsec (status 0): 0\n") && strstr(logs, "mode 22: wpa_auth (status 0): 0\n"));
+        assert(strstr(logs, "mode 22: 32 receive buffers of 2048 bytes posted on the rx post ring, write index 32, "
+            "DB0 0xff000020\n"));
+        char line[160];
+        snprintf(line, sizeof(line), "mode 22: the firmware took %u of the 32 receive buffers within %u ms; rx "
+            "completions written 0 (none expected before a join)\n", take, take == 32 ? 100 : 1100);
+        assert(strstr(logs, line));
+        assert(rx22_db == 1 && mask18[0] == 0xeb && mask18[8] == 0x20 && mask18[5] == 0x40);
+    }
+    puts("Firmware data path, mode 22: association events on, wsec/wpa_auth read, receive buffers posted passed");
 }
 '''
 

@@ -101,6 +101,9 @@
 #define WIFI_HOST_IOCTL3 0x1e000u       /* mode 16: two 4 KiB ioctl-response buffers */
 #define WIFI_HOST_IOCTL4 0x1d000u       /* mode 17: two 2 KiB ioctl-response buffers */
 #define WIFI_HOST_BLOB_IN 0x20000u      /* mode 19: one clmload chunk's input, 2 KiB */
+#define WIFI_HOST_RXBUF 0x30000u        /* mode 22: the receive buffers */
+#define WIFI_RXBUFS 32u
+#define WIFI_RXBUF_BYTES 2048u          /* DHD_FLOWRING_RX_BUFPOST_PKTSZ */
 /* Mode 19: the board's CLM blob (bcmdhd_clm.blob) after the NVRAM in the
  * attachment (B2LFW003), pinned like the firmware; dhd_download_blob's chunk. */
 #define WIFI_CLM_BYTES 29464u
@@ -1728,6 +1731,107 @@ wifi_channel_list(const uint32_t *bits, char *list, unsigned size)
  * event buffers, until the escan's final status. Logged: counts, channels,
  * signal levels; never a network's name or address. The rings may wrap.
  */
+/*
+ * S10 port, mode 22 (boots 90-91: the active scan heard 4 networks; the
+ * firmware has no supplicant of its own, sup_wpa -23): what a join through a
+ * host supplicant needs first, with nothing sent to the air. The association
+ * events go on in event_msgs and are read back: SET_SSID, JOIN, AUTH,
+ * DEAUTH, DEAUTH_IND, ASSOC, REASSOC, DISASSOC, DISASSOC_IND, LINK and
+ * PSK_SUP. "wsec" and "wpa_auth" are read as they are. Then the receive
+ * path: 32 buffers of 2 KiB on the H2D rx post ring (host_rxbuf_post_t, as
+ * dhd_prot_rxbuf_post), and how many the firmware takes. Before a join it
+ * receives nothing into them.
+ */
+static int
+wifi_host_datapath(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb, struct wifi_host_view *last,
+    unsigned *next)
+{
+    /* bits 0 1 3 5 6 7, 9 11 12, 16, 46 */
+    static const uint8_t assoc[16] = { 0xeb, 0x1a, 0x01, 0, 0, 0x40 };
+    const uint8_t *answer = NULL;
+    unsigned bytes = 0, had = 0;
+    int status = 0, r;
+    uint64_t deadline;
+    r = wifi_host_repost(regions, info, last, *next, 11);
+    if (r < 0) return -1;
+    *next += (unsigned)r;
+    r = wifi_host_var(regions, info, d2h_mb, last, "mode 22", (*next)++, 262, "event_msgs", NULL, 0, 32,
+        WIFI_HOST_IOVAR_IN + 0xe00u, &answer, &bytes, &status);
+    if (r) return r < 0 ? -1 : 0;
+    if (status != 0 || bytes < 16) {
+        wlog("mode 22: event_msgs (status %d, %u bytes): not read; left as it is\n", status, bytes);
+        return 0;
+    }
+    uint8_t mask[16];
+    memcpy(mask, answer, 16);
+    for (unsigned k = 0; k < 16; k++) {
+        had += (unsigned)__builtin_popcount(mask[k] & assoc[k]);
+        mask[k] |= assoc[k];
+    }
+    r = wifi_host_var(regions, info, d2h_mb, last, "mode 22", (*next)++, 263, "event_msgs", mask, 16, 27,
+        WIFI_HOST_IOVAR_IN, &answer, &bytes, &status);
+    if (r) return r < 0 ? -1 : 0;
+    wlog("mode 22: association events (SET_SSID JOIN AUTH DEAUTH DEAUTH_IND ASSOC REASSOC DISASSOC DISASSOC_IND "
+        "LINK PSK_SUP): %u of 11 were on; set: status %d\n", had, status);
+    r = wifi_host_repost(regions, info, last, *next, 11);
+    if (r < 0) return -1;
+    *next += (unsigned)r;
+    r = wifi_host_var(regions, info, d2h_mb, last, "mode 22", (*next)++, 262, "event_msgs", NULL, 0, 32,
+        WIFI_HOST_IOVAR_IN + 0xe00u, &answer, &bytes, &status);
+    if (r) return r < 0 ? -1 : 0;
+    unsigned on = 0;
+    for (unsigned k = 0; status == 0 && bytes >= 16 && k < 16; k++)
+        on += (unsigned)__builtin_popcount(answer[k] & assoc[k]);
+    wlog("mode 22: event_msgs read back (status %d): %u of the 11 association events on\n", status, on);
+    static const char *const vars[2] = { "wsec", "wpa_auth" };
+    for (unsigned v = 0; v < 2; v++) {
+        r = wifi_host_repost(regions, info, last, *next, 11);
+        if (r < 0) return -1;
+        *next += (unsigned)r;
+        r = wifi_host_var(regions, info, d2h_mb, last, "mode 22", (*next)++, 262, vars[v], NULL, 0, 32,
+            WIFI_HOST_IOVAR_IN + 0x800u + 0x200u * v, &answer, &bytes, &status);
+        if (r) return r < 0 ? -1 : 0;
+        if (status == 0 && bytes >= 4) wlog("mode 22: %s (status 0): %#x\n", vars[v], wifi_le32(answer));
+        else wlog("mode 22: %s (status %d, %u bytes): not given\n", vars[v], status, bytes);
+    }
+    /* The receive buffers: request ids from 0x100, apart from the control
+     * buffers' 1 to 12; the epoch counts from 1, as the control ring's. */
+    for (unsigned k = 0; k < WIFI_RXBUFS; k++) {
+        uint8_t *e = wifi_host + wifi_rings[1].offset + wifi_rings[1].size * k;
+        const uint64_t pa = wifi_host_pa + WIFI_HOST_RXBUF + (uint64_t)WIFI_RXBUF_BYTES * k;
+        memset(e, 0, wifi_rings[1].size);
+        e[0] = 0x11;                            /* MSG_TYPE_RXBUF_POST */
+        e[3] = (uint8_t)((1 + k) % 253);
+        wifi_put(e + 4, 0x100u + k, 4);
+        wifi_put(e + 10, WIFI_RXBUF_BYTES, 2);  /* data_buf_len; no metadata buffer */
+        wifi_put(e + 24, (uint32_t)pa, 4);
+        wifi_put(e + 28, (uint32_t)(pa >> 32), 4);
+    }
+    CleanPoC_DcacheRegion((vm_offset_t)wifi_host + WIFI_HOST_RXBUF, WIFI_RXBUFS * WIFI_RXBUF_BYTES);
+    CleanPoC_DcacheRegion((vm_offset_t)wifi_host + wifi_rings[1].offset, WIFI_RXBUFS * wifi_rings[1].size);
+    clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+    if (wifi_tcm_set(regions, info[1] + 4, WIFI_RXBUFS, deadline) ||
+        wifi_bp_write(regions, WIFI_PCIE_CORE + WIFI_H2D_DB0, 0xff000000u | WIFI_RXBUFS, deadline)) {
+        wlog("mode 22: rx post write index or DB0 failed\n");
+        return -1;
+    }
+    wlog("mode 22: %u receive buffers of %u bytes posted on the rx post ring, write index %u, DB0 %#x\n",
+        WIFI_RXBUFS, WIFI_RXBUF_BYTES, WIFI_RXBUFS, 0xff000000u | WIFI_RXBUFS);
+    uint32_t taken = 0;
+    unsigned waited = 0;
+    for (; waited < 1000; waited += 100) {
+        delay_for_interval(100, NSEC_PER_MSEC);
+        clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+        if (wifi_bp_read(regions, info[2] + 4, &taken, deadline)) return -1;
+        if (taken == WIFI_RXBUFS) break;
+    }
+    clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+    if (wifi_host_view(regions, info, d2h_mb, last, deadline)) return -1;
+    wlog("mode 22: the firmware took %u of the %u receive buffers within %u ms; rx completions written %u "
+        "(none expected before a join)\n", taken, WIFI_RXBUFS, waited + 100, last->d2h_write[2]);
+    return 0;
+}
+
 static int
 wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb, struct wifi_host_view *last,
     unsigned *next, unsigned mode)
@@ -1991,7 +2095,7 @@ wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
     wlog("mode 21: all three passes: %u networks (%u on 2.4 GHz, %u on 5/6 GHz; %u with a name, %u hidden), RSSI %d "
         "to %d dBm; channels heard:%s\n", s.networks, s.networks - s.networks_5g, s.networks_5g, s.named, s.hidden,
         s.results ? s.rssi_min : 0, s.results ? s.rssi_max : 0, list[0] ? list : " none");
-    return 0;
+    return mode >= 22 ? wifi_host_datapath(regions, info, d2h_mb, last, next) : 0;
 }
 
 /*
@@ -2874,7 +2978,7 @@ void
 b2l_wifi_diag_start(void)
 {
     uint32_t mode = 0;
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 21) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 22) {
         wlog("diagnostic disabled; no MMIO access\n");
         return;
     }

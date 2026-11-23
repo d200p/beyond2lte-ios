@@ -1010,3 +1010,20 @@ Added (build 86, with build 85's 1 GiB limit):
 - The kernel's PC and stack samplers follow backboardd. The stacks follow
   its `coreanimation.display` thread (`b2l_stack_thread`), to show who
   calls malloc.
+
+The lock-screen swipe (boot 91, the user: "it still freezes for a few
+seconds"): after the swipe, 3.5 s went by without a command buffer from
+backboardd. In that time it made about ten pipelines of `fixed_vert_lph_spc`
+and `fixed_frag_lph_cph` (other vertex layouts and attachments). The log
+timed one of them: 660 ms. Panfrost's `pan_shader_preprocess` runs before
+its disk cache is looked up, so it runs again at every boot. Added, so that
+the next boot says where those seconds go:
+
+- Every pipeline of 100 ms or more is noted whole: the translation, this
+  layer's own passes, the wait for the device lock, and Panfrost.
+- A gap of 0.5 s or more between two command buffers is noted with what this
+  layer did in it: pipelines (and their lock waits), textures,
+  `replaceRegion` and buffers, by count and time. Anything left over belongs
+  to Core Animation, and the stack sampler shows it.
+- B2LMali notes how long the runtime takes to start for the first client.
+  Every boot's first call waited about 12 s for that lock.

@@ -459,8 +459,11 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * the channels the firmware allows, and a second pass.
                  * Mode 21 (boot 84: 37 channels allowed, the same 2
                  * networks in both passes): the firmware's capabilities and
-                 * supplicant, then one active scan, the first transmission. */
-                "b2l_wifi_diag=21 "
+                 * supplicant, then one active scan, the first transmission.
+                 * Mode 22 (boots 90-91: 4 networks, no supplicant in the
+                 * firmware): the association events on, wsec and wpa_auth
+                 * read, and the receive path's buffers posted, nothing sent. */
+                "b2l_wifi_diag=22 "
                 /* S10 port: no b2l_recovery_after any more (boot 85, the
                  * user's request): the phone stays in iOS; both volume keys
                  * held for 3 s sync the log and restart into TWRP

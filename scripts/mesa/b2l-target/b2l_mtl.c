@@ -101,6 +101,23 @@ static uint64_t alive_textures, alive_texture_bytes, alive_buffers, alive_buffer
 static uint64_t cpu_tiled_textures;             /* written by the CPU: no AFBC (texture_new_bind) */
 static uint64_t upload_count, upload_bytes, upload_us;  /* replaceRegion since the last summary */
 
+/*
+ * M4 (boot 91): swiping up from the lock screen left 3.5 s without a
+ * command buffer while backboardd made about ten pipelines, of which the log
+ * timed one. What the Metal layer did between two command buffers, by kind
+ * (count, microseconds); cmdbuf_execute says it when the gap is 0.5 s or
+ * more, so a stall is either ours, by these numbers, or Core Animation's.
+ */
+enum { STALL_PIPELINE, STALL_PIPELINE_LOCK, STALL_TEXTURE, STALL_UPLOAD, STALL_BUFFER, STALL_KINDS };
+static uint64_t stall_count[STALL_KINDS], stall_us[STALL_KINDS];
+
+static void
+stall_add(unsigned kind, uint64_t us)
+{
+	__atomic_add_fetch(&stall_count[kind], 1, __ATOMIC_RELAXED);
+	__atomic_add_fetch(&stall_us[kind], us, __ATOMIC_RELAXED);
+}
+
 static void
 alive_add(uint64_t *count, uint64_t *bytes, int64_t n, int64_t size)
 {
@@ -550,6 +567,7 @@ buffer_new(struct b2l_mtl_device *dev, uint64_t length, const void *bytes, char 
 	obj_init(&b->base, buffer_destroy);
 	b->dev = dev;
 	b->length = length;
+	const uint64_t b0 = now_us();
 	unsigned size = (unsigned)align64(length, 16);
 	struct pipe_resource t;
 	memset(&t, 0, sizeof(t));
@@ -586,6 +604,7 @@ buffer_new(struct b2l_mtl_device *dev, uint64_t length, const void *bytes, char 
 	} else {
 		memset(b->map, 0, size);
 	}
+	stall_add(STALL_BUFFER, now_us() - b0);
 	return b;
 }
 
@@ -734,6 +753,7 @@ texture_new_bind(struct b2l_mtl_device *dev, const struct b2l_mtl_texture_desc *
 	t->dev = dev;
 	t->format = templat.format;
 	t->desc = *desc;
+	const uint64_t c0 = now_us();
 	pthread_mutex_lock(&dev->lock);
 	/* A usage the Mali cannot give (an image of this format, say) is dropped
 	 * rather than refusing the texture: CA asks for ShaderWrite broadly. */
@@ -788,6 +808,7 @@ texture_new_bind(struct b2l_mtl_device *dev, const struct b2l_mtl_texture_desc *
 		free(t);
 		return NULL;
 	}
+	stall_add(STALL_TEXTURE, now_us() - c0);
 	t->own_bytes = MAX2(resource_bytes(t->res), 1);
 	alive_add(&alive_textures, &alive_texture_bytes, 1, (int64_t)t->own_bytes);
 	if (t->cpu_tiled) {
@@ -1192,7 +1213,9 @@ texture_replace(struct b2l_mtl_texture *t, const struct b2l_mtl_region *region, 
 	__atomic_add_fetch(&upload_count, 1, __ATOMIC_RELAXED);
 	__atomic_add_fetch(&upload_bytes, (uint64_t)box.width * box.height * box.depth *
 	    util_format_get_blocksize(t->format), __ATOMIC_RELAXED);
-	__atomic_add_fetch(&upload_us, now_us() - u0, __ATOMIC_RELAXED);
+	const uint64_t u1 = now_us() - u0;
+	__atomic_add_fetch(&upload_us, u1, __ATOMIC_RELAXED);
+	stall_add(STALL_UPLOAD, u1);
 }
 
 /* Rows of a mapped texture into memory laid out as the caller asked. */
@@ -3076,6 +3099,7 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 		return NULL;
 	}
 	uint64_t t0 = now_us();
+	const uint64_t p_start = t0;
 	bool translated = function_translate(dev, desc->vertex) &&
 	    (desc->fragment == NULL || function_translate(dev, desc->fragment));
 	report->translate_ms = (uint32_t)((now_us() - t0) / 1000);
@@ -3275,8 +3299,10 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 			name_for_disk(fs, pkey, 'f');
 		}
 	}
+	const uint64_t p_passes = now_us();     /* boot 91: the end of this layer's own passes */
 	pthread_mutex_lock(&dev->lock);
 	uint64_t t1 = now_us();
+	stall_add(STALL_PIPELINE_LOCK, t1 - p_passes);
 	bool vs_hit = false, fs_hit = false;
 	uint32_t vs_ms = 0, fs_ms = 0;
 	/* the driver owns the NIR now (or it was freed for a shader made before) */
@@ -3346,6 +3372,20 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 	    bv->argument_members + bf->argument_members != 0 ? "; argument buffers NOT bound" : "");
 	if (pkeyed) {
 		pipeline_keep(dev, pkey, p);
+	}
+	/* Boot 91: a pipeline of 100 ms or more, whole: the translation, this
+	 * layer's passes (linking, outputs, scratch, inputs, Gallium's lowering
+	 * and the NIR's hash), the wait for the device lock (a command buffer
+	 * of the other thread holds it), Panfrost's state and the rest. */
+	const uint64_t p_total = now_us() - p_start;
+	stall_add(STALL_PIPELINE, p_total);
+	static unsigned slow_noted;
+	if (p_total >= 100000 && __atomic_add_fetch(&slow_noted, 1, __ATOMIC_RELAXED) <= 200) {
+		b2l_drm_note("mtl M4: pipeline %s + %s made in %llu ms: translation %u, own passes %llu, waiting for the "
+		    "device %llu, Panfrost %u ms", function_name(desc->vertex),
+		    desc->fragment != NULL ? function_name(desc->fragment) : "-", (unsigned long long)(p_total / 1000),
+		    report->translate_ms, (unsigned long long)((p_passes - p_start) / 1000 - report->translate_ms),
+		    (unsigned long long)((t1 - p_passes) / 1000), report->compile_ms);
 	}
 	return p;
 }
@@ -4954,6 +4994,29 @@ cmdbuf_execute(struct b2l_mtl_cmdbuf *cb, uint64_t *gpu_us, char *why, size_t wh
 		say(why, why_size, "out of memory");
 		return -1;
 	}
+	/* Boot 91: a gap of 0.5 s or more since the last command buffer, and
+	 * what this layer did in it (stall_add). Gaps over 30 s with little work
+	 * are the screen at rest; at most 80 lines. */
+	static uint64_t last_done_us;
+	static unsigned stalls_noted;
+	const uint64_t arrived = now_us();
+	uint64_t c[STALL_KINDS], u[STALL_KINDS], work = 0;
+	for (unsigned k = 0; k < STALL_KINDS; k++) {
+		c[k] = __atomic_exchange_n(&stall_count[k], 0, __ATOMIC_RELAXED);
+		u[k] = __atomic_exchange_n(&stall_us[k], 0, __ATOMIC_RELAXED);
+		work += k == STALL_PIPELINE_LOCK ? 0 : u[k];
+	}
+	const uint64_t gap = last_done_us != 0 ? arrived - last_done_us : 0;
+	if (gap >= 500000 && (gap <= 30000000 || work >= 100000) &&
+	    __atomic_add_fetch(&stalls_noted, 1, __ATOMIC_RELAXED) <= 80) {
+		b2l_drm_note("mtl M4: %llu ms without a command buffer; in it pipelines %llu in %llu ms (%llu ms waiting for "
+		    "the device), textures %llu in %llu ms, replaceRegion %llu in %llu ms, buffers %llu in %llu ms",
+		    (unsigned long long)(gap / 1000), (unsigned long long)c[STALL_PIPELINE],
+		    (unsigned long long)(u[STALL_PIPELINE] / 1000), (unsigned long long)(u[STALL_PIPELINE_LOCK] / 1000),
+		    (unsigned long long)c[STALL_TEXTURE], (unsigned long long)(u[STALL_TEXTURE] / 1000),
+		    (unsigned long long)c[STALL_UPLOAD], (unsigned long long)(u[STALL_UPLOAD] / 1000),
+		    (unsigned long long)c[STALL_BUFFER], (unsigned long long)(u[STALL_BUFFER] / 1000));
+	}
 	pthread_mutex_lock(&dev->lock);
 	uint64_t t0 = now_us();
 	/* M4: textures on buffers take what the CPU wrote there since. */
@@ -5057,6 +5120,7 @@ cmdbuf_execute(struct b2l_mtl_cmdbuf *cb, uint64_t *gpu_us, char *why, size_t wh
 	const uint64_t t_wait = now_us();
 	settle(dev);
 	execute_summary(dev, t_wait - t0, now_us() - t_wait, st->draws, util_dynarray_num_elements(&cb->ops, struct op));
+	last_done_us = now_us();
 	for (unsigned i = 0; i < linears; i++) {
 		if (linear_written[i]) {
 			linear_sync(linear[i], true);   /* the GPU is done: back into the buffer */
