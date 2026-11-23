@@ -2370,7 +2370,9 @@ mtl_test_thread(__unused void *argument)
 static void
 mtl_test_start(void)
 {
-	if (boot_arg_int("b2l_metal=") < 1) {
+	/* M4 (boot 89): the test child (about 20 s of CPU and GPU in each boot)
+	 * runs only with b2l_mtl_test=1. */
+	if (boot_arg_int("b2l_metal=") < 1 || boot_arg_int("b2l_mtl_test=") < 1) {
 		return;
 	}
 	if (!once_per_boot(MTL_TEST_MARKER)) {

@@ -1581,7 +1581,7 @@ constants_of(id values, struct b2l_mtl_constant *out, char (*names)[64])
 		/* S10 port: boot 72's Core Animation shaders came out as with no
 		 * constants at all; say what each array held. */
 		static unsigned array_logs;
-		if (__atomic_fetch_add(&array_logs, 1, __ATOMIC_RELAXED) < 80) {
+		if (__atomic_fetch_add(&array_logs, 1, __ATOMIC_RELAXED) < 16) {
 			say("constant values %s: -%s gave %s with %lu", class_getName(object_getClass(values)), arrays[a],
 			    array != nil ? class_getName(object_getClass(array)) : "nil", count);
 		}
@@ -1883,7 +1883,7 @@ device_new_render_pipeline_options(id self, SEL _cmd, id d, unsigned long option
 	/* S10 port: what each pipeline writes (boot 71: Core Animation's left
 	 * the target zero); the first 24 of a process. */
 	static unsigned described;
-	if (__atomic_fetch_add(&described, 1, __ATOMIC_RELAXED) < 24) {
+	if (__atomic_fetch_add(&described, 1, __ATOMIC_RELAXED) < 8) {
 		const struct b2l_mtl_color_desc *c0 = &desc.color[0];
 		say("pipeline %s: colour 0 format %u blend %d (rgb %u: %u,%u; alpha %u: %u,%u) write mask 0x%x; "
 		    "depth %u stencil %u samples %u", s->names, c0->pixel_format, c0->blend, c0->rgb_op, c0->src_rgb,

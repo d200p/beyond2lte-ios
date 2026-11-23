@@ -61,6 +61,7 @@
 #include "util/macros.h"
 #include "util/blob.h"
 #include "util/mesa-sha1.h"
+#include "util/disk_cache.h"
 #include "compiler/nir/nir.h"
 #include "compiler/nir/nir_serialize.h"
 #include "compiler/nir/nir_builder.h"
@@ -1664,6 +1665,254 @@ function_keep(struct b2l_mtl_device *dev, struct b2l_mtl_function *f, const unsi
 	obj_unref(old);
 }
 
+/*
+ * M4 (boot 89): with Panfrost's shaders read from the disk cache, the AIR
+ * translation was what remained: 217 pipelines, 40 s of translating in a
+ * boot, up to 2.2 s at a time (the lock screen's stops). A translated function
+ * (its NIR, cleaned up, and the air_shader_info beside it) is stored in the
+ * same disk cache by its key (function_key: bitcode and constants), and the
+ * next boot reads it back instead of translating. The cache's name for the
+ * driver covers every file under scripts/mesa, the translator included.
+ */
+#define AIR_DISK_MAGIC 0x42324c41u              /* "B2LA" */
+#define AIR_DISK_VERSION 1u
+
+static struct disk_cache *
+air_disk(struct b2l_mtl_device *dev)
+{
+	return dev->screen->get_disk_shader_cache != NULL ? dev->screen->get_disk_shader_cache(dev->screen) : NULL;
+}
+
+static void
+air_disk_key(struct disk_cache *dc, const unsigned char key[20], cache_key out)
+{
+	unsigned char data[28];
+	memcpy(data, "b2l:air:", 8);
+	memcpy(data + 8, key, 20);
+	disk_cache_compute_key(dc, data, sizeof(data), out);
+}
+
+static void
+blob_write_str(struct blob *b, const char *s)
+{
+	blob_write_uint8(b, s != NULL);
+	if (s != NULL) {
+		blob_write_string(b, s);
+	}
+}
+
+static const char *
+blob_read_str(struct blob_reader *r, void *mem)
+{
+	if (!blob_read_uint8(r)) {
+		return NULL;
+	}
+	const char *s = blob_read_string(r);
+	return s != NULL ? ralloc_strdup(mem, s) : NULL;
+}
+
+static void
+air_info_write(struct blob *b, const struct air_shader_info *info)
+{
+	blob_write_uint32(b, AIR_DISK_MAGIC);
+	blob_write_uint32(b, AIR_DISK_VERSION);
+	blob_write_uint32(b, (uint32_t)info->stage);
+	blob_write_str(b, info->entry_point);
+	blob_write_uint32(b, info->num_resources);
+	for (unsigned i = 0; i < info->num_resources; i++) {
+		const struct air_resource *r = &info->resources[i];
+		blob_write_uint32(b, (uint32_t)r->kind);
+		blob_write_uint32(b, r->index);
+		blob_write_uint32(b, r->size);
+		blob_write_uint8(b, r->read);
+		blob_write_uint8(b, r->write);
+		blob_write_uint8(b, r->ir_write);
+		blob_write_uint8(b, r->null_texture);
+		blob_write_uint32(b, r->param);
+		blob_write_str(b, r->name);
+		blob_write_str(b, r->type_name);
+		blob_write_uint8(b, r->inline_sampler);
+		blob_write_uint64(b, r->sampler_state);
+		blob_write_bytes(b, &r->sampler, sizeof(r->sampler));
+		blob_write_uint32(b, (uint32_t)r->raster_order_group);
+		blob_write_uint32(b, r->argbuf_set);
+		blob_write_uint32(b, r->argbuf_id);
+		blob_write_uint32(b, r->argbuf_offset);
+	}
+	blob_write_uint32(b, info->num_varyings);
+	for (unsigned i = 0; i < info->num_varyings; i++) {
+		const struct air_varying *v = &info->varyings[i];
+		blob_write_str(b, v->name);
+		blob_write_str(b, v->link);
+		blob_write_uint32(b, v->slot);
+		blob_write_uint32(b, v->components);
+		blob_write_uint8(b, v->flat);
+		blob_write_uint8(b, v->centroid);
+		blob_write_uint8(b, v->sample);
+		blob_write_uint8(b, v->no_perspective);
+	}
+	blob_write_uint32(b, info->num_vertex_attributes);
+	for (unsigned i = 0; i < info->num_vertex_attributes; i++) {
+		const struct air_vertex_attribute *a = &info->vertex_attributes[i];
+		blob_write_uint32(b, a->index);
+		blob_write_uint32(b, a->location);
+		blob_write_uint32(b, a->components);
+		blob_write_uint32(b, a->driver_location);
+		blob_write_uint32(b, a->bit_size);
+		blob_write_uint32(b, (uint32_t)a->base_type);
+		blob_write_str(b, a->name);
+		blob_write_str(b, a->type_name);
+		blob_write_uint8(b, a->used);
+		blob_write_str(b, a->function_constant);
+	}
+	blob_write_uint32(b, info->vertex_attributes_read);
+	blob_write_uint32(b, info->num_render_targets);
+	blob_write_uint32(b, info->fbfetch_targets);
+	blob_write_uint32(b, info->raster_order_groups);
+	blob_write_uint32(b, info->num_notes);
+	for (unsigned i = 0; i < info->num_notes; i++) {
+		blob_write_str(b, info->notes[i]);
+	}
+	blob_write_uint32(b, info->threadgroup_bytes);
+	blob_write_uint8(b, info->has_threadgroup_arg);
+	blob_write_uint32(b, info->threadgroup_arg_base);
+}
+
+static bool
+air_info_read(struct blob_reader *r, void *mem, struct air_shader_info *info)
+{
+	memset(info, 0, sizeof(*info));
+	if (blob_read_uint32(r) != AIR_DISK_MAGIC || blob_read_uint32(r) != AIR_DISK_VERSION) {
+		return false;
+	}
+	info->stage = (gl_shader_stage)blob_read_uint32(r);
+	info->entry_point = blob_read_str(r, mem);
+	info->num_resources = blob_read_uint32(r);
+	if (r->overrun || info->num_resources > 4096) {
+		return false;
+	}
+	info->resources = rzalloc_array(mem, struct air_resource, MAX2(info->num_resources, 1));
+	for (unsigned i = 0; i < info->num_resources && !r->overrun; i++) {
+		struct air_resource *x = &info->resources[i];
+		x->kind = (enum air_resource_kind)blob_read_uint32(r);
+		x->index = blob_read_uint32(r);
+		x->size = blob_read_uint32(r);
+		x->read = blob_read_uint8(r);
+		x->write = blob_read_uint8(r);
+		x->ir_write = blob_read_uint8(r);
+		x->null_texture = blob_read_uint8(r);
+		x->param = blob_read_uint32(r);
+		x->name = blob_read_str(r, mem);
+		x->type_name = blob_read_str(r, mem);
+		x->inline_sampler = blob_read_uint8(r);
+		x->sampler_state = blob_read_uint64(r);
+		blob_copy_bytes(r, &x->sampler, sizeof(x->sampler));
+		x->raster_order_group = (int)blob_read_uint32(r);
+		x->argbuf_set = blob_read_uint32(r);
+		x->argbuf_id = blob_read_uint32(r);
+		x->argbuf_offset = blob_read_uint32(r);
+	}
+	info->num_varyings = blob_read_uint32(r);
+	if (r->overrun || info->num_varyings > 4096) {
+		return false;
+	}
+	info->varyings = rzalloc_array(mem, struct air_varying, MAX2(info->num_varyings, 1));
+	for (unsigned i = 0; i < info->num_varyings && !r->overrun; i++) {
+		struct air_varying *v = &info->varyings[i];
+		v->name = blob_read_str(r, mem);
+		v->link = blob_read_str(r, mem);
+		v->slot = blob_read_uint32(r);
+		v->components = blob_read_uint32(r);
+		v->flat = blob_read_uint8(r);
+		v->centroid = blob_read_uint8(r);
+		v->sample = blob_read_uint8(r);
+		v->no_perspective = blob_read_uint8(r);
+	}
+	info->num_vertex_attributes = blob_read_uint32(r);
+	if (r->overrun || info->num_vertex_attributes > 4096) {
+		return false;
+	}
+	info->vertex_attributes = rzalloc_array(mem, struct air_vertex_attribute, MAX2(info->num_vertex_attributes, 1));
+	for (unsigned i = 0; i < info->num_vertex_attributes && !r->overrun; i++) {
+		struct air_vertex_attribute *a = &info->vertex_attributes[i];
+		a->index = blob_read_uint32(r);
+		a->location = blob_read_uint32(r);
+		a->components = blob_read_uint32(r);
+		a->driver_location = blob_read_uint32(r);
+		a->bit_size = blob_read_uint32(r);
+		a->base_type = (enum air_attribute_base_type)blob_read_uint32(r);
+		a->name = blob_read_str(r, mem);
+		a->type_name = blob_read_str(r, mem);
+		a->used = blob_read_uint8(r);
+		a->function_constant = blob_read_str(r, mem);
+	}
+	info->vertex_attributes_read = blob_read_uint32(r);
+	info->num_render_targets = blob_read_uint32(r);
+	info->fbfetch_targets = blob_read_uint32(r);
+	info->raster_order_groups = blob_read_uint32(r);
+	info->num_notes = blob_read_uint32(r);
+	if (r->overrun || info->num_notes > 4096) {
+		return false;
+	}
+	info->notes = rzalloc_array(mem, const char *, MAX2(info->num_notes, 1));
+	for (unsigned i = 0; i < info->num_notes && !r->overrun; i++) {
+		info->notes[i] = blob_read_str(r, mem);
+	}
+	info->threadgroup_bytes = blob_read_uint32(r);
+	info->has_threadgroup_arg = blob_read_uint8(r);
+	info->threadgroup_arg_base = blob_read_uint32(r);
+	return !r->overrun;
+}
+
+static bool
+function_from_disk(struct b2l_mtl_device *dev, struct b2l_mtl_function *f, const unsigned char key[20])
+{
+	struct disk_cache *dc = air_disk(dev);
+	if (dc == NULL) {
+		return false;
+	}
+	cache_key ck;
+	air_disk_key(dc, key, ck);
+	size_t size = 0;
+	void *data = disk_cache_get(dc, ck, &size);
+	if (data == NULL) {
+		return false;
+	}
+	struct blob_reader r;
+	blob_reader_init(&r, data, size);
+	struct air_shader_info info;
+	bool ok = air_info_read(&r, f->mem, &info);
+	nir_shader *nir = ok ? nir_deserialize(f->mem, dev->nir_options, &r) : NULL;
+	ok = nir != NULL && !r.overrun;
+	free(data);
+	if (!ok) {
+		return false;
+	}
+	f->nir = nir;
+	f->info = info;
+	f->instructions = count_instrs(nir);
+	return true;
+}
+
+static void
+function_to_disk(struct b2l_mtl_device *dev, struct b2l_mtl_function *f, const unsigned char key[20])
+{
+	struct disk_cache *dc = air_disk(dev);
+	if (dc == NULL || f->nir == NULL) {
+		return;
+	}
+	struct blob b;
+	blob_init(&b);
+	air_info_write(&b, &f->info);
+	nir_serialize(&b, f->nir, false);
+	if (!b.out_of_memory) {
+		cache_key ck;
+		air_disk_key(dc, key, ck);
+		disk_cache_put(dc, ck, b.data, b.size, NULL);
+	}
+	blob_finish(&b);
+}
+
 /* Translated once, with the function's constants, and kept. */
 static bool
 function_translate(struct b2l_mtl_device *dev, struct b2l_mtl_function *f)
@@ -1677,6 +1926,20 @@ function_translate(struct b2l_mtl_device *dev, struct b2l_mtl_function *f)
 		f->keyed = true;
 		keyed = true;
 		if (function_share(dev, f, key)) {
+			keyed = false;
+		}
+	}
+	if (f->nir == NULL && !f->failed && keyed) {
+		const uint64_t d0 = now_us();
+		if (function_from_disk(dev, f, key)) {
+			f->translate_ms = (uint32_t)((now_us() - d0) / 1000);
+			static unsigned from_disk;
+			const unsigned n = __atomic_add_fetch(&from_disk, 1, __ATOMIC_RELAXED);
+			if (n <= 24 || n % 100 == 0) {
+				b2l_drm_note("mtl M4: %s: translation read from the disk cache in %u ms (%u so far)",
+				    f->library->lib.functions[f->index].name, f->translate_ms, n);
+			}
+			function_keep(dev, f, key);
 			keyed = false;
 		}
 	}
@@ -1700,6 +1963,7 @@ function_translate(struct b2l_mtl_device *dev, struct b2l_mtl_function *f)
 		f->translate_ms = (uint32_t)((now_us() - t0) / 1000);
 		if (f->nir != NULL && keyed) {
 			function_keep(dev, f, key);
+			function_to_disk(dev, f, key);
 		}
 	}
 	bool ok = f->nir != NULL;
@@ -2825,14 +3089,8 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 	prepare_for_gallium(vs);
 	if (fs != NULL) {
 		prepare_for_gallium(fs);
-		static bool dumped;
-		if (note_fragment(desc->fragment, fs) != 0 && !__atomic_test_and_set(&dumped, __ATOMIC_RELAXED)) {
-			b2l_drm_note("mtl M2: nir dump of %s + %s begins", function_name(desc->vertex),
-			    function_name(desc->fragment));
-			dump_nir("fs", fs);
-			dump_nir("vs", vs);
-			b2l_drm_note("mtl M2: nir dump ends");
-		}
+		(void)note_fragment(desc->fragment, fs);       /* M4: the M2c NIR dump is gone */
+		(void)dump_nir;
 	}
 
 	/* Vertex elements in driver-location order, from the descriptor.
@@ -2969,6 +3227,11 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 		obj_unref(p);
 		return NULL;
 	}
+	static unsigned pipelines_noted;
+	const unsigned pipeline_n = __atomic_add_fetch(&pipelines_noted, 1, __ATOMIC_RELAXED);
+	const bool note_pipeline = pipeline_n <= 40 || pipeline_n % 100 == 0 || report->translate_ms >= 500 ||
+	    report->compile_ms >= 500;
+	if (note_pipeline)
 	b2l_drm_note("mtl M2: pipeline %s + %s: AIR %u ms, Panfrost %u ms; %u + %u NIR instructions, "
 	    "varyings %u linked %u unmatched, %u vertex elements",
 	    function_name(desc->vertex), desc->fragment != NULL ? function_name(desc->fragment) : "-",
@@ -2987,6 +3250,7 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 		    fs_keyed ? fs_key[3] : 0, pkeyed ? "yes" : "no");
 	}
 	const struct stage_bindings *bv = &p->bind[B2L_MTL_VERTEX], *bf = &p->bind[B2L_MTL_FRAGMENT];
+	if (note_pipeline)
 	b2l_drm_note("mtl M2: pipeline %s binds: UBOs %u + %u, SSBOs 0x%x + 0x%x, textures 0x%x + 0x%x (null 0x%x), "
 	    "images 0x%x + 0x%x, samplers 0x%x + 0x%x (%u inline), vertex buffers 0x%x (zero slot %d)%s",
 	    function_name(desc->vertex), bv->ubos, bf->ubos, bv->ssbo_mask, bf->ssbo_mask, bv->texture_mask,

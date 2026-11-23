@@ -928,3 +928,25 @@ Added for build 85:
 - A colour attachment with `MTLLoadActionDontCare` is cleared to zero, not
   preloaded: undefined contents allow it. This also saves the preload's
   full-screen pass.
+
+### Boot 89 (build 84, a plain restart): the disk cache works
+
+The probe read back boot 88's entry, and no compile of a second or more was
+left: the generic shader came from the disk cache. The first frame came at
+79 s (boot 83: 110 s, boot 82: 200 s, OpenGL ES at boot 81: 68 s). What
+remained was the AIR translation: 217 pipelines took 40 s of translating in
+the boot, up to 2.2 s at a time. In 600 command buffers, Panfrost's
+`draw_vbo` took 80-90 % of the draw time, about 0.17 ms a draw. Widgets:
+`WidgetRenderer_Default` now has the device, but its RenderBox shaders
+(`uber_vertex` + `uber_fragment`) are refused by the translator ("a phi of
+pointers one of whose operands is itself a pointer chosen at run time"). The
+widgets stay white, or black once touched.
+
+Added (build 85, with the BO page and DontCare changes above):
+
+- A translated function (its NIR and its `air_shader_info`) is stored in
+  the disk cache by its key, and a later boot reads it back instead of
+  translating.
+- The Metal test child runs only with `b2l_mtl_test=1`. The M2c NIR dump is
+  gone. The two lines every pipeline wrote are kept for the first 40, every
+  100th, and any slow one.
