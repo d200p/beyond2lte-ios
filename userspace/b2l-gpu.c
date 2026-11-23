@@ -2267,7 +2267,9 @@ mtl_sweep_start(void)
  * test:") and exits. Nothing is drawn yet (M2b).
  */
 #define MTL_TEST_MARKER  "/private/var/tmp/b2l-mtl-test.running"
-#define MTL_TEST_DELAY_S 60u
+/* M4 (boot 85): 60 s after backboardd's start the test ran from 83 to 106 s,
+ * while backboardd made its first frames (109 s); it now waits for them. */
+#define MTL_TEST_DELAY_S 200u
 #define MTL_TEST_LIMIT_S 180u   /* shader translations, then Core Animation's own renderer */
 
 extern char **environ;

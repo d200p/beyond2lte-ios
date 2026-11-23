@@ -827,3 +827,43 @@ Added for build 82:
   the buffer when made and before each command buffer that uses it, and
   written back after each one that draws, copies or computes into it. A
   test checks both directions.
+
+### Boots 84 and 85 (build 82): the cache written but not found, and M4's third step
+
+Both boots said `mesa: disk shader cache on ... (writable)`. Boot 84 filled
+the cache: read back read-only from the phone, `mesa_shader_cache_db/part0`
+held 174 KB of data and a 2,848-byte index. Boot 85, a plain restart, still
+compiled the generic fragment shader (20.8 s). The cache works; the key does
+not match. Panfrost keys a shader by the SHA-1 of its NIR, which is
+evidently not the same from one boot to the next. Core Animation used the
+textures on buffers at once (a 718 x 466 BGRA8 image, a8 and rg8 glyph
+textures), which boot 83 answered nil. The test program: 44 of 45 (the new
+linear-texture test passed). In 600 command buffers, encoding took 8.1-8.6 s
+of CPU and waiting for the GPU 0.8-1.1 s: 57 draws and about 390 commands
+each.
+
+Added for build 83 (speed first, as asked after boot 85):
+
+- A stage made for a keyed pipeline is named `b2l:` and the SHA-1 of what
+  made it: the functions' bitcode and constants, and the pipeline's
+  descriptor without Core Animation's label. `patch_pan_disk_cache.py` keys
+  such a shader by that name, so the same shader is found at the next boot
+  whatever its NIR's bytes. A long compile logs the first bytes of the NIR's
+  SHA-1, to see whether it changes between boots. The disk cache is probed
+  at each start: what the last start stored is read back, then this start's
+  boot and process are stored.
+- What the context holds is remembered between draws (`dev->bound`, which
+  `unbind_all` forgets): shaders, blend, depth, rasterizer, stencil
+  reference, blend colour, viewport, scissor, vertex elements and buffers,
+  constant buffers (the same buffer and offset, or the same bytes), sampler
+  views and samplers are set only when they differ. Rebinding a shader made
+  Panfrost link the two stages again at every draw. The summary every 600
+  command buffers counts the state calls made and skipped.
+- A render pipeline is kept by its functions' keys and its descriptor, and
+  the same request gets the same pipeline (256 kept): no clone, fixes,
+  serialization and hashing again. Boot 84 made more than 150 of the same
+  few functions.
+- The Metal test child starts 200 s after backboardd instead of 60 s, so it
+  no longer runs while backboardd makes its first frames.
+- No `b2l_recovery_after` any more: the phone stays in iOS. Both volume keys
+  held for 3 s sync the log and restart into TWRP.

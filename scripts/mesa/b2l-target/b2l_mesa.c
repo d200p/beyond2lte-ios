@@ -23,6 +23,8 @@
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/driconf.h"
+#include "util/disk_cache.h"
+#include "util/u_math.h"
 #include "util/xmlconfig.h"
 #include "glapi/glapi.h"
 #include "main/dispatch.h"
@@ -30,6 +32,8 @@
 #include "panfrost/pan_public.h"
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
 #include <unistd.h>
 #include <IOSurface/IOSurfaceRef.h>
 #include "frontend/winsys_handle.h"
@@ -129,10 +133,33 @@ b2l_fscreen(void)
 	b2l.fscreen.screen = screen;
 	b2l.fscreen.get_param = fscreen_get_param;
 	b2l_drm_note("mesa: screen %s / %s", screen->get_name(screen), screen->get_vendor(screen));
-	const bool cache = screen->get_disk_shader_cache != NULL && screen->get_disk_shader_cache(screen) != NULL;
+	struct disk_cache *dc = screen->get_disk_shader_cache != NULL ? screen->get_disk_shader_cache(screen) : NULL;
 	const char *dir = getenv("MESA_SHADER_CACHE_DIR");
-	b2l_drm_note("mesa: disk shader cache %s, %s (%s)", cache ? "on" : "OFF", dir != NULL ? dir : "no directory",
+	b2l_drm_note("mesa: disk shader cache %s, %s (%s)", dc != NULL ? "on" : "OFF", dir != NULL ? dir : "no directory",
 	    dir != NULL && access(dir, W_OK) == 0 ? "writable" : "not writable or not there");
+	if (dc != NULL) {
+		/* M4 (boot 85): whether what a start stores is read by a later one,
+		 * whatever Panfrost's keys do: the boot and process of the last start,
+		 * read, then this start's stored in their place. */
+		static const char probe[] = "b2l: disk cache probe";
+		cache_key key;
+		disk_cache_compute_key(dc, probe, sizeof(probe), &key[0]);
+		size_t size = 0;
+		char *before = disk_cache_get(dc, key, &size);
+		struct timeval boot = { 0, 0 };
+		size_t boot_size = sizeof(boot);
+		int mib[2] = { CTL_KERN, KERN_BOOTTIME };
+		sysctl(mib, 2, &boot, &boot_size, NULL, 0);
+		char now[96];
+		int n = snprintf(now, sizeof(now), "boot %ld, %s %d", (long)boot.tv_sec, getprogname(), (int)getpid());
+		b2l_drm_note("mesa: disk cache probe: %s%.*s; this start is boot %ld", before != NULL ?
+		    "read back what an earlier start stored: " : "nothing read back (none stored before, or not found)",
+		    before != NULL ? (int)MIN2(size, 80) : 0, before != NULL ? before : "", (long)boot.tv_sec);
+		free(before);
+		if (n > 0) {
+			disk_cache_put(dc, key, now, (size_t)n + 1, NULL);
+		}
+	}
 	return &b2l.fscreen;
 }
 

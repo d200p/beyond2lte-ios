@@ -1006,3 +1006,11 @@ channels the firmware allows for the country. Second, after the first pass,
 the same escan runs again 1 s later, and networks are counted once over
 both passes. The test's firmware answers 13 channels on 2.4 GHz and 8 on
 5 GHz and replays its results, so the second pass finds nothing new.
+
+### Boot 84 (build 82): mode 20
+
+With the country IT the firmware allows 37 channels: 13 on 2.4 GHz and 24 on
+5 GHz (36-64, 100-140, 149-165). The country limits nothing here. Both
+passes heard the same 2 networks as boot 82 with GB: channel 1 at -70/-72
+dBm and channel 58. The second pass found nothing new. So boot 83's 2 weak
+networks on channel 2 were chance or the phone's position, not the country.

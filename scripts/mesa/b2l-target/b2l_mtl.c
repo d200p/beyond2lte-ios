@@ -181,6 +181,42 @@ struct b2l_mtl_device {
 		bool written;                           /* drawn into: newer than the surface */
 	} shadows[64];
 	unsigned shadow_next, shadow_made, shadow_refreshed;
+	/*
+	 * M4 (boot 84): 600 command buffers took 8.6 s of CPU to encode and 0.8 s
+	 * of GPU, 57 draws each, and every draw bound everything again: both
+	 * shaders (Panfrost links them again whenever either is bound), blend,
+	 * depth, rasterizer, viewport, scissor, vertex buffers, up to 11
+	 * constant buffers, 16 sampler views and 5 samplers. What the context
+	 * holds since the last unbind_all is kept here, and a draw sets only
+	 * what differs. Under lock; unbind_all forgets it.
+	 */
+	struct bound_cache {
+		void *vs, *fs, *blend, *dsa, *rast, *velems;
+		bool have_stencil, have_blend_color, have_viewport, have_scissor, have_vb;
+		struct pipe_stencil_ref stencil;
+		struct pipe_blend_color blend_color;
+		struct pipe_viewport_state viewport;
+		struct pipe_scissor_state scissor;
+		struct bound_cbuf {
+			bool set;
+			const void *bytes;              /* an op's copy, alive while the command buffer runs */
+			unsigned length;
+			struct pipe_resource *res;
+			unsigned offset, size;
+		} cbuf[B2L_MTL_STAGES][B2L_MTL_MAX_BUFFERS], vb[B2L_MTL_MAX_BUFFERS];
+		unsigned vb_count;
+		struct pipe_sampler_view *views[B2L_MTL_STAGES][B2L_MTL_MAX_TEXTURES];
+		unsigned nviews[B2L_MTL_STAGES];
+		void *samplers[B2L_MTL_STAGES][B2L_MTL_MAX_SAMPLERS];
+		unsigned nsamplers[B2L_MTL_STAGES];
+	} bound;
+	unsigned long state_set, state_skipped;         /* for execute_summary */
+	/* M4: pipelines kept by their functions and descriptor (render_pipeline_new). */
+	struct kept_pipeline {
+		unsigned char sha1[20];
+		struct b2l_mtl_render_pipeline *pipeline;      /* held */
+	} pipelines[256];
+	unsigned pipeline_next, pipeline_hits;
 };
 
 static struct b2l_mtl_device *the_device;
@@ -1399,6 +1435,8 @@ struct b2l_mtl_function {
 	/* M4: an earlier function with the same bitcode and constants, held;
 	 * nir and info are then its own (read only, in its memory). */
 	struct b2l_mtl_function *twin;
+	unsigned char key[20];                  /* M4: function_key(), when keyed */
+	bool keyed;
 };
 
 static void
@@ -1594,6 +1632,8 @@ function_translate(struct b2l_mtl_device *dev, struct b2l_mtl_function *f)
 	bool keyed = false;
 	if (f->nir == NULL && !f->failed) {
 		function_key(f, key);
+		memcpy(f->key, key, sizeof(key));
+		f->keyed = true;
 		keyed = true;
 		if (function_share(dev, f, key)) {
 			keyed = false;
@@ -2544,6 +2584,86 @@ fold_scratch(nir_shader *nir, const char *name, const char *label)
 	}
 }
 
+/*
+ * M4 (boot 84): backboardd made more than 150 pipelines of the same few
+ * functions, each one cloning, fixing, serializing and hashing their NIR
+ * again (the uber shader's 26,000 instructions take a while). A pipeline is
+ * kept by its functions' keys and its whole descriptor (formats, blending,
+ * vertex layout, label); the same request gets the same pipeline. Pipelines
+ * are immutable once made.
+ */
+static bool
+pipeline_key(const struct b2l_mtl_render_pipeline_desc *desc, unsigned char sha1[20])
+{
+	if (!desc->vertex->keyed || (desc->fragment != NULL && !desc->fragment->keyed)) {
+		return false;
+	}
+	struct b2l_mtl_render_pipeline_desc d = *desc;
+	d.vertex = d.fragment = NULL;
+	if (strstr(d.label, "b2l:") == NULL) {
+		memset(d.label, 0, sizeof(d.label));    /* a name only, unless a test's control */
+	}
+	struct mesa_sha1 ctx;
+	_mesa_sha1_init(&ctx);
+	_mesa_sha1_update(&ctx, desc->vertex->key, 20);
+	if (desc->fragment != NULL) {
+		_mesa_sha1_update(&ctx, desc->fragment->key, 20);
+	}
+	_mesa_sha1_update(&ctx, &d, sizeof(d));
+	_mesa_sha1_final(&ctx, sha1);
+	return true;
+}
+
+/*
+ * M4 (boot 85): Panfrost's disk cache keys a shader by the SHA-1 of its NIR,
+ * and the next boot compiled Core Animation's generic shader again although
+ * the cache held what the first one stored. A stage made for a keyed pipeline
+ * is named "b2l:" and the SHA-1 of the pipeline's key and the stage, what it
+ * was made from; patch_pan_disk_cache.py keys such a shader by its name. Done
+ * after shader_key(), so that sharing within the process still goes by NIR.
+ */
+static void
+name_for_disk(nir_shader *nir, const unsigned char pkey[20], char stage)
+{
+	unsigned char sha1[20];
+	struct mesa_sha1 ctx;
+	_mesa_sha1_init(&ctx);
+	_mesa_sha1_update(&ctx, pkey, 20);
+	_mesa_sha1_update(&ctx, &stage, 1);
+	_mesa_sha1_final(&ctx, sha1);
+	char hex[41];
+	_mesa_sha1_format(hex, sha1);
+	nir->info.name = ralloc_asprintf(nir, "b2l:%s", hex);
+}
+
+static struct b2l_mtl_render_pipeline *
+pipeline_kept(struct b2l_mtl_device *dev, const unsigned char sha1[20], unsigned *hits)
+{
+	struct b2l_mtl_render_pipeline *p = NULL;
+	pthread_mutex_lock(&dev->functions_lock);
+	for (unsigned i = 0; i < ARRAY_SIZE(dev->pipelines); i++) {
+		if (dev->pipelines[i].pipeline != NULL && memcmp(dev->pipelines[i].sha1, sha1, 20) == 0) {
+			p = obj_ref(dev->pipelines[i].pipeline);
+			*hits = ++dev->pipeline_hits;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&dev->functions_lock);
+	return p;
+}
+
+static void
+pipeline_keep(struct b2l_mtl_device *dev, const unsigned char sha1[20], struct b2l_mtl_render_pipeline *p)
+{
+	pthread_mutex_lock(&dev->functions_lock);
+	struct kept_pipeline *slot = &dev->pipelines[dev->pipeline_next++ % ARRAY_SIZE(dev->pipelines)];
+	struct b2l_mtl_render_pipeline *old = slot->pipeline;
+	memcpy(slot->sha1, sha1, 20);
+	slot->pipeline = obj_ref(p);
+	pthread_mutex_unlock(&dev->functions_lock);
+	obj_unref(old);         /* a pipeline takes the device lock to go: outside functions_lock */
+}
+
 static struct b2l_mtl_render_pipeline *
 render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipeline_desc *desc,
     struct b2l_mtl_pipeline_report *report, char *why, size_t why_size)
@@ -2573,6 +2693,19 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 	}
 	report->vs_instructions = desc->vertex->instructions;
 	report->fs_instructions = desc->fragment != NULL ? desc->fragment->instructions : 0;
+	unsigned char pkey[20];
+	const bool pkeyed = strstr(desc->label, "b2l:no-share") == NULL && pipeline_key(desc, pkey);
+	if (pkeyed) {
+		unsigned hits = 0;
+		struct b2l_mtl_render_pipeline *kept = pipeline_kept(dev, pkey, &hits);
+		if (kept != NULL) {
+			if (hits <= 24 || hits % 200 == 0) {
+				b2l_drm_note("mtl M4: pipeline %s + %s: the same as one made before, given again (%u so far)",
+				    function_name(desc->vertex), desc->fragment != NULL ? function_name(desc->fragment) : "-", hits);
+			}
+			return kept;
+		}
+	}
 
 	struct b2l_mtl_render_pipeline *p = calloc(1, sizeof(*p));
 	if (p == NULL) {
@@ -2750,6 +2883,12 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 	unsigned char vs_key[20], fs_key[20];
 	const bool vs_keyed = strstr(desc->label, "b2l:no-share") == NULL && shader_key(vs, vs_key);
 	const bool fs_keyed = fs != NULL && strstr(desc->label, "b2l:no-share") == NULL && shader_key(fs, fs_key);
+	if (pkeyed) {
+		name_for_disk(vs, pkey, 'v');
+		if (fs != NULL) {
+			name_for_disk(fs, pkey, 'f');
+		}
+	}
 	pthread_mutex_lock(&dev->lock);
 	uint64_t t1 = now_us();
 	bool vs_hit = false, fs_hit = false;
@@ -2800,9 +2939,11 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 		    vs_hit ? "vertex shader" : "", vs_hit && fs_hit ? " and " : "", fs_hit ? "fragment shader" : "",
 		    shader_hits, shader_saved);
 	} else if (fs_ms >= 1000 || vs_ms >= 1000) {
-		b2l_drm_note("mtl M4: pipeline %s + %s: Panfrost compiled the vertex shader in %u ms, the fragment shader "
-		    "in %u ms; kept for the pipelines that need the same", function_name(desc->vertex),
-		    desc->fragment != NULL ? function_name(desc->fragment) : "-", vs_ms, fs_ms);
+		b2l_drm_note("mtl M4: pipeline %s + %s: Panfrost made the vertex shader in %u ms, the fragment shader in %u "
+		    "ms (fragment NIR %02x%02x%02x%02x, named for the disk cache: %s); kept for the pipelines that need the "
+		    "same", function_name(desc->vertex), desc->fragment != NULL ? function_name(desc->fragment) : "-", vs_ms,
+		    fs_ms, fs_keyed ? fs_key[0] : 0, fs_keyed ? fs_key[1] : 0, fs_keyed ? fs_key[2] : 0,
+		    fs_keyed ? fs_key[3] : 0, pkeyed ? "yes" : "no");
 	}
 	const struct stage_bindings *bv = &p->bind[B2L_MTL_VERTEX], *bf = &p->bind[B2L_MTL_FRAGMENT];
 	b2l_drm_note("mtl M2: pipeline %s binds: UBOs %u + %u, SSBOs 0x%x + 0x%x, textures 0x%x + 0x%x (null 0x%x), "
@@ -2811,6 +2952,9 @@ render_pipeline_new(struct b2l_mtl_device *dev, const struct b2l_mtl_render_pipe
 	    bf->texture_mask, bv->null_texture_mask | bf->null_texture_mask, bv->image_mask, bf->image_mask,
 	    bv->sampler_mask, bf->sampler_mask, inline_count, p->vb_mask, p->zero_slot,
 	    bv->argument_members + bf->argument_members != 0 ? "; argument buffers NOT bound" : "");
+	if (pkeyed) {
+		pipeline_keep(dev, pkey, p);
+	}
 	return p;
 }
 
@@ -3581,9 +3725,54 @@ static void
 bind_vertex(struct b2l_mtl_device *dev, const struct encoder_state *st, const struct b2l_mtl_render_pipeline *p)
 {
 	struct pipe_context *pipe = dev->pipe;
-	pipe->bind_vertex_elements_state(pipe, p->velems != NULL ? p->velems : dev->default_velems);
+	struct bound_cache *bc = &dev->bound;
+	void *velems = p->velems != NULL ? p->velems : dev->default_velems;
+	if (bc->velems != velems) {
+		pipe->bind_vertex_elements_state(pipe, velems);
+		bc->velems = velems;
+		dev->state_set++;
+	} else {
+		dev->state_skipped++;
+	}
 	uint32_t mask = p->velems != NULL ? p->vb_mask : 1u;
-	unsigned count = p->velems != NULL ? p->vb_count : 1;
+	unsigned count = MIN2(p->velems != NULL ? p->vb_count : 1, B2L_MTL_MAX_BUFFERS);
+	/* M4: what each slot would read; nothing is set when it is what the
+	 * context already reads (the same buffer and offset, or the same bytes). */
+	struct bound_cbuf want[B2L_MTL_MAX_BUFFERS];
+	memset(want, 0, sizeof(want));
+	for (unsigned i = 0; i < count; i++) {
+		if ((mask & (1u << i)) == 0) {
+			continue;
+		}
+		const struct bound *b = &st->buffers[B2L_MTL_VERTEX][i];
+		want[i].set = true;
+		if (p->velems != NULL && p->zero_slot == (int)i) {
+			want[i].res = dev->zero_buffer;
+		} else if (b->bytes != NULL) {
+			want[i].bytes = b->bytes;
+			want[i].length = b->length;
+		} else if (b->buffer != NULL && b->offset < b->buffer->length) {
+			want[i].res = b->buffer->res;
+			want[i].offset = (unsigned)b->offset;
+		} else {
+			want[i].res = dev->zero_buffer;
+		}
+	}
+	bool same = bc->have_vb && bc->vb_count == count;
+	for (unsigned i = 0; same && i < count; i++) {
+		const struct bound_cbuf *k = &bc->vb[i], *w = &want[i];
+		same = k->set == w->set && k->res == w->res && k->offset == w->offset && k->length == w->length &&
+		    (k->bytes == NULL) == (w->bytes == NULL) &&
+		    (w->bytes == NULL || k->bytes == w->bytes || memcmp(k->bytes, w->bytes, w->length) == 0);
+	}
+	if (same) {
+		dev->state_skipped++;
+		return;
+	}
+	memcpy(bc->vb, want, sizeof(want));
+	bc->vb_count = count;
+	bc->have_vb = true;
+	dev->state_set++;
 	struct pipe_vertex_buffer vb[B2L_MTL_MAX_BUFFERS];
 	memset(vb, 0, sizeof(vb));
 	for (unsigned i = 0; i < count && i < B2L_MTL_MAX_BUFFERS; i++) {
@@ -3606,7 +3795,7 @@ bind_vertex(struct b2l_mtl_device *dev, const struct encoder_state *st, const st
 		}
 	}
 	/* the driver takes these references (p_context.h, set_vertex_buffers) */
-	pipe->set_vertex_buffers(pipe, MIN2(count, B2L_MTL_MAX_BUFFERS), vb);
+	pipe->set_vertex_buffers(pipe, count, vb);
 }
 
 /* One stage's buffers, textures and samplers; a zero stand-in for what the
@@ -3631,6 +3820,24 @@ bind_stage(struct b2l_mtl_device *dev, const struct encoder_state *st, enum pipe
 			c.buffer = dev->zero_buffer;
 			c.buffer_size = ZERO_BYTES;
 		}
+		/* M4: within one command buffer the same buffer and offset hold the
+		 * same data (the CPU wrote it before the commit), and bytes are
+		 * compared */
+		struct bound_cbuf *k = &dev->bound.cbuf[s][i];
+		if (k->set && (c.user_buffer != NULL ?
+		    k->bytes != NULL && k->length == c.buffer_size &&
+		    (k->bytes == c.user_buffer || memcmp(k->bytes, c.user_buffer, c.buffer_size) == 0) :
+		    k->bytes == NULL && k->res == c.buffer && k->offset == c.buffer_offset && k->size == c.buffer_size)) {
+			dev->state_skipped++;
+			continue;
+		}
+		k->set = true;
+		k->bytes = c.user_buffer;
+		k->length = c.user_buffer != NULL ? c.buffer_size : 0;
+		k->res = c.buffer;
+		k->offset = c.buffer_offset;
+		k->size = c.buffer_size;
+		dev->state_set++;
 		pipe->set_constant_buffer(pipe, shader, i, false, &c);
 	}
 	unsigned n = util_last_bit(b->ssbo_mask);
@@ -3660,7 +3867,14 @@ bind_stage(struct b2l_mtl_device *dev, const struct encoder_state *st, enum pipe
 				views[i] = dev->zero_view;
 			}
 		}
-		pipe->set_sampler_views(pipe, shader, 0, n, 0, false, views);
+		if (dev->bound.nviews[s] == n && memcmp(dev->bound.views[s], views, n * sizeof(views[0])) == 0) {
+			dev->state_skipped++;
+		} else {
+			memcpy(dev->bound.views[s], views, n * sizeof(views[0]));
+			dev->bound.nviews[s] = n;
+			dev->state_set++;
+			pipe->set_sampler_views(pipe, shader, 0, n, 0, false, views);
+		}
 	}
 	n = util_last_bit(b->image_mask);
 	if (n != 0) {
@@ -3694,7 +3908,14 @@ bind_stage(struct b2l_mtl_device *dev, const struct encoder_state *st, enum pipe
 			states[i] = b->inline_samplers[i] != NULL ? b->inline_samplers[i] :
 			    bound_sampler != NULL ? bound_sampler->cso : dev->default_sampler;
 		}
-		pipe->bind_sampler_states(pipe, shader, 0, n, states);
+		if (dev->bound.nsamplers[s] == n && memcmp(dev->bound.samplers[s], states, n * sizeof(states[0])) == 0) {
+			dev->state_skipped++;
+		} else {
+			memcpy(dev->bound.samplers[s], states, n * sizeof(states[0]));
+			dev->bound.nsamplers[s] = n;
+			dev->state_set++;
+			pipe->bind_sampler_states(pipe, shader, 0, n, states);
+		}
 	}
 }
 
@@ -3780,17 +4001,83 @@ exec_draw(struct b2l_mtl_device *dev, struct encoder_state *st, const struct b2l
 		draw.start = (unsigned)(d->index_offset / size);
 		draw.index_bias = d->base_vertex;
 	}
-	pipe->bind_vs_state(pipe, p->vs);
-	pipe->bind_fs_state(pipe, p->fs);
-	pipe->bind_blend_state(pipe, p->blend);
-	pipe->bind_depth_stencil_alpha_state(pipe, st->dsa != NULL ? st->dsa->cso : dev->default_dsa);
-	pipe->set_stencil_ref(pipe, st->stencil_ref);
-	pipe->set_blend_color(pipe, &st->blend_color);
-	pipe->bind_rasterizer_state(pipe, rasterizer(dev, st, p));
+	/* M4: only what differs from what the context holds (dev->bound) */
+	struct bound_cache *bc = &dev->bound;
+	unsigned set = 0, skipped = 0;
+	if (bc->vs != p->vs) {
+		pipe->bind_vs_state(pipe, p->vs);
+		bc->vs = p->vs;
+		set++;
+	} else {
+		skipped++;
+	}
+	if (bc->fs != p->fs) {
+		pipe->bind_fs_state(pipe, p->fs);
+		bc->fs = p->fs;
+		set++;
+	} else {
+		skipped++;
+	}
+	if (bc->blend != p->blend) {
+		pipe->bind_blend_state(pipe, p->blend);
+		bc->blend = p->blend;
+		set++;
+	} else {
+		skipped++;
+	}
+	void *dsa = st->dsa != NULL ? st->dsa->cso : dev->default_dsa;
+	if (bc->dsa != dsa) {
+		pipe->bind_depth_stencil_alpha_state(pipe, dsa);
+		bc->dsa = dsa;
+		set++;
+	} else {
+		skipped++;
+	}
+	void *rast = rasterizer(dev, st, p);
+	if (bc->rast != rast) {
+		pipe->bind_rasterizer_state(pipe, rast);
+		bc->rast = rast;
+		set++;
+	} else {
+		skipped++;
+	}
+	if (!bc->have_stencil || memcmp(&bc->stencil, &st->stencil_ref, sizeof(bc->stencil)) != 0) {
+		bc->stencil = st->stencil_ref;
+		bc->have_stencil = true;
+		pipe->set_stencil_ref(pipe, st->stencil_ref);
+		set++;
+	} else {
+		skipped++;
+	}
+	if (!bc->have_blend_color || memcmp(&bc->blend_color, &st->blend_color, sizeof(bc->blend_color)) != 0) {
+		bc->blend_color = st->blend_color;
+		bc->have_blend_color = true;
+		pipe->set_blend_color(pipe, &st->blend_color);
+		set++;
+	} else {
+		skipped++;
+	}
 	struct pipe_viewport_state viewport;
+	memset(&viewport, 0, sizeof(viewport));
 	viewport_state(&st->viewport, &viewport);
-	pipe->set_viewport_states(pipe, 0, 1, &viewport);
-	pipe->set_scissor_states(pipe, 0, 1, &st->scissor);
+	if (!bc->have_viewport || memcmp(&bc->viewport, &viewport, sizeof(viewport)) != 0) {
+		bc->viewport = viewport;
+		bc->have_viewport = true;
+		pipe->set_viewport_states(pipe, 0, 1, &viewport);
+		set++;
+	} else {
+		skipped++;
+	}
+	if (!bc->have_scissor || memcmp(&bc->scissor, &st->scissor, sizeof(bc->scissor)) != 0) {
+		bc->scissor = st->scissor;
+		bc->have_scissor = true;
+		pipe->set_scissor_states(pipe, 0, 1, &st->scissor);
+		set++;
+	} else {
+		skipped++;
+	}
+	dev->state_set += set;
+	dev->state_skipped += skipped;
 	bind_vertex(dev, st, p);
 	bind_stage(dev, st, PIPE_SHADER_VERTEX, B2L_MTL_VERTEX, &p->bind[B2L_MTL_VERTEX]);
 	if (p->fs != NULL) {
@@ -3829,6 +4116,7 @@ unbind_all(struct b2l_mtl_device *dev)
 		pipe->set_sampler_views(pipe, stages[s], 0, 0, B2L_MTL_MAX_TEXTURES, false, NULL);
 		pipe->bind_sampler_states(pipe, stages[s], 0, B2L_MTL_MAX_SAMPLERS, no_samplers);
 	}
+	memset(&dev->bound, 0, sizeof(dev->bound));     /* M4: nothing of ours is bound now */
 }
 
 /* An encoder state command into `st` (the stage and index checked). */
@@ -4169,7 +4457,7 @@ slow_draw(const struct encoder_state *st, uint64_t us)
 /* M4: where a command buffer's time goes, encoding it (CPU) or waiting for
  * the GPU at its end; every 600 command buffers, under the device lock. */
 static void
-execute_summary(uint64_t encode_us, uint64_t wait_us, unsigned draws, unsigned ops)
+execute_summary(struct b2l_mtl_device *dev, uint64_t encode_us, uint64_t wait_us, unsigned draws, unsigned ops)
 {
 	static uint64_t encode_total, wait_total, encode_max, wait_max;
 	static unsigned count, draws_total, slow, ops_total;
@@ -4184,9 +4472,11 @@ execute_summary(uint64_t encode_us, uint64_t wait_us, unsigned draws, unsigned o
 		return;
 	}
 	b2l_drm_note("mtl M4: 600 command buffers: encoding %llu ms (at most %llu), waiting for the GPU %llu ms (at most "
-	    "%llu), %u draws, %u commands, %u of them 50 ms or more", (unsigned long long)(encode_total / 1000),
-	    (unsigned long long)(encode_max / 1000), (unsigned long long)(wait_total / 1000),
-	    (unsigned long long)(wait_max / 1000), draws_total, ops_total, slow);
+	    "%llu), %u draws, %u commands, %u of them 50 ms or more; state calls %lu made, %lu skipped",
+	    (unsigned long long)(encode_total / 1000), (unsigned long long)(encode_max / 1000),
+	    (unsigned long long)(wait_total / 1000), (unsigned long long)(wait_max / 1000), draws_total, ops_total, slow,
+	    dev->state_set, dev->state_skipped);
+	dev->state_set = dev->state_skipped = 0;
 	encode_total = wait_total = encode_max = wait_max = 0;
 	count = draws_total = slow = ops_total = 0;
 }
@@ -4343,7 +4633,7 @@ cmdbuf_execute(struct b2l_mtl_cmdbuf *cb, uint64_t *gpu_us, char *why, size_t wh
 	}
 	const uint64_t t_wait = now_us();
 	settle(dev);
-	execute_summary(t_wait - t0, now_us() - t_wait, st->draws, util_dynarray_num_elements(&cb->ops, struct op));
+	execute_summary(dev, t_wait - t0, now_us() - t_wait, st->draws, util_dynarray_num_elements(&cb->ops, struct op));
 	for (unsigned i = 0; i < linears; i++) {
 		if (linear_written[i]) {
 			linear_sync(linear[i], true);   /* the GPU is done: back into the buffer */

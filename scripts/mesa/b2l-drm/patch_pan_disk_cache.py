@@ -48,7 +48,28 @@ new_flags = ('   driver_flags |= ((uint64_t)(midgard_debug | bifrost_debug) << 3
              '      driver_flags |= 1ull << 63;\n')
 old_include = '#include <string.h>\n'
 new_include = '#include <stdlib.h>\n#include <string.h>\n'
-for old, new in ((old_id, new_id), (old_flags, new_flags), (old_include, new_include)):
+# Boot 85: the cache was written (part0 of mesa_shader_cache_db held 174 KB)
+# but the next boot compiled Core Animation's generic shader again: the NIR's
+# SHA-1 is not the same from one boot to the next. A shader the Metal layer
+# names "b2l:" and 40 hex digits (b2l_mtl.c: the SHA-1 of the functions'
+# bitcode and constants and the pipeline's descriptor, which made it) is
+# keyed by that name instead.
+old_key = '   memcpy(data, uncompiled->nir_sha1, sizeof(uncompiled->nir_sha1));\n'
+new_key = ('   memcpy(data, uncompiled->nir_sha1, sizeof(uncompiled->nir_sha1));\n'
+           '   /* S10 port: a shader named "b2l:" and 40 hex digits by the Metal layer is\n'
+           '    * keyed by that name, what it was made from (patch_pan_disk_cache.py). */\n'
+           '   const char *b2l_name = uncompiled->nir != NULL ? uncompiled->nir->info.name : NULL;\n'
+           '   if (b2l_name != NULL && strncmp(b2l_name, "b2l:", 4) == 0 && strlen(b2l_name) == 44) {\n'
+           '      for (unsigned i = 0; i < 20 && i < sizeof(uncompiled->nir_sha1); i++) {\n'
+           '         unsigned v = 0;\n'
+           '         for (unsigned h = 0; h < 2; h++) {\n'
+           '            const char c = b2l_name[4 + 2 * i + h];\n'
+           '            v = v * 16 + (c >= \'a\' ? (unsigned)(c - \'a\' + 10) : (unsigned)(c - \'0\'));\n'
+           '         }\n'
+           '         data[i] = (uint8_t)v;\n'
+           '      }\n'
+           '   }\n')
+for old, new in ((old_id, new_id), (old_flags, new_flags), (old_include, new_include), (old_key, new_key)):
     if text.count(old) != 1:
         sys.exit(f'pan_disk_cache.c: expected code not found:\n{old}')
     text = text.replace(old, new, 1)

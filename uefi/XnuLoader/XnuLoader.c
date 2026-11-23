@@ -458,10 +458,10 @@ EFI_STATUS EFIAPI UefiMain(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * at -67/-74 dBm, with IT 2 at -91/-93): the country IT,
                  * the channels the firmware allows, and a second pass. */
                 "b2l_wifi_diag=20 "
-                /* S10 port: test boots come back to TWRP by themselves 8 min
-                 * after start (after Metal's test and Wi-Fi's deferred run),
-                 * synced like the volume-key chord (B2LPower.cpp). */
-                "b2l_recovery_after=480 "
+                /* S10 port: no b2l_recovery_after any more (boot 85, the
+                 * user's request): the phone stays in iOS; both volume keys
+                 * held for 3 s sync the log and restart into TWRP
+                 * (B2LInput.cpp, B2LPower.cpp). */
                 /* Metal M1 (docs/metal-on-panfrost.md): B2LMali publishes an
                  * IOAcceleratorES naming the B2LMetal plug-in, and backboardd's
                  * library asks Metal for its device in a child process 60 s
