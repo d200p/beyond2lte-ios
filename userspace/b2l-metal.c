@@ -225,6 +225,14 @@ shown_to_this_process(int level)
 		say("M3: backboardd's first start in this boot: shown the device (b2l_metal=%d)", level);
 		return true;
 	}
+	/* Boot 87: widgets always came out white. They are drawn by
+	 * WidgetRenderer_* (and chronod), which were not shown the device: shown
+	 * it too, as backboardd is. */
+	const char *name = getprogname();
+	if (level >= 2 && name != NULL && (strncmp(name, "WidgetRenderer", 14) == 0 || strcmp(name, "chronod") == 0)) {
+		say("M3: %s shown the device too, for widgets (b2l_metal=%d)", name, level);
+		return true;
+	}
 	return level >= 3;
 }
 

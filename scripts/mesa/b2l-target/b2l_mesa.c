@@ -30,6 +30,7 @@
 #include "main/dispatch.h"
 #include "panfrost/drm/panfrost_drm_public.h"
 #include "panfrost/pan_public.h"
+#include <errno.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
@@ -103,6 +104,27 @@ fscreen_get_param(struct pipe_frontend_screen *fscreen, enum st_manager_param pa
 	return 0;
 }
 
+/*
+ * M4 (boot 87): the disk cache's first directory, /private/var/tmp, is emptied
+ * at each boot (the probe found nothing a restart after storing). The first
+ * of these the process can make and write: the mobile user's caches (Core
+ * Animation's processes run as uid 501), /private/var/db, then
+ * /private/var/tmp (one boot only).
+ */
+static const char *
+shader_cache_dir(void)
+{
+	static const char *const dirs[] = {
+		"/private/var/mobile/Library/Caches/b2l-mesa-cache", "/private/var/db/b2l-mesa-cache", B2L_SHADER_CACHE_DIR,
+	};
+	for (unsigned i = 0; i < ARRAY_SIZE(dirs); i++) {
+		if ((mkdir(dirs[i], 0755) == 0 || errno == EEXIST) && access(dirs[i], W_OK) == 0) {
+			return dirs[i];
+		}
+	}
+	return NULL;
+}
+
 /* The screen, once per process (for the EAGL layer, b2l_eagl.c; the probe
  * makes its own). */
 struct pipe_frontend_screen *b2l_fscreen(void);
@@ -123,7 +145,10 @@ b2l_fscreen(void)
 	 * where backboardd can write (its Metal start marker lives there too) and
 	 * what outlives a boot; Mesa makes the directory. The probe's screens
 	 * turn it off for themselves. */
-	setenv("MESA_SHADER_CACHE_DIR", B2L_SHADER_CACHE_DIR, 0);
+	const char *cache_dir = shader_cache_dir();
+	if (cache_dir != NULL) {
+		setenv("MESA_SHADER_CACHE_DIR", cache_dir, 0);
+	}
 	setenv("MESA_SHADER_CACHE_MAX_SIZE", "256M", 0);
 	struct pipe_screen *screen = panfrost_drm_screen_create(b2l.fd, &config);
 	if (screen == NULL) {
@@ -146,15 +171,17 @@ b2l_fscreen(void)
 		disk_cache_compute_key(dc, probe, sizeof(probe), &key[0]);
 		size_t size = 0;
 		char *before = disk_cache_get(dc, key, &size);
-		struct timeval boot = { 0, 0 };
+		/* boot 87: the clock starts at 1970 at every boot, so a boot is
+		 * named by its session UUID */
+		char boot[48] = "?";
 		size_t boot_size = sizeof(boot);
-		int mib[2] = { CTL_KERN, KERN_BOOTTIME };
-		sysctl(mib, 2, &boot, &boot_size, NULL, 0);
-		char now[96];
-		int n = snprintf(now, sizeof(now), "boot %ld, %s %d", (long)boot.tv_sec, getprogname(), (int)getpid());
-		b2l_drm_note("mesa: disk cache probe: %s%.*s; this start is boot %ld", before != NULL ?
+		sysctlbyname("kern.bootsessionuuid", boot, &boot_size, NULL, 0);
+		boot[sizeof(boot) - 1] = 0;
+		char now[112];
+		int n = snprintf(now, sizeof(now), "boot %.8s, %s %d", boot, getprogname(), (int)getpid());
+		b2l_drm_note("mesa: disk cache probe: %s%.*s; this start is boot %.8s", before != NULL ?
 		    "read back what an earlier start stored: " : "nothing read back (none stored before, or not found)",
-		    before != NULL ? (int)MIN2(size, 80) : 0, before != NULL ? before : "", (long)boot.tv_sec);
+		    before != NULL ? (int)MIN2(size, 80) : 0, before != NULL ? before : "", boot);
 		free(before);
 		if (n > 0) {
 			disk_cache_put(dc, key, now, (size_t)n + 1, NULL);

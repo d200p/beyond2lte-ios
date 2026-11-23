@@ -867,3 +867,42 @@ Added for build 83 (speed first, as asked after boot 85):
   no longer runs while backboardd makes its first frames.
 - No `b2l_recovery_after` any more: the phone stays in iOS. Both volume keys
   held for 3 s sync the log and restart into TWRP.
+
+### Boots 86 and 87 (build 83): a crash, white widgets, a cache that does not outlive a boot
+
+From the user: no more visual glitches. Widgets come out white, as they
+always have. Swiping the lock screen stops for a few seconds, and opening
+Files crashed backboardd; its OpenGL ES fallback took over.
+
+- The disk cache probe: the test child read back what backboardd stored in
+  the same boot, but at the next boot nothing was there, and the generic
+  shader was compiled again. Its NIR's SHA-1 was the same in both boots
+  (`a0f2cd35`), so the key was not at fault: `/private/var/tmp` is emptied at
+  each boot. The clock starts at 1970 at every boot, so a boot is now named
+  by `kern.bootsessionuuid`.
+- The swipe's stop: a new variant of `fixed_frag_lph_cph` took Panfrost 11 s
+  at that moment.
+- The crash (read back from the phone's crash reports, read-only): SIGSEGV in
+  `pan_preload_fb_part` < `pan_preload_fb_v7` < `submit_batch` <
+  `panfrost_flush`, from `cmdbuf_execute`'s flush. It came right after the
+  first `generateMipmapsForTexture:` of 1179 x 2556 textures. The likely
+  cause: drawing the levels made Panfrost lay the texture out anew while
+  earlier work still named the old memory.
+- Encoding: 9.7-14.1 s of CPU per 600 command buffers (42,000 draws), the
+  state cache skipping about 16 calls a draw.
+- Widgets: `WidgetRenderer_*` and `chronod` were never shown the device.
+
+Added for build 84:
+
+- `generateMipmapsForTexture:` submits and waits for what was recorded
+  before it, and again after its blits.
+- The disk cache lives in the first directory the process can make and
+  write: `/private/var/mobile/Library/Caches/b2l-mesa-cache` (Core
+  Animation's processes run as uid 501), then `/private/var/db`, then
+  `/private/var/tmp`.
+- `WidgetRenderer_*` and `chronod` are shown the device at `b2l_metal=2`.
+- Textures on buffers are linear, and a command buffer copies the buffer in
+  only when its bytes differ from the last copy.
+- The 600-buffer summary splits the encoding time: draws, Panfrost's
+  `draw_vbo` alone, and the textures on buffers (copied in, unchanged,
+  written back).

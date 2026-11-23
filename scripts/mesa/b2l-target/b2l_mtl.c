@@ -211,6 +211,8 @@ struct b2l_mtl_device {
 		unsigned nsamplers[B2L_MTL_STAGES];
 	} bound;
 	unsigned long state_set, state_skipped;         /* for execute_summary */
+	uint64_t draw_us, draw_vbo_us, linear_us;       /* M4 (boot 86): where encoding goes */
+	unsigned linear_uploads, linear_unchanged, linear_writebacks;
 	/* M4: pipelines kept by their functions and descriptor (render_pipeline_new). */
 	struct kept_pipeline {
 		unsigned char sha1[20];
@@ -577,6 +579,11 @@ struct b2l_mtl_texture {
 	 * buffer that uses it and written back after one that draws into it. */
 	struct b2l_mtl_buffer *linear_buffer;
 	uint64_t linear_offset, linear_row;
+	/* M4 (boot 86): the pixels last copied in or out, packed rows; a command
+	 * buffer copies the buffer in only when they differ (832 x 466 BGRA8 is
+	 * 1.5 MB at every command buffer otherwise). */
+	uint8_t *linear_copy;
+	size_t linear_packed_row;
 };
 
 static void
@@ -608,6 +615,7 @@ texture_destroy(void *self)
 		CFRelease(t->surface);
 	}
 	obj_unref(t->linear_buffer);    /* after the lock: a buffer takes it to go */
+	free(t->linear_copy);
 	free(t);
 }
 
@@ -654,12 +662,14 @@ texture_template(const struct b2l_mtl_texture_desc *d, struct pipe_resource *t, 
 }
 
 static struct b2l_mtl_texture *
-texture_new(struct b2l_mtl_device *dev, const struct b2l_mtl_texture_desc *desc, char *why, size_t why_size)
+texture_new_bind(struct b2l_mtl_device *dev, const struct b2l_mtl_texture_desc *desc, unsigned extra_bind,
+    char *why, size_t why_size)
 {
 	struct pipe_resource templat;
 	if (!texture_template(desc, &templat, why, why_size)) {
 		return NULL;
 	}
+	templat.bind |= extra_bind;
 	struct b2l_mtl_texture *t = calloc(1, sizeof(*t));
 	if (t == NULL) {
 		say(why, why_size, "out of memory");
@@ -708,6 +718,12 @@ texture_new(struct b2l_mtl_device *dev, const struct b2l_mtl_texture_desc *desc,
 	return t;
 }
 
+static struct b2l_mtl_texture *
+texture_new(struct b2l_mtl_device *dev, const struct b2l_mtl_texture_desc *desc, char *why, size_t why_size)
+{
+	return texture_new_bind(dev, desc, 0, why, why_size);
+}
+
 static void texture_read_locked(struct b2l_mtl_texture *t, const struct pipe_box *box, uint32_t level, uint8_t *out,
     uint64_t bytes_per_row, uint64_t bytes_per_image);
 
@@ -719,14 +735,33 @@ linear_sync(struct b2l_mtl_texture *t, bool to_buffer)
 	if (b == NULL || b->map == NULL) {
 		return;
 	}
+	struct b2l_mtl_device *dev = t->dev;
+	const uint64_t t0 = now_us();
 	struct pipe_box box;
 	u_box_2d(0, 0, (int)t->res->width0, (int)t->res->height0, &box);
+	const uint8_t *src = b->map + t->linear_offset;
+	const size_t row = t->linear_packed_row;
+	const unsigned height = t->res->height0;
 	if (to_buffer) {
 		texture_read_locked(t, &box, 0, b->map + t->linear_offset, t->linear_row, 0);
+		dev->linear_writebacks++;
 	} else {
-		t->dev->pipe->texture_subdata(t->dev->pipe, t->res, 0, PIPE_MAP_WRITE, &box, b->map + t->linear_offset,
-		    (unsigned)t->linear_row, 0);
+		bool same = t->linear_copy != NULL;
+		for (unsigned y = 0; same && y < height; y++) {
+			same = memcmp(t->linear_copy + y * row, src + y * t->linear_row, row) == 0;
+		}
+		if (same) {
+			dev->linear_unchanged++;
+			dev->linear_us += now_us() - t0;
+			return;
+		}
+		dev->pipe->texture_subdata(dev->pipe, t->res, 0, PIPE_MAP_WRITE, &box, src, (unsigned)t->linear_row, 0);
+		dev->linear_uploads++;
 	}
+	for (unsigned y = 0; t->linear_copy != NULL && y < height; y++) {
+		memcpy(t->linear_copy + y * row, src + y * t->linear_row, row);
+	}
+	dev->linear_us += now_us() - t0;
 }
 
 /*
@@ -765,13 +800,19 @@ texture_from_buffer(struct b2l_mtl_buffer *b, const struct b2l_mtl_texture_desc 
 		    (unsigned long long)b->length);
 		return NULL;
 	}
-	struct b2l_mtl_texture *t = texture_new(b->dev, &d, why, why_size);
+	/* linear, as the buffer's rows are: copies in and out are rows, not tiles */
+	struct b2l_mtl_texture *t = texture_new_bind(b->dev, &d, PIPE_BIND_LINEAR, why, why_size);
+	if (t == NULL) {
+		t = texture_new(b->dev, &d, why, why_size);
+	}
 	if (t == NULL) {
 		return NULL;
 	}
 	t->linear_buffer = obj_ref(b);
 	t->linear_offset = offset;
 	t->linear_row = bytes_per_row;
+	t->linear_packed_row = (size_t)row;
+	t->linear_copy = malloc((size_t)row * d.height);   /* NULL: every command buffer copies */
 	pthread_mutex_lock(&b->dev->lock);
 	linear_sync(t, false);
 	b->dev->pending = true;
@@ -4084,7 +4125,9 @@ exec_draw(struct b2l_mtl_device *dev, struct encoder_state *st, const struct b2l
 		bind_stage(dev, st, PIPE_SHADER_FRAGMENT, B2L_MTL_FRAGMENT, &p->bind[B2L_MTL_FRAGMENT]);
 	}
 	u_upload_unmap(pipe->stream_uploader);
+	const uint64_t v0 = now_us();
 	pipe->draw_vbo(pipe, &info, 0, NULL, &draw, 1);
+	dev->draw_vbo_us += now_us() - v0;
 	st->draws++;
 	dev->pending = true;
 }
@@ -4472,11 +4515,16 @@ execute_summary(struct b2l_mtl_device *dev, uint64_t encode_us, uint64_t wait_us
 		return;
 	}
 	b2l_drm_note("mtl M4: 600 command buffers: encoding %llu ms (at most %llu), waiting for the GPU %llu ms (at most "
-	    "%llu), %u draws, %u commands, %u of them 50 ms or more; state calls %lu made, %lu skipped",
+	    "%llu), %u draws, %u commands, %u of them 50 ms or more; state calls %lu made, %lu skipped; draws %llu ms, of "
+	    "which Panfrost's draw_vbo %llu ms; textures on buffers %llu ms (%u copied in, %u unchanged, %u written back)",
 	    (unsigned long long)(encode_total / 1000), (unsigned long long)(encode_max / 1000),
 	    (unsigned long long)(wait_total / 1000), (unsigned long long)(wait_max / 1000), draws_total, ops_total, slow,
-	    dev->state_set, dev->state_skipped);
+	    dev->state_set, dev->state_skipped, (unsigned long long)(dev->draw_us / 1000),
+	    (unsigned long long)(dev->draw_vbo_us / 1000), (unsigned long long)(dev->linear_us / 1000), dev->linear_uploads,
+	    dev->linear_unchanged, dev->linear_writebacks);
 	dev->state_set = dev->state_skipped = 0;
+	dev->draw_us = dev->draw_vbo_us = dev->linear_us = 0;
+	dev->linear_uploads = dev->linear_unchanged = dev->linear_writebacks = 0;
 	encode_total = wait_total = encode_max = wait_max = 0;
 	count = draws_total = slow = ops_total = 0;
 }
@@ -4499,8 +4547,17 @@ exec_mipmaps(struct b2l_mtl_device *dev, struct b2l_mtl_texture *t, char *first,
 		return;
 	}
 	const unsigned last_layer = t->first_layer + MAX2(t->layers, 1) - 1;
-	if (!util_gen_mipmap(dev->pipe, t->res, t->format, base, last, t->first_layer, last_layer,
-	    PIPE_TEX_FILTER_LINEAR)) {
+	/* Boot 87: backboardd died in Panfrost's flush (pan_preload_fb_part, a
+	 * pass loading its attachment) after the first mipmaps of 1179 x 2556
+	 * textures, when Files opened. Panfrost may lay a texture out anew to
+	 * draw its levels while earlier work still names the old memory: what
+	 * was recorded before is submitted and finished first, and the blits
+	 * after. */
+	settle(dev);
+	const bool made = util_gen_mipmap(dev->pipe, t->res, t->format, base, last, t->first_layer, last_layer,
+	    PIPE_TEX_FILTER_LINEAR);
+	settle(dev);
+	if (!made) {
 		if (first[0] == 0) {
 			say(first, first_size, "generateMipmapsForTexture: Gallium could not make levels %u-%u of %s %ux%u",
 			    base + 1, last, util_format_short_name(t->format), t->res->width0, t->res->height0);
@@ -4567,6 +4624,7 @@ cmdbuf_execute(struct b2l_mtl_cmdbuf *cb, uint64_t *gpu_us, char *why, size_t wh
 		case OP_DRAW: {
 			const uint64_t d0 = now_us();
 			exec_draw(dev, st, &op->u.draw, first, sizeof(first));
+			dev->draw_us += now_us() - d0;
 			slow_draw(st, now_us() - d0);
 			break;
 		}
