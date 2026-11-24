@@ -44,7 +44,7 @@ public:
  unsigned debounce[4]={},failures=0,keyLogs=0;
  B2L_SEC_TS_POINTER pointer={};
  uint64_t pollCount=0,eventCount=0,updateCount=0,bulkCount=0,transferFailures=0;
- uint64_t lastPollStart=0,lastDiagnostic=0,maxPollGapUS=0,maxPollWorkUS=0,chordStart=0;
+ uint64_t lastPollStart=0,lastDiagnostic=0,lastDiagnosticUpdates=0,maxPollGapUS=0,maxPollWorkUS=0,chordStart=0;
  unsigned maxPending=0,quiesced=0;
  unsigned initAttempts=0,initCalls=0;bool initPending=false;uint64_t nextInitUS=0;
  uint64_t transferTimeUS=0,maxTransferUS=0;

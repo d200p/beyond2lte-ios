@@ -1027,3 +1027,15 @@ the next boot says where those seconds go:
   to Core Animation, and the stack sampler shows it.
 - B2LMali notes how long the runtime takes to start for the first client.
   Every boot's first call waited about 12 s for that lock.
+
+### Boot 92 (build 86): the share sheet works
+
+The user: the Photos share sheet no longer crashes; the rest is unchanged
+(the lock-screen swipe still freezes, widgets white). No backboardd crash
+report of this build. The phone stayed on for 9 hours before TWRP, and the
+16 MiB log kept only the last 6 hours at rest, so the swipe, the stall notes
+and Wi-Fi mode 22 were overwritten. 55 % of what remained was
+`triggered unnest` lines (bluetoothd and seputil started again every few
+seconds), 13 % the PC sampler, 12 % the input line. At rest the PC sampler
+now writes one line, and the input line comes every 2 minutes instead of
+every 10 s.

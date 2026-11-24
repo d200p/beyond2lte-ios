@@ -1066,3 +1066,44 @@ a second run.
 The next step is the join itself. It needs the network's name and password
 in a private file next to the firmware, which the user writes; neither is
 ever in the repository or the log.
+
+## S10: joining the network the private record names (mode 23)
+
+The firmware has no supplicant of its own, so the WPA2 4-way handshake runs
+in the kernel, as `wpa_supplicant` runs it beside brcmfmac. The network's
+name and passphrase come in a private record after the CLM blob (B2LFW004,
+128 bytes: `B2LJOIN1`, the two lengths, the name, the passphrase, and 16
+bytes of the SHA-256 of the rest). `attach-wifi-firmware.py --join FILE`
+writes the record from a two-line file the user keeps next to the firmware.
+`/chosen` still carries only the attachment's range, so no process reads
+the record; the kernel copies what it needs and wipes its copies.
+
+Mode 23 runs after mode 22 and does this:
+
+1. It finds the network in mode 21's passes by comparing names in memory and
+   keeps the strongest one. It reads that network's RSN element and joins
+   only a WPA2-PSK network with CCMP that does not require PMF.
+2. It derives the PMK with PBKDF2-HMAC-SHA1 (4096 rounds), or takes 64 hex
+   digits as they are.
+3. It sets `WLC_SET_INFRA` 1, `WLC_SET_AUTH` 0, `wsec` AES, `wpa_auth`
+   WPA2-PSK, `mfp` 0 and `wpaie` (our RSN element), then sends
+   `WLC_SET_SSID` with the name, the network's address and its channel.
+4. On link up it creates flow ring 2 (tid 7).
+5. Message 1 gets message 2: a random SNonce, the PTK from the 802.11 PRF,
+   and a MIC with the KCK. Message 3's MIC proves the password right. Its
+   key data is unwrapped with the KEK (RFC 3394) to get the group key, and
+   message 4 follows.
+6. It sets the pairwise key (CCMP) and the group key with `wsec_key`.
+7. A broadcast DHCP discover goes out, and an offer back shows that data
+   flows both ways.
+8. `WLC_DISASSOC` with reason 3, and the link goes down.
+
+The log shows verdicts, status codes, counts, the channel and the level.
+It never shows the name, the passphrase, an address, a nonce or a key.
+
+The primitives (`b2l_wifi_crypto.h`) are written for this port.
+`test_wifi_crypto.py` checks them against Python's hashlib and hmac, the
+FIPS 197 vectors and RFC 3394. The gen1 model plays a WPA2 access point: it
+checks message 2's MIC and the keys set, wraps the group key in message 3,
+and answers the DHCP discover. It runs four cases: a wrong MIC in message
+3, no record, a record whose digest fails, and a successful join.

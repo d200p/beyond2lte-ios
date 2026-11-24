@@ -105,6 +105,7 @@ def test_kernel():
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include "b2l_wifi_crypto.h"
 #include "b2l_wifi_phy_data.h"
 #include "wifi_firmware_fixture.h"
 typedef uintptr_t vm_offset_t;
@@ -124,6 +125,7 @@ static kern_return_t kernel_thread_start(thread_continue_t fn, void *arg, thread
 }
 static void thread_deallocate(thread_t thread) { (void)thread; assert(0); }
 void read_frandom(void *p, unsigned n) { (void)p; (void)n; assert(0); }
+static void absolutetime_to_nanoseconds(uint64_t t, uint64_t *ns) { (void)t; (void)ns; assert(0); }
 /* S10 port, mode 13's host memory, cache and RAM checks: never reached here. */
 typedef unsigned ppnum_t;
 typedef uint64_t addr64_t;
@@ -243,13 +245,13 @@ static void reset(int requested, unsigned fail) {
     memset(memory, 0, sizeof(memory)); memset(logs, 0, sizeof(logs));
 }
 int main(void) {
-    const int disabled[] = {-1, 0, 23, 24, -2};
+    const int disabled[] = {-1, 0, 24, 25, -2};
     for (unsigned i = 0; i < sizeof(disabled)/sizeof(disabled[0]); i++) {
         reset(disabled[i], 0); b2l_wifi_diag_start();
         assert(!maps && !reads && !writes && !unmapped && strstr(logs, "disabled"));
     }
-    /* Modes 10 to 22 need the staged private input before any MMIO or thread. */
-    for (int m = 10; m <= 22; m++) {
+    /* Modes 10 to 23 need the staged private input before any MMIO or thread. */
+    for (int m = 10; m <= 23; m++) {
         reset(m, 0); b2l_wifi_diag_start();
         assert(!maps && !reads && !writes && !thread_starts && strstr(logs, "firmware input absent/invalid"));
     }

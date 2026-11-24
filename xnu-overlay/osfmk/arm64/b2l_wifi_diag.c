@@ -74,6 +74,7 @@
 #include <vm/pmap.h>
 #include <vm/vm_kern.h>
 #include <vm/vm_kern_xnu.h>
+#include <arm64/b2l_wifi_crypto.h>
 
 #define wlog(...) b2l_early_trace("B2L WIFI: " __VA_ARGS__)
 #define WIFI_FIRMWARE_BYTES 1297036u
@@ -104,6 +105,14 @@
 #define WIFI_HOST_RXBUF 0x30000u        /* mode 22: the receive buffers */
 #define WIFI_RXBUFS 32u
 #define WIFI_RXBUF_BYTES 2048u          /* DHD_FLOWRING_RX_BUFPOST_PKTSZ */
+#define WIFI_HOST_TXRING 0x28000u       /* mode 23: flow ring 2 */
+#define WIFI_TX_ITEMS 64u
+#define WIFI_TX_ITEM 48u                /* H2DRING_TXPOST_ITEMSIZE, no extension tags */
+#define WIFI_HOST_TXBUF 0x29000u        /* mode 23: the transmit buffers */
+#define WIFI_TXBUFS 4u
+#define WIFI_TXBUF_BYTES 1024u
+/* Mode 23: the private join record after the CLM blob (B2LFW004). */
+#define WIFI_JOIN_BYTES 128u
 /* Mode 19: the board's CLM blob (bcmdhd_clm.blob) after the NVRAM in the
  * attachment (B2LFW003), pinned like the firmware; dhd_download_blob's chunk. */
 #define WIFI_CLM_BYTES 29464u
@@ -127,6 +136,7 @@ static const uint8_t *wifi_nvram;
 static unsigned wifi_nvram_bytes;
 static const uint8_t *wifi_clm;
 static unsigned wifi_clm_bytes;
+static const uint8_t *wifi_join;        /* mode 23: the private join record, read by the kernel only */
 /* S10 port, mode 19: the control rings wrap (clmload is 22 ioctls). Every
  * completion is counted from the start (wifi_d2h_count, at the last look;
  * wifi_d2h_ring, the ring index then; wifi_d2h_parsed, how many were read),
@@ -135,6 +145,10 @@ static unsigned wifi_clm_bytes;
  * wifi_quick is set an ioctl is waited for only until its completion. */
 static uint32_t wifi_d2h_count, wifi_d2h_ring, wifi_d2h_parsed, wifi_events_held, wifi_ioctls_held;
 static int wifi_quick;
+struct wifi_join_state;
+static struct wifi_join_state *wifi_joining;
+static void wifi_join_event(struct wifi_join_state *, const uint8_t *, unsigned);
+static void wifi_join_flow_created(struct wifi_join_state *, unsigned);
 extern void b2l_sha256(const void *, size_t, uint8_t[32]);
 extern void read_frandom(void *, unsigned int);
 
@@ -206,6 +220,7 @@ wifi_firmware_input(uint32_t mode)
     wifi_nvram_bytes = 0;
     wifi_clm = NULL;
     wifi_clm_bytes = 0;
+    wifi_join = NULL;
     if (!args || SecureDTLookupEntry(NULL, "/chosen", &dt) != kSuccess ||
         SecureDTGetProperty(dt, "b2l,wifi-firmware", &prop, &n) != kSuccess || n != sizeof(range)) return -1;
     memcpy(range, prop, sizeof(range));
@@ -213,7 +228,7 @@ wifi_firmware_input(uint32_t mode)
      * then perhaps the board's CLM blob (B2LFW003), which is known by its size
      * and its pinned SHA-256 at the end. */
     if (range[1] < WIFI_FIRMWARE_BYTES ||
-        range[1] - WIFI_FIRMWARE_BYTES > WIFI_NVRAM_MAX_BYTES + WIFI_CLM_MAX_BYTES ||
+        range[1] - WIFI_FIRMWARE_BYTES > WIFI_NVRAM_MAX_BYTES + WIFI_CLM_MAX_BYTES + WIFI_JOIN_BYTES ||
         ((range[1] - WIFI_FIRMWARE_BYTES) & 3) || (range[0] & 4095) ||
         range[0] < args->physBase || range[0] > args->topOfKernelData ||
         range[1] > args->topOfKernelData - range[0]) return -1;
@@ -222,8 +237,18 @@ wifi_firmware_input(uint32_t mode)
     b2l_sha256(data, WIFI_FIRMWARE_BYTES, digest);
     if (memcmp(digest, expected, sizeof(expected))) return -1;
     unsigned nvram = (unsigned)(range[1] - WIFI_FIRMWARE_BYTES), clm = 0;
+    /* Mode 23: the join record ends the attachment: "B2LJOIN1", the lengths,
+     * then the first 16 bytes of the SHA-256 of its first 112. */
+    const uint8_t *join = data + range[1] - WIFI_JOIN_BYTES;
+    if (nvram >= WIFI_CLM_BYTES + WIFI_JOIN_BYTES + 8 && !memcmp(join, "B2LJOIN1", 8)) {
+        b2l_sha256(join, 112, digest);
+        if (memcmp(digest, join + 112, 16) || join[8] < 1 || join[8] > 32 || join[9] < 8 || join[9] > 64) return -1;
+        nvram -= WIFI_JOIN_BYTES;
+    } else {
+        join = NULL;
+    }
     if (nvram >= WIFI_CLM_BYTES + 8) {
-        b2l_sha256(data + range[1] - WIFI_CLM_BYTES, WIFI_CLM_BYTES, digest);
+        b2l_sha256(data + WIFI_FIRMWARE_BYTES + nvram - WIFI_CLM_BYTES, WIFI_CLM_BYTES, digest);
         if (!memcmp(digest, expected_clm, sizeof(expected_clm))) clm = WIFI_CLM_BYTES;
         nvram -= clm;
     }
@@ -239,6 +264,10 @@ wifi_firmware_input(uint32_t mode)
         wifi_clm = data + WIFI_FIRMWARE_BYTES + nvram;
         wifi_clm_bytes = clm;
         wlog("private CLM blob verified: bytes=%u SHA-256 pinned\n", clm);
+    }
+    if (join && clm) {
+        wifi_join = join;
+        wlog("private join record verified (a network to join; its name and password are never logged)\n");
     }
     return 0;
 }
@@ -1276,6 +1305,10 @@ wifi_host_var(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb
         const uint8_t *c = wifi_host + wifi_rings[2].offset + wifi_rings[2].size * (i % wifi_rings[2].items);
         const uint32_t id = wifi_le32(c + 4);
         if (c[0] == 0x0e && id >= 3 && id <= 6) wifi_events_held &= ~(1u << id);  /* an event used its buffer */
+        if (wifi_joining && c[0] == 0x0e && id >= 3 && id <= 6 && (unsigned)(c[12] | c[13] << 8) <= 0x800u)
+            wifi_join_event(wifi_joining, wifi_host + wifi_host_buffer(id), (unsigned)(c[12] | c[13] << 8));
+        if (wifi_joining && c[0] == 0x04)       /* MSG_TYPE_FLOW_RING_CREATE_CMPLT */
+            wifi_join_flow_created(wifi_joining, (unsigned)(c[8] | c[9] << 8));
         if (c[0] == 0x0c && id >= 1 && id <= 12) wifi_ioctls_held &= ~(1u << id);
         if (c[0] != 0x0c || i < done) continue;
         *status = (int16_t)(c[8] | c[9] << 8);
@@ -1599,6 +1632,10 @@ wifi_host_event_post(unsigned item, unsigned id)
 struct wifi_scan {
     unsigned results, networks, networks_5g, others, malformed, given, logged, done;
     unsigned named, hidden;             /* mode 21: networks with a name or without (never the name) */
+    /* mode 23: the network the private record names, compared in memory */
+    unsigned target, target_chanspec, target_rsn_len;
+    int target_rssi;
+    uint8_t target_bssid[6], target_rsn[64];
     int rssi_min, rssi_max;
     uint32_t final_status, channels[8];
     uint8_t seen[48][6];
@@ -1638,6 +1675,26 @@ wifi_scan_event(struct wifi_scan *s, const uint8_t *packet, unsigned length)
         if (bi[18] != 0) s->named++;        /* wl_bss_info_t SSID_len: counted, the name never read */
         else s->hidden++;
         s->networks_5g += band[0] != '2';
+    }
+    if (wifi_join && bi[18] == wifi_join[8] && !memcmp(bi + 19, wifi_join + 12, wifi_join[8]) &&
+        (!s->target || rssi > s->target_rssi)) {
+        /* wl_bss_info_t: ie_offset at 116, ie_length at 120; the RSN element (48) */
+        const unsigned size = wifi_le32(bi + 4), ie_off = bi[116] | bi[117] << 8, ie_len = wifi_le32(bi + 120);
+        s->target = 1;
+        s->target_chanspec = chanspec;
+        s->target_rssi = rssi;
+        s->target_rsn_len = 0;
+        memcpy(s->target_bssid, bi + 8, 6);
+        if (size >= 124 && ie_off >= 124 && ie_len <= size && ie_off <= size - ie_len) {
+            for (unsigned p = ie_off; p + 2 <= ie_off + ie_len && p + 2u + bi[p + 1] <= ie_off + ie_len;
+                 p += 2u + bi[p + 1]) {
+                if (bi[p] == 48 && bi[p + 1] + 2u <= sizeof(s->target_rsn)) {
+                    memcpy(s->target_rsn, bi + p, bi[p + 1] + 2u);
+                    s->target_rsn_len = bi[p + 1] + 2u;
+                    break;
+                }
+            }
+        }
     }
     s->results++;
     s->channels[channel / 32] |= 1u << (channel % 32);
@@ -1731,6 +1788,675 @@ wifi_channel_list(const uint32_t *bits, char *list, unsigned size)
  * event buffers, until the escan's final status. Logged: counts, channels,
  * signal levels; never a network's name or address. The rings may wrap.
  */
+/* ---- S10 port, mode 23: joining the network the private record names ---- */
+
+/*
+ * Boots 90-91: the firmware has no WPA supplicant of its own (sup_wpa -23),
+ * so the 4-way handshake runs here, as wpa_supplicant runs it beside
+ * brcmfmac. The network is the one the private record names (B2LFW004: its
+ * name and passphrase), found in mode 21's passes by comparing names in
+ * memory. Logged: verdicts, status codes, counts, the channel and the level;
+ * never the name, the passphrase, an address, a nonce or a key. Every secret
+ * is wiped at the end.
+ */
+struct wifi_join_state {
+    uint8_t pmk[32], ptk[48], anonce[32], snonce[32], replay[8], aa[6], spa[6], gtk[32], gtk_rsc[8], ie[24];
+    uint8_t eapol[512];                 /* the newest EAPOL frame from the network, waiting */
+    unsigned eapol_len, ie_len, group, gtk_len, gtk_id, have_snonce, have_ptk;
+    int set_ssid, link, deauth;
+    unsigned events, msg1, msg2, msg3, msg4, mic_bad, eapol_other, unwrap_bad, msg4_tx;
+    unsigned flow_asked, flow_done, flow_status, flow_ok, tx_w, tx_seen, tx_done, tx_bad;
+    uint32_t rx_read, rx_next;
+    unsigned keyed, before_keys, frames, arp, ipv4, ipv6, other, offer;
+    uint32_t xid;
+};
+/* wifi_joining (declared above): while set, completions read elsewhere reach it */
+static unsigned wifi_rx_ready;                  /* mode 22: the firmware took receive buffers */
+
+static void
+wifi_join_event(struct wifi_join_state *j, const uint8_t *packet, unsigned length)
+{
+    if (length < 72) return;
+    const uint8_t *m = packet + 24;     /* wl_event_msg_t, big-endian */
+    const uint32_t type = wifi_be32(m + 4), status = wifi_be32(m + 8), reason = wifi_be32(m + 12);
+    const unsigned flags = (unsigned)(m[2] << 8 | m[3]);
+    if (type == 69) return;             /* a late escan result */
+    j->events++;
+    if (type == 0) j->set_ssid = (int)status + 1;               /* WLC_E_SET_SSID: 1 is success */
+    else if (type == 16) j->link = (flags & 1u) ? 1 : -1;       /* WLC_E_LINK */
+    else if (type == 5 || type == 6 || type == 11 || type == 12) j->deauth = (int)reason + 1;
+    if (j->events <= 16) wlog("mode 23: event %u status %u reason %u flags %#x\n", type, status, reason, flags);
+}
+
+static void
+wifi_join_flow_created(struct wifi_join_state *j, unsigned status)
+{
+    j->flow_done = 1;
+    j->flow_status = status;
+}
+
+/* A frame from the network (an Ethernet frame, as the firmware gives it). */
+static void
+wifi_join_rx(struct wifi_join_state *j, const uint8_t *f, unsigned len)
+{
+    const unsigned type = (unsigned)(f[12] << 8 | f[13]);
+    if (type == 0x888eu) {
+        if (len - 14 <= sizeof(j->eapol) && !j->eapol_len && !memcmp(f + 6, j->aa, 6)) {
+            memcpy(j->eapol, f + 14, len - 14);
+            j->eapol_len = len - 14;
+        } else {
+            j->eapol_other++;
+        }
+        return;
+    }
+    if (!j->keyed) {
+        j->before_keys++;
+        return;
+    }
+    j->frames++;
+    if (type == 0x0806u) j->arp++;
+    else if (type == 0x86ddu) j->ipv6++;
+    else if (type != 0x0800u) j->other++;
+    else {
+        j->ipv4++;
+        /* An offer for our discover: UDP 67 to 68, BOOTREPLY, our xid, the cookie, option 53 = 2. */
+        const uint8_t *ip = f + 14;
+        const unsigned ihl = (ip[0] & 15u) * 4u;
+        if ((ip[0] >> 4) != 4 || ihl < 20 || ip[9] != 17 || len < 14 + ihl + 8 + 240) return;
+        const uint8_t *udp = ip + ihl, *b = udp + 8;
+        if ((udp[0] << 8 | udp[1]) != 67 || (udp[2] << 8 | udp[3]) != 68 || b[0] != 2 || wifi_be32(b + 4) != j->xid ||
+            wifi_be32(b + 236) != 0x63825363u) return;
+        for (unsigned p = 240; 14 + ihl + 8 + p + 3 <= len && b[p] != 255; p += b[p] ? 2u + b[p + 1] : 1u)
+            if (b[p] == 53 && b[p + 1] == 1 && b[p + 2] == 2) j->offer++;
+    }
+}
+
+/*
+ * One look at the rings: control completions (events, the flow ring's
+ * creation), transmit and receive completions; used event and receive
+ * buffers posted again, read indices given back. -1 on a failed access.
+ */
+static int
+wifi_join_look(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb, struct wifi_host_view *last,
+    unsigned *next, struct wifi_join_state *j)
+{
+    uint64_t deadline;
+    clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+    if (wifi_host_view(regions, info, d2h_mb, last, deadline)) return -1;
+    FlushPoC_DcacheRegion((vm_offset_t)wifi_host, WIFI_HOST_BYTES);
+    unsigned posted = 0, reposted = 0;
+    const uint32_t upto = last->d2h_count;
+    if (upto - wifi_d2h_parsed >= wifi_rings[2].items) wifi_d2h_parsed = upto - (wifi_rings[2].items - 1);
+    for (; wifi_d2h_parsed < upto; wifi_d2h_parsed++) {
+        const uint8_t *c = wifi_host + wifi_rings[2].offset + wifi_rings[2].size * (wifi_d2h_parsed % wifi_rings[2].items);
+        const uint32_t id = wifi_le32(c + 4);
+        if (c[0] == 0x0e && id >= 3 && id <= 6) {
+            const unsigned length = c[12] | c[13] << 8;
+            wifi_events_held &= ~(1u << id);
+            if (length <= 0x800u) wifi_join_event(j, wifi_host + wifi_host_buffer(id), length);
+            wifi_host_event_post((*next)++, id);
+            posted++;
+        } else if (c[0] == 0x04) {      /* MSG_TYPE_FLOW_RING_CREATE_CMPLT */
+            wifi_join_flow_created(j, (unsigned)(c[8] | c[9] << 8));
+        } else if (c[0] == 0x0c && id >= 1 && id <= 12) {
+            wifi_ioctls_held &= ~(1u << id);
+        }
+    }
+    /* Event buffers an ioctl's wait read (wifi_host_var) go back here too. */
+    for (unsigned id = 3; id <= 6; id++) {
+        if (wifi_events_held & (1u << id)) continue;
+        wifi_host_event_post((*next)++, id);
+        posted++;
+    }
+    if (wifi_tcm_set(regions, info[4], last->d2h_write[0], deadline)) return -1;
+    if (posted) {
+        const unsigned windex = *next % wifi_rings[0].items;
+        CleanPoC_DcacheRegion((vm_offset_t)wifi_host + wifi_rings[0].offset,
+            (unsigned long)wifi_rings[0].items * wifi_rings[0].size);
+        if (wifi_tcm_set(regions, info[1], windex, deadline) ||
+            wifi_bp_write(regions, WIFI_PCIE_CORE + WIFI_H2D_DB0, 0xff000000u | windex, deadline)) return -1;
+    }
+    const uint32_t tx_w = last->d2h_write[1], rx_w = last->d2h_write[2];
+    if (tx_w < wifi_rings[3].items && tx_w != j->tx_seen) {
+        for (; j->tx_seen != tx_w; j->tx_seen = (j->tx_seen + 1) % wifi_rings[3].items) {
+            const uint8_t *c = wifi_host + wifi_rings[3].offset + wifi_rings[3].size * j->tx_seen;
+            if (c[0] != 0x10) continue;         /* MSG_TYPE_TX_STATUS */
+            j->tx_done++;
+            if (c[8] | c[9] << 8) j->tx_bad++;
+        }
+        if (wifi_tcm_set(regions, info[4] + 4, tx_w, deadline)) return -1;
+    }
+    if (rx_w < wifi_rings[4].items && rx_w != j->rx_read) {
+        for (; j->rx_read != rx_w; j->rx_read = (j->rx_read + 1) % wifi_rings[4].items) {
+            const uint8_t *c = wifi_host + wifi_rings[4].offset + wifi_rings[4].size * j->rx_read;
+            const uint32_t id = wifi_le32(c + 4);
+            if (c[0] != 0x12 || id < 0x100u || id >= 0x100u + WIFI_RXBUFS) continue;   /* MSG_TYPE_RX_CMPLT */
+            const unsigned k = id - 0x100u, len = c[14] | c[15] << 8, off = c[16] | c[17] << 8;
+            if (len >= 14 && off + len <= WIFI_RXBUF_BYTES)
+                wifi_join_rx(j, wifi_host + WIFI_HOST_RXBUF + WIFI_RXBUF_BYTES * k + off, len);
+            uint8_t *e = wifi_host + wifi_rings[1].offset + wifi_rings[1].size * (j->rx_next % wifi_rings[1].items);
+            const uint64_t pa = wifi_host_pa + WIFI_HOST_RXBUF + (uint64_t)WIFI_RXBUF_BYTES * k;
+            memset(e, 0, wifi_rings[1].size);
+            e[0] = 0x11;
+            e[3] = (uint8_t)((1 + j->rx_next) % 253);
+            wifi_put(e + 4, id, 4);
+            wifi_put(e + 10, WIFI_RXBUF_BYTES, 2);
+            wifi_put(e + 24, (uint32_t)pa, 4);
+            wifi_put(e + 28, (uint32_t)(pa >> 32), 4);
+            j->rx_next++;
+            reposted++;
+        }
+        if (wifi_tcm_set(regions, info[4] + 8, rx_w, deadline)) return -1;
+    }
+    if (reposted) {
+        const unsigned w = j->rx_next % wifi_rings[1].items;
+        CleanPoC_DcacheRegion((vm_offset_t)wifi_host + wifi_rings[1].offset,
+            (unsigned long)wifi_rings[1].items * wifi_rings[1].size);
+        if (wifi_tcm_set(regions, info[1] + 4, w, deadline) ||
+            wifi_bp_write(regions, WIFI_PCIE_CORE + WIFI_H2D_DB0, 0xff000000u | w, deadline)) return -1;
+    }
+    return 0;
+}
+
+/* Flow ring 2, the first after the two common rings, for the network: as
+ * dhd_prot_flow_ring_create, its indices zeroed first. */
+static int
+wifi_join_flow(struct wifi_region *regions, const uint32_t *info, unsigned *next, struct wifi_join_state *j)
+{
+    uint64_t deadline;
+    const uint64_t pa = wifi_host_pa + WIFI_HOST_TXRING;
+    memset(wifi_host + WIFI_HOST_TXRING, 0, WIFI_TX_ITEMS * WIFI_TX_ITEM);
+    CleanPoC_DcacheRegion((vm_offset_t)wifi_host + WIFI_HOST_TXRING, WIFI_TX_ITEMS * WIFI_TX_ITEM);
+    const unsigned item = (*next)++, windex = (item + 1) % wifi_rings[0].items;
+    uint8_t *e = wifi_host + wifi_rings[0].offset + wifi_rings[0].size * (item % wifi_rings[0].items);
+    memset(e, 0, wifi_rings[0].size);
+    e[0] = 0x03;                                /* MSG_TYPE_FLOW_RING_CREATE */
+    e[3] = (uint8_t)((254 + item) % 253);
+    wifi_put(e + 4, 0x300u, 4);
+    memcpy(e + 8, j->aa, 6);
+    memcpy(e + 14, j->spa, 6);
+    e[20] = 7;                                  /* tid */
+    wifi_put(e + 22, 2, 2);                     /* flow_ring_id */
+    wifi_put(e + 28, WIFI_TX_ITEMS, 2);
+    wifi_put(e + 30, WIFI_TX_ITEM, 2);
+    wifi_put(e + 32, (uint32_t)pa, 4);
+    wifi_put(e + 36, (uint32_t)(pa >> 32), 4);
+    CleanPoC_DcacheRegion((vm_offset_t)wifi_host + wifi_rings[0].offset,
+        (unsigned long)wifi_rings[0].items * wifi_rings[0].size);
+    clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+    if (wifi_tcm_set(regions, info[1] + 8, 0, deadline) || wifi_tcm_set(regions, info[2] + 8, 0, deadline) ||
+        wifi_tcm_set(regions, info[1], windex, deadline) ||
+        wifi_bp_write(regions, WIFI_PCIE_CORE + WIFI_H2D_DB0, 0xff000000u | windex, deadline)) return -1;
+    j->flow_asked = 1;
+    wlog("mode 23: flow ring 2 asked for (%u items of %u bytes, tid 7), write index %u\n", WIFI_TX_ITEMS,
+        WIFI_TX_ITEM, windex);
+    return 0;
+}
+
+/* One frame on flow ring 2: its Ethernet header in the item
+ * (host_txbuf_post_t), the rest in a transmit buffer. */
+static int
+wifi_join_send(struct wifi_region *regions, const uint32_t *info, struct wifi_join_state *j, const uint8_t dst[6],
+    unsigned ethertype, const uint8_t *payload, unsigned len)
+{
+    uint64_t deadline;
+    if (!j->flow_ok || len > WIFI_TXBUF_BYTES) return 1;
+    const unsigned slot = j->tx_w % WIFI_TX_ITEMS, buffer = j->tx_w % WIFI_TXBUFS;
+    uint8_t *e = wifi_host + WIFI_HOST_TXRING + WIFI_TX_ITEM * slot;
+    uint8_t *b = wifi_host + WIFI_HOST_TXBUF + WIFI_TXBUF_BYTES * buffer;
+    const uint64_t pa = wifi_host_pa + WIFI_HOST_TXBUF + (uint64_t)WIFI_TXBUF_BYTES * buffer;
+    memcpy(b, payload, len);
+    memset(e, 0, WIFI_TX_ITEM);
+    e[0] = 0x0f;                                /* MSG_TYPE_TX_POST */
+    e[3] = (uint8_t)((1 + j->tx_w) % 253);
+    wifi_put(e + 4, 0x400u + j->tx_w, 4);
+    memcpy(e + 8, dst, 6);
+    memcpy(e + 14, j->spa, 6);
+    e[20] = (uint8_t)(ethertype >> 8);
+    e[21] = (uint8_t)ethertype;
+    e[22] = (uint8_t)(0x01u | 7u << 5);         /* an 802.3 frame, priority 7 */
+    e[23] = 1;                                  /* one segment */
+    wifi_put(e + 32, (uint32_t)pa, 4);
+    wifi_put(e + 36, (uint32_t)(pa >> 32), 4);
+    wifi_put(e + 42, len, 2);
+    CleanPoC_DcacheRegion((vm_offset_t)b, len);
+    CleanPoC_DcacheRegion((vm_offset_t)e, WIFI_TX_ITEM);
+    j->tx_w++;
+    clock_interval_to_deadline(2000, NSEC_PER_MSEC, &deadline);
+    if (wifi_tcm_set(regions, info[1] + 8, j->tx_w % WIFI_TX_ITEMS, deadline) ||
+        wifi_bp_write(regions, WIFI_PCIE_CORE + WIFI_H2D_DB0, 0xff000000u | (j->tx_w % WIFI_TX_ITEMS), deadline))
+        return -1;
+    return 0;
+}
+
+/* The EAPOL-Key MIC: HMAC-SHA1 with the KCK over the frame, its MIC field zero. */
+static void
+wifi_eapol_mic(const uint8_t kck[16], const uint8_t *frame, unsigned len, uint8_t out[16])
+{
+    static uint8_t copy[512];
+    uint8_t mac[20];
+    memset(out, 0, 16);
+    if (len > sizeof(copy) || len < 97) return;
+    memcpy(copy, frame, len);
+    memset(copy + 81, 0, 16);
+    const uint8_t *parts[1] = { copy };
+    const size_t lens[1] = { len };
+    b2l_hmac_sha1(kck, 16, parts, lens, 1, mac);
+    memcpy(out, mac, 16);
+    memset(mac, 0, sizeof(mac));
+    memset(copy, 0, len);
+}
+
+/*
+ * The waiting EAPOL frame: message 1 (pairwise, ack, no MIC) gets message 2
+ * with our SNonce and RSN element; message 3 (pairwise, ack, MIC, install)
+ * is checked (its MIC with the KCK: the passphrase is right only then; its
+ * ANonce), its key data unwrapped with the KEK for the group key, and gets
+ * message 4. -1 on a failed access.
+ */
+static int
+wifi_join_handshake(struct wifi_region *regions, const uint32_t *info, struct wifi_join_state *j)
+{
+    const uint8_t *f = j->eapol;
+    const unsigned len = j->eapol_len;
+    if (len < 99 || f[1] != 3 || f[4] != 2) {
+        j->eapol_other++;
+        return 0;
+    }
+    const unsigned body = (unsigned)(f[2] << 8 | f[3]), ki = (unsigned)(f[5] << 8 | f[6]);
+    const unsigned kdl = (unsigned)(f[97] << 8 | f[98]);
+    if (4 + body > len || 99 + kdl > 4 + body || (ki & 7u) != 2) {
+        j->eapol_other++;
+        return 0;
+    }
+    if ((ki & 0x0008u) && (ki & 0x0080u) && !(ki & 0x0100u)) {
+        j->msg1++;
+        if (!j->have_ptk || memcmp(j->anonce, f + 17, 32)) {
+            uint8_t data[76];
+            memcpy(j->anonce, f + 17, 32);
+            if (!j->have_snonce) {
+                read_frandom(j->snonce, 32);
+                j->have_snonce = 1;
+            }
+            const int a = memcmp(j->aa, j->spa, 6) < 0, n = memcmp(j->anonce, j->snonce, 32) < 0;
+            memcpy(data, a ? j->aa : j->spa, 6);
+            memcpy(data + 6, a ? j->spa : j->aa, 6);
+            memcpy(data + 12, n ? j->anonce : j->snonce, 32);
+            memcpy(data + 44, n ? j->snonce : j->anonce, 32);
+            b2l_prf_sha1(j->pmk, 32, "Pairwise key expansion", data, 76, j->ptk, 48);
+            memset(data, 0, sizeof(data));
+            j->have_ptk = 1;
+        }
+        memcpy(j->replay, f + 9, 8);
+        uint8_t m[4 + 95 + 22];
+        memset(m, 0, sizeof(m));
+        m[0] = 1;
+        m[1] = 3;
+        m[3] = 95 + 22;
+        m[4] = 2;
+        m[5] = 0x01;                            /* key info: HMAC-SHA1/AES, pairwise, MIC */
+        m[6] = 0x0a;
+        memcpy(m + 9, j->replay, 8);
+        memcpy(m + 17, j->snonce, 32);
+        m[98] = 22;
+        memcpy(m + 99, j->ie, 22);
+        wifi_eapol_mic(j->ptk, m, sizeof(m), m + 81);
+        const int r = wifi_join_send(regions, info, j, j->aa, 0x888eu, m, sizeof(m));
+        memset(m, 0, sizeof(m));
+        if (r < 0) return -1;
+        if (r == 0) j->msg2++;
+        if (j->msg1 <= 3) wlog("mode 23: 4-way message 1 received, message 2 %s\n", r == 0 ? "sent" : "not sent");
+        return 0;
+    }
+    if ((ki & 0x0008u) && (ki & 0x0080u) && (ki & 0x0100u) && (ki & 0x0040u)) {
+        j->msg3++;
+        uint8_t check[16];
+        wifi_eapol_mic(j->ptk, f, 4 + body, check);
+        const int mic_ok = j->have_ptk && !memcmp(check, f + 81, 16) && !memcmp(f + 17, j->anonce, 32);
+        memset(check, 0, sizeof(check));
+        if (!mic_ok) {
+            if (j->mic_bad++ == 0)
+                wlog("mode 23: 4-way message 3's MIC does not verify: the password in the private record is not "
+                    "this network's\n");
+            return 0;
+        }
+        if (!(ki & 0x1000u) || kdl < 24 || kdl % 8 || kdl > 256) {
+            if (j->unwrap_bad++ == 0) wlog("mode 23: 4-way message 3 has no encrypted key data (%u bytes)\n", kdl);
+            return 0;
+        }
+        uint8_t plain[248];
+        if (!b2l_aes_unwrap(j->ptk + 16, f + 99, kdl / 8 - 1, plain)) {
+            if (j->unwrap_bad++ == 0) wlog("mode 23: 4-way message 3's key data does not unwrap with the KEK\n");
+            return 0;
+        }
+        for (unsigned p = 0; p + 2 <= kdl - 8; p += 2u + plain[p + 1]) {
+            const unsigned t = plain[p], l = plain[p + 1];
+            if (p + 2 + l > kdl - 8) break;
+            if (t == 0xdd && l >= 6 + 16 && l - 6 <= 32 && plain[p + 2] == 0 && plain[p + 3] == 0x0f &&
+                plain[p + 4] == 0xac && plain[p + 5] == 1) {
+                j->gtk_id = plain[p + 6] & 3u;
+                j->gtk_len = l - 6;
+                memcpy(j->gtk, plain + p + 8, j->gtk_len);
+            }
+        }
+        memset(plain, 0, sizeof(plain));
+        memcpy(j->gtk_rsc, f + 65, 8);
+        memcpy(j->replay, f + 9, 8);
+        uint8_t m[4 + 95];
+        memset(m, 0, sizeof(m));
+        m[0] = 1;
+        m[1] = 3;
+        m[3] = 95;
+        m[4] = 2;
+        m[5] = 0x03;                            /* key info: HMAC-SHA1/AES, pairwise, MIC, secure */
+        m[6] = 0x0a;
+        memcpy(m + 9, j->replay, 8);
+        wifi_eapol_mic(j->ptk, m, sizeof(m), m + 81);
+        const int r = wifi_join_send(regions, info, j, j->aa, 0x888eu, m, sizeof(m));
+        if (r < 0) return -1;
+        if (r == 0 && j->msg4++ == 0) j->msg4_tx = j->tx_w;
+        wlog("mode 23: 4-way message 3 received, its MIC verified (the password is right); group key of %u "
+            "bytes, key id %u; message 4 %s\n", j->gtk_len, j->gtk_id, r == 0 ? "sent" : "not sent");
+        return 0;
+    }
+    j->eapol_other++;
+    return 0;
+}
+
+/* A key into the firmware: "wsec_key" with a wl_wsec_key_t (brcmf_wsec_key_le). */
+static int
+wifi_join_key(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb, struct wifi_host_view *last,
+    unsigned *next, unsigned index, const uint8_t *key, unsigned len, unsigned algo, unsigned flags,
+    const uint8_t *rsc, const uint8_t ea[6], int *status)
+{
+    const uint8_t *answer = NULL;
+    unsigned bytes = 0;
+    uint8_t k[164];
+    memset(k, 0, sizeof(k));
+    wifi_put(k, index, 4);
+    wifi_put(k + 4, len, 4);
+    memcpy(k + 8, key, len);
+    wifi_put(k + 112, algo, 4);
+    wifi_put(k + 116, flags, 4);
+    if (rsc) {
+        wifi_put(k + 132, 1, 4);                /* iv_initialized */
+        wifi_put(k + 140, (uint32_t)rsc[2] | (uint32_t)rsc[3] << 8 | (uint32_t)rsc[4] << 16 | (uint32_t)rsc[5] << 24, 4);
+        wifi_put(k + 144, (uint32_t)rsc[0] | (uint32_t)rsc[1] << 8, 2);
+    }
+    memcpy(k + 156, ea, 6);
+    int r = wifi_host_repost(regions, info, last, *next, 11);
+    if (r < 0) return -1;
+    *next += (unsigned)r;
+    r = wifi_host_var(regions, info, d2h_mb, last, "mode 23", (*next)++, 263, "wsec_key", k, sizeof(k),
+        9 + sizeof(k), WIFI_HOST_IOVAR_IN + 0x200u, &answer, &bytes, status);
+    memset(k, 0, sizeof(k));
+    memset(wifi_host + WIFI_HOST_IOVAR_IN + 0x200u, 0, 0x200u);     /* the key leaves the DMA input too */
+    CleanPoC_DcacheRegion((vm_offset_t)wifi_host + WIFI_HOST_IOVAR_IN + 0x200u, 0x200u);
+    return r;
+}
+
+static int
+wifi_join_set(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb, struct wifi_host_view *last,
+    unsigned *next, unsigned cmd, const char *name, const uint8_t *value, unsigned value_bytes, unsigned in_off,
+    int *status)
+{
+    const uint8_t *answer = NULL;
+    unsigned bytes = 0;
+    int r = wifi_host_repost(regions, info, last, *next, 11);
+    if (r < 0) return -1;
+    *next += (unsigned)r;
+    const unsigned length = cmd == 263 ? (unsigned)strlen(name) + 1 + value_bytes : value_bytes;
+    return wifi_host_var(regions, info, d2h_mb, last, "mode 23", (*next)++, cmd, name, value, value_bytes, length,
+        WIFI_HOST_IOVAR_IN + in_off, &answer, &bytes, status);
+}
+
+/* An IPv4 header's checksum. */
+static unsigned
+wifi_ip_sum(const uint8_t *h, unsigned n)
+{
+    uint32_t sum = 0;
+    for (unsigned i = 0; i + 1 < n; i += 2) sum += (uint32_t)(h[i] << 8 | h[i + 1]);
+    while (sum >> 16) sum = (sum & 0xffffu) + (sum >> 16);
+    return ~sum & 0xffffu;
+}
+
+static int
+wifi_host_join(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_mb, struct wifi_host_view *last,
+    unsigned *next, const struct wifi_scan *s)
+{
+    static struct wifi_join_state j;
+    int status = 0, r = 0;
+    if (!wifi_join) {
+        wlog("mode 23: no join record in the private attachment; no join\n");
+        return 0;
+    }
+    if (!wifi_rx_ready) {
+        wlog("mode 23: the receive path is not ready (mode 22); no join\n");
+        return 0;
+    }
+    if (!s->target) {
+        wlog("mode 23: the network the private record names was not heard in the three passes; no join\n");
+        return 0;
+    }
+    memset(&j, 0, sizeof(j));
+    memcpy(j.aa, s->target_bssid, 6);
+    if (!wifi_chosen_mac(j.spa)) {
+        wlog("mode 23: no station address in /chosen; no join\n");
+        return 0;
+    }
+    /* The network's RSN element, from its beacon or probe response. */
+    const uint8_t *ie = s->target_rsn;
+    const unsigned n = s->target_rsn_len, channel = s->target_chanspec & 0xffu;
+    unsigned group = 0, ccmp = 0, psk = 0, psk256 = 0, sae = 0, caps = 0;
+    const int rsn = n >= 8 && ie[0] == 48 && (ie[2] | ie[3] << 8) == 1;
+    if (rsn) {
+        unsigned p = 4;
+        if (p + 4 <= n && ie[p] == 0 && ie[p + 1] == 0x0f && ie[p + 2] == 0xac) group = ie[p + 3];
+        p += 4;
+        const unsigned pairwise = p + 2 <= n ? (unsigned)(ie[p] | ie[p + 1] << 8) : 0;
+        p += 2;
+        for (unsigned i = 0; i < pairwise && p + 4 <= n; i++, p += 4)
+            if (ie[p] == 0 && ie[p + 1] == 0x0f && ie[p + 2] == 0xac && ie[p + 3] == 4) ccmp = 1;
+        const unsigned akms = p + 2 <= n ? (unsigned)(ie[p] | ie[p + 1] << 8) : 0;
+        p += 2;
+        for (unsigned i = 0; i < akms && p + 4 <= n; i++, p += 4) {
+            if (ie[p] || ie[p + 1] != 0x0f || ie[p + 2] != 0xac) continue;
+            psk |= ie[p + 3] == 2;
+            psk256 |= ie[p + 3] == 6;
+            sae |= ie[p + 3] == 8;
+        }
+        if (p + 2 <= n) caps = ie[p] | ie[p + 1] << 8;
+    }
+    wlog("mode 23: the network the private record names: channel %u (%s GHz), RSSI %d dBm; RSN %s: group "
+        "cipher %u, pairwise CCMP %s, AKM PSK %s, PSK-SHA256 %s, SAE %s; protected management frames %s\n", channel,
+        (s->target_chanspec & 0xc000u) == 0 ? "2.4" : "5/6", s->target_rssi, rsn ? "present" : "absent", group,
+        ccmp ? "yes" : "no", psk ? "yes" : "no", psk256 ? "yes" : "no", sae ? "yes" : "no",
+        (caps & 0x40u) ? "required" : (caps & 0x80u) ? "capable" : "off");
+    if (!rsn || !ccmp || !psk || (group != 4 && group != 2) || (caps & 0x40u)) {
+        wlog("mode 23: not a WPA2-PSK network with CCMP that lets a station go without PMF; no join\n");
+        return 0;
+    }
+    /* The PMK: 64 hex digits as they are, else PBKDF2 of the passphrase with the name. */
+    uint8_t ssid[32], pass[64];
+    const unsigned sl = wifi_join[8], pl = wifi_join[9];
+    memcpy(ssid, wifi_join + 12, sl);
+    memcpy(pass, wifi_join + 44, pl);
+    uint64_t t0 = mach_absolute_time(), ns = 0;
+    if (pl == 64) {
+        for (unsigned i = 0; i < 32; i++) {
+            unsigned v = 0;
+            for (unsigned h = 0; h < 2; h++) {
+                const unsigned c = pass[2 * i + h];
+                v = v << 4 | (c <= '9' ? c - '0' : (c | 0x20u) - 'a' + 10);
+            }
+            j.pmk[i] = (uint8_t)v;
+        }
+    } else {
+        b2l_pbkdf2_sha1(pass, pl, ssid, sl, 4096, j.pmk, 32);
+    }
+    memset(pass, 0, sizeof(pass));
+    absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+    wlog("mode 23: PMK %s in %llu ms\n", pl == 64 ? "given as 64 hex digits" :
+        "derived from the passphrase (PBKDF2-HMAC-SHA1, 4096 rounds)", ns / 1000000);
+    /* Ours: version 1, the network's group cipher, CCMP, PSK, no capabilities. */
+    static const uint8_t base[22] = { 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2,
+                                      0, 0 };
+    memcpy(j.ie, base, sizeof(base));
+    j.ie[7] = (uint8_t)group;
+    j.ie_len = sizeof(base);
+    j.group = group;
+    /* The firmware's security, as brcmfmac sets it for a host supplicant. */
+    static const struct { unsigned cmd; const char *name; } sets[5] = {
+        { 20, "WLC_SET_INFRA" }, { 22, "WLC_SET_AUTH" }, { 263, "wsec" }, { 263, "wpa_auth" }, { 263, "mfp" },
+    };
+    const uint32_t values[5] = { 1, 0, group == 2 ? 6u : 4u, 0x80u, 0 };
+    for (unsigned i = 0; i < 5; i++) {
+        uint8_t v[4];
+        wifi_put(v, values[i], 4);
+        r = wifi_join_set(regions, info, d2h_mb, last, next, sets[i].cmd, sets[i].name, v, 4, 0x400u, &status);
+        if (r) goto out;
+        wlog("mode 23: %s %#x: status %d\n", sets[i].name, values[i], status);
+    }
+    r = wifi_join_set(regions, info, d2h_mb, last, next, 263, "wpaie", j.ie, j.ie_len, 0x400u, &status);
+    if (r) goto out;
+    wlog("mode 23: wpaie (our RSN element, %u bytes): status %d\n", j.ie_len, status);
+    /* The join: brcmf_join_params, the name, the network's address and its channel. */
+    uint8_t join[52];
+    memset(join, 0, sizeof(join));
+    wifi_put(join, sl, 4);
+    memcpy(join + 4, ssid, sl);
+    memcpy(join + 36, j.aa, 6);
+    wifi_put(join + 44, 1, 4);
+    wifi_put(join + 48, s->target_chanspec, 2);
+    memset(ssid, 0, sizeof(ssid));
+    j.rx_read = last->d2h_write[2] < wifi_rings[4].items ? last->d2h_write[2] : 0;
+    j.tx_seen = last->d2h_write[1] < wifi_rings[3].items ? last->d2h_write[1] : 0;
+    j.rx_next = WIFI_RXBUFS;
+    wifi_joining = &j;
+    r = wifi_join_set(regions, info, d2h_mb, last, next, 26, "WLC_SET_SSID", join, sizeof(join), 0x600u, &status);
+    memset(join, 0, sizeof(join));
+    memset(wifi_host + WIFI_HOST_IOVAR_IN + 0x600u, 0, 0x200u);     /* the name leaves the DMA input too */
+    CleanPoC_DcacheRegion((vm_offset_t)wifi_host + WIFI_HOST_IOVAR_IN + 0x600u, 0x200u);
+    if (r) goto out;
+    wlog("mode 23: WLC_SET_SSID (the name, address and channel; none logged): status %d\n", status);
+    if (status) goto out;
+    /* Up to 10 s: association, the flow ring, the 4-way handshake as its messages come. */
+    unsigned waited = 0;
+    for (; waited < 10000; waited += 20) {
+        r = wifi_join_look(regions, info, d2h_mb, last, next, &j);
+        if (r) goto out;
+        if (j.link == 1 && !j.flow_asked) {
+            r = wifi_join_flow(regions, info, next, &j);
+            if (r) goto out;
+        }
+        if (j.flow_done && !j.flow_ok) {
+            j.flow_ok = j.flow_status == 0;
+            wlog("mode 23: flow ring 2 created: status %u\n", j.flow_status);
+            if (!j.flow_ok) break;
+            j.flow_done = 2;
+        }
+        if (j.eapol_len && j.flow_ok) {
+            r = wifi_join_handshake(regions, info, &j);
+            j.eapol_len = 0;
+            if (r) goto out;
+        }
+        if (j.msg4 && j.tx_done >= j.msg4_tx) break;
+        if (j.deauth || j.set_ssid > 1 || j.link == -1) break;
+        delay_for_interval(20, NSEC_PER_MSEC);
+    }
+    wlog("mode 23: after %u ms: SET_SSID %s, link %s; 4-way messages 1 x%u, 2 x%u, 3 x%u (MIC failures %u), "
+        "4 x%u; transmit completions %u (%u not ok); other EAPOL %u; %u events; %s\n", waited,
+        j.set_ssid == 1 ? "succeeded" : j.set_ssid ? "failed" : "not reported", j.link == 1 ? "up" :
+        j.link ? "down" : "not reported", j.msg1, j.msg2, j.msg3, j.mic_bad, j.msg4, j.tx_done, j.tx_bad,
+        j.eapol_other, j.events, j.deauth ? "the network let us go" : "still associated");
+    if (j.msg4 && !j.deauth) {
+        static const uint8_t none[6] = { 0 };
+        int pairwise = 0, group_status = 0;
+        r = wifi_join_key(regions, info, d2h_mb, last, next, 0, j.ptk + 32, 16, 4, 2, NULL, j.aa, &pairwise);
+        if (r) goto out;
+        if (j.gtk_len == 32) {                  /* TKIP: the two MIC keys change places for a station */
+            uint8_t t[8];
+            memcpy(t, j.gtk + 24, 8);
+            memcpy(j.gtk + 24, j.gtk + 16, 8);
+            memcpy(j.gtk + 16, t, 8);
+            memset(t, 0, sizeof(t));
+        }
+        if (j.gtk_len) {
+            r = wifi_join_key(regions, info, d2h_mb, last, next, j.gtk_id, j.gtk, j.gtk_len, j.gtk_len == 32 ? 2 : 4,
+                0, j.gtk_rsc, none, &group_status);
+            if (r) goto out;
+        }
+        wlog("mode 23: pairwise key (CCMP) set: status %d; group key (id %u, %u bytes) %s: status %d\n", pairwise,
+            j.gtk_id, j.gtk_len, j.gtk_len ? "set" : "not given", group_status);
+        j.keyed = pairwise == 0;
+        /* The data path both ways: a DHCP discover, broadcast, and what comes back in 3 s. */
+        if (j.keyed) {
+            static const uint8_t broadcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+            uint8_t d[20 + 8 + 249];
+            memset(d, 0, sizeof(d));
+            read_frandom(&j.xid, sizeof(j.xid));
+            uint8_t *ip = d, *udp = d + 20, *b = d + 28;
+            ip[0] = 0x45;
+            ip[2] = (uint8_t)(sizeof(d) >> 8);
+            ip[3] = (uint8_t)sizeof(d);
+            ip[8] = 64;
+            ip[9] = 17;
+            memset(ip + 16, 0xff, 4);
+            const unsigned sum = wifi_ip_sum(ip, 20);
+            ip[10] = (uint8_t)(sum >> 8);
+            ip[11] = (uint8_t)sum;
+            udp[1] = 68;
+            udp[3] = 67;
+            udp[4] = (uint8_t)((8 + 249) >> 8);
+            udp[5] = (uint8_t)(8 + 249);
+            b[0] = 1;
+            b[1] = 1;
+            b[2] = 6;
+            b[4] = (uint8_t)(j.xid >> 24);
+            b[5] = (uint8_t)(j.xid >> 16);
+            b[6] = (uint8_t)(j.xid >> 8);
+            b[7] = (uint8_t)j.xid;
+            b[10] = 0x80;                       /* broadcast the reply */
+            memcpy(b + 28, j.spa, 6);
+            b[236] = 0x63;
+            b[237] = 0x82;
+            b[238] = 0x53;
+            b[239] = 0x63;
+            static const uint8_t options[9] = { 53, 1, 1, 55, 3, 1, 3, 6, 255 };
+            memcpy(b + 240, options, sizeof(options));
+            r = wifi_join_send(regions, info, &j, broadcast, 0x0800u, d, sizeof(d));
+            if (r < 0) goto out;
+            for (waited = 0; waited < 3000 && !j.offer && !j.deauth; waited += 20) {
+                r = wifi_join_look(regions, info, d2h_mb, last, next, &j);
+                if (r) goto out;
+                delay_for_interval(20, NSEC_PER_MSEC);
+            }
+            wlog("mode 23: DHCP discover %s; within %u ms: %u frames (%u ARP, %u IPv4, %u IPv6, %u other), "
+                "DHCP offers %u (no address logged)%s\n", r == 0 ? "sent" : "not sent", waited, j.frames, j.arp,
+                j.ipv4, j.ipv6, j.other, j.offer, j.offer ? ": the link carries data both ways" : "");
+        }
+    }
+    /* Leave as a station leaves: WLC_DISASSOC with reason 3 (deauthenticated, leaving). */
+    if (j.set_ssid == 1 && !j.deauth) {
+        uint8_t scb[12];
+        memset(scb, 0, sizeof(scb));
+        wifi_put(scb, 3, 4);
+        memcpy(scb + 4, j.aa, 6);
+        r = wifi_join_set(regions, info, d2h_mb, last, next, 52, "WLC_DISASSOC", scb, sizeof(scb), 0x400u, &status);
+        if (r) goto out;
+        for (waited = 0; waited < 1000 && j.link != -1; waited += 20) {
+            r = wifi_join_look(regions, info, d2h_mb, last, next, &j);
+            if (r) goto out;
+            delay_for_interval(20, NSEC_PER_MSEC);
+        }
+        wlog("mode 23: WLC_DISASSOC: status %d; link %s\n", status, j.link == -1 ? "down" : "not reported down");
+    }
+out:
+    wifi_joining = NULL;
+    memset(&j, 0, sizeof(j));
+    return r < 0 ? -1 : 0;
+}
+
 /*
  * S10 port, mode 22 (boots 90-91: the active scan heard 4 networks; the
  * firmware has no supplicant of its own, sup_wpa -23): what a join through a
@@ -1752,6 +2478,7 @@ wifi_host_datapath(struct wifi_region *regions, const uint32_t *info, uint32_t d
     unsigned bytes = 0, had = 0;
     int status = 0, r;
     uint64_t deadline;
+    wifi_rx_ready = 0;
     r = wifi_host_repost(regions, info, last, *next, 11);
     if (r < 0) return -1;
     *next += (unsigned)r;
@@ -1829,6 +2556,7 @@ wifi_host_datapath(struct wifi_region *regions, const uint32_t *info, uint32_t d
     if (wifi_host_view(regions, info, d2h_mb, last, deadline)) return -1;
     wlog("mode 22: the firmware took %u of the %u receive buffers within %u ms; rx completions written %u "
         "(none expected before a join)\n", taken, WIFI_RXBUFS, waited + 100, last->d2h_write[2]);
+    wifi_rx_ready = taken != 0;
     return 0;
 }
 
@@ -2095,7 +2823,8 @@ wifi_host_scan(struct wifi_region *regions, const uint32_t *info, uint32_t d2h_m
     wlog("mode 21: all three passes: %u networks (%u on 2.4 GHz, %u on 5/6 GHz; %u with a name, %u hidden), RSSI %d "
         "to %d dBm; channels heard:%s\n", s.networks, s.networks - s.networks_5g, s.networks_5g, s.named, s.hidden,
         s.results ? s.rssi_min : 0, s.results ? s.rssi_max : 0, list[0] ? list : " none");
-    return mode >= 22 ? wifi_host_datapath(regions, info, d2h_mb, last, next) : 0;
+    r = mode >= 22 ? wifi_host_datapath(regions, info, d2h_mb, last, next) : 0;
+    return r || mode < 23 ? r : wifi_host_join(regions, info, d2h_mb, last, next, &s);
 }
 
 /*
@@ -2978,7 +3707,7 @@ void
 b2l_wifi_diag_start(void)
 {
     uint32_t mode = 0;
-    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 22) {
+    if (!PE_parse_boot_argn("b2l_wifi_diag", &mode, sizeof(mode)) || mode < 1 || mode > 23) {
         wlog("diagnostic disabled; no MMIO access\n");
         return;
     }

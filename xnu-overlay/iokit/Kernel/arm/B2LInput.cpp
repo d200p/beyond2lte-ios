@@ -38,7 +38,7 @@ class B2LInput : public IOService {
     bool initPending;
     uint64_t nextInitUS;
     uint64_t pollCount,eventCount,updateCount,bulkCount,transferFailures;
-    uint64_t lastPollStart,lastDiagnostic,maxPollGapUS,maxPollWorkUS,chordStart;
+    uint64_t lastPollStart,lastDiagnostic,lastDiagnosticUpdates,maxPollGapUS,maxPollWorkUS,chordStart;
     unsigned maxPending;
     uint64_t transferTimeUS,maxTransferUS;
     static uint64_t uptimeUS(){uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time(),&ns);return ns/1000;}
@@ -241,8 +241,10 @@ void B2LInput::poll(OSObject *owner,IOTimerEventSource *sender){
     }
     uint64_t end=uptimeUS(),work=end-begin;
     if(work>s->maxPollWorkUS)s->maxPollWorkUS=work;
-    if(end-s->lastDiagnostic>=10000000){
-        s->lastDiagnostic=end;
+    /* Boot 92: every 10 s while touched, every 2 minutes at rest (12 % of a
+     * 9-hour log was this line with nothing changed). */
+    if(end-s->lastDiagnostic>=(s->updateCount!=s->lastDiagnosticUpdates?10000000ULL:120000000ULL)){
+        s->lastDiagnostic=end;s->lastDiagnosticUpdates=s->updateCount;
         b2l_diag_record("B2L INPUT PERF: sec=%llu polls=%llu wire=%llu updates=%llu bulk=%llu max_pending=%u transfer_failures=%llu max_gap_us=%llu max_work_us=%llu max_transfer_us=%llu bus_us=%llu enabled=%d init_attempts=%u init_pending=%d\n",
             end/1000000,s->pollCount,s->eventCount,s->updateCount,s->bulkCount,
             s->maxPending,s->transferFailures,s->maxPollGapUS,s->maxPollWorkUS,

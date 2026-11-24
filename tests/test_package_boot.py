@@ -208,6 +208,41 @@ class BootTrailerTests(unittest.TestCase):
                         broken[len(prefix) + 288 + i] ^= 1 << bit
                         with self.assertRaises(ValueError):
                             self.verify(bytes(broken))
+        # S10 port: B2LFW004, the 128-byte join record after the CLM blob (a model
+        # network; nothing about it is ever printed).
+        record = pack.wifi_join_record(b"ModelNet", b"model passphrase")
+        self.assertEqual(len(record), pack.WIFI_JOIN_SIZE)
+        header[288:320] = pack.wifi_metadata(mac, len(firmware), len(nvram), len(clm), len(record))
+        self.assertEqual(bytes(header[302:310]), b"B2LFW004")
+        joined = prefix + header + self.kernel() + firmware + nvram + clm + record
+        with patch.object(pack, 'WIFI_FIRMWARE_SHA256', hashlib.sha256(firmware).hexdigest()), \
+                patch.object(pack, 'WIFI_CLM_SHA256', hashlib.sha256(clm).hexdigest()):
+            result = self.verify(joined)
+            self.assertTrue(result['wifi_join_present'])
+            self.assertEqual(result['wifi_clm_bytes'], len(clm))
+            for at in (0, 8, 9, 10, 20, 60, 108, 112, 127):
+                broken = bytearray(joined)
+                broken[len(joined) - 128 + at] ^= 1
+                with self.assertRaisesRegex(ValueError, 'join record'):
+                    self.verify(bytes(broken))
+            with self.assertRaises(ValueError):
+                self.verify(joined[:-4])
+        for ssid, password in ((b"", b"model passphrase"), (b"x" * 33, b"model passphrase"),
+                               (b"ModelNet", b"short"), (b"ModelNet", b"x" * 64), (b"ModelNet", b"tab\there!")):
+            with self.assertRaises(ValueError):
+                pack.wifi_join_record(ssid, password)
+        self.assertEqual(len(pack.wifi_join_record(b"ModelNet", b"0123456789abcdef" * 4)), 128)
+        with tempfile.TemporaryDirectory() as tmp:
+            join = Path(tmp) / "join.txt"
+            join.write_bytes(b"\xef\xbb\xbfModelNet\r\nmodel passphrase\r\n")
+            self.assertEqual(pack.read_wifi_join(join), (b"ModelNet", b"model passphrase"))
+            join.write_bytes(b"ModelNet\n")
+            with self.assertRaises(ValueError):
+                pack.read_wifi_join(join)
+        with self.assertRaises(ValueError):
+            pack.wifi_metadata(mac, len(firmware), len(nvram), 0, 128)       # needs the CLM blob
+        with self.assertRaises(ValueError):
+            pack.wifi_metadata(mac, len(firmware), len(nvram), len(clm), 64)  # the record is 128 bytes
         for size in (2, pack.WIFI_CLM_MAX + 4):
             with self.assertRaises(ValueError):
                 pack.wifi_metadata(mac, len(firmware), len(nvram), size)

@@ -8,7 +8,7 @@ typedef struct { uint64_t physBase, topOfKernelData; } boot_args;
 /* S10 port: Wi-Fi mode 19's synthetic CLM blob follows the NVRAM (B2LFW003). */
 #define FIXTURE_CLM_BYTES 29464u
 static _Alignas(4096) uint8_t firmware_fixture[FIXTURE_FIRMWARE_BYTES + FIXTURE_NVRAM_MAX + 65536u];
-static unsigned firmware_nvram_bytes, firmware_clm_bytes;
+static unsigned firmware_nvram_bytes, firmware_clm_bytes, firmware_join_bytes;
 static boot_args firmware_args;
 static struct { void *bootArgs; } PE_state = { &firmware_args };
 static unsigned firmware_fault;
@@ -19,7 +19,7 @@ static const uint8_t firmware_chosen_mac[6] = { 0x02, 0xb2, 0x1c, 0x5e, 0x10, 0x
 static const uint8_t firmware_chip_mac[6] = { 0x00, 0x90, 0x4c, 0xc5, 0x12, 0x38 };
 #define kSuccess 0
 static inline void firmware_fixture_setup(void) {
-    firmware_fault=0;firmware_nvram_bytes=0;firmware_clm_bytes=0;
+    firmware_fault=0;firmware_nvram_bytes=0;firmware_clm_bytes=0;firmware_join_bytes=0;
     firmware_args.physBase=(uintptr_t)firmware_fixture;
     firmware_args.topOfKernelData=firmware_args.physBase+FIXTURE_FIRMWARE_BYTES;
     for(unsigned i=0;i<FIXTURE_FIRMWARE_BYTES;i++)firmware_fixture[i]=(uint8_t)(i*13u+7u);
@@ -31,6 +31,19 @@ static inline void firmware_fixture_clm(void) {
     for(unsigned i=0;i<FIXTURE_CLM_BYTES;i++)c[i]=(uint8_t)(i*7u+3u);
     memcpy(c,"BLOB",4);firmware_clm_bytes=FIXTURE_CLM_BYTES;
     firmware_args.topOfKernelData+=FIXTURE_CLM_BYTES;
+}
+/* S10 port, Wi-Fi mode 23: the join record (B2LFW004) after the CLM blob, a
+ * model network's; the fake SHA-256 below gives its digest. */
+static inline uint8_t *firmware_join_at(void) { return firmware_clm_at()+firmware_clm_bytes; }
+static inline void firmware_join_digest(const uint8_t *record,uint8_t digest[32]) {
+    for(unsigned i=0;i<32;i++)digest[i]=(uint8_t)(record[i]^record[44+i]^(i*29u+1u));
+}
+static inline void firmware_fixture_join(const char *ssid,const char *password) {
+    uint8_t *j=firmware_join_at(),digest[32];
+    memset(j,0,128);memcpy(j,"B2LJOIN1",8);j[8]=(uint8_t)strlen(ssid);j[9]=(uint8_t)strlen(password);
+    memcpy(j+12,ssid,j[8]);memcpy(j+44,password,j[9]);
+    firmware_join_digest(j,digest);memcpy(j+112,digest,16);
+    firmware_join_bytes=128;firmware_args.topOfKernelData+=128;
 }
 static inline void firmware_fixture_nvram(const uint8_t *nvram,unsigned bytes) {
     assert(bytes<=FIXTURE_NVRAM_MAX);
@@ -46,7 +59,8 @@ static int SecureDTGetProperty(DTEntry dt,const char *name,const void **prop,uns
         *prop=firmware_mac_mode==2 ? firmware_chip_mac:firmware_chosen_mac;*n=6;return firmware_mac_mode==1 ? -1:0;
     }
     assert(!strcmp(name,"b2l,wifi-firmware"));
-    range[0]=(uintptr_t)firmware_fixture;range[1]=FIXTURE_FIRMWARE_BYTES+firmware_nvram_bytes+firmware_clm_bytes;
+    range[0]=(uintptr_t)firmware_fixture;
+    range[1]=FIXTURE_FIRMWARE_BYTES+firmware_nvram_bytes+firmware_clm_bytes+firmware_join_bytes;
     if(firmware_fault==4)range[1]--;
     if(firmware_fault==5)range[0]++;
     if(firmware_fault==6)range[0]-=4096;
@@ -68,6 +82,9 @@ void b2l_sha256(const void *p,size_t n,uint8_t digest[32]) {
     static const uint8_t clm[32]={
         0x5e,0x55,0x20,0xcc,0x65,0x59,0x91,0x92,0x3b,0x7c,0x88,0xc8,0x5c,0x2c,0x02,0x7d,
         0x22,0xb0,0x46,0x2d,0xc6,0xa3,0xbf,0xd8,0xfd,0x19,0x1c,0xbe,0xfa,0xe3,0x33,0x00};
+    if(firmware_join_bytes&&p==firmware_join_at()){
+        assert(n==112);firmware_join_digest(p,digest);if(firmware_fault==12)digest[3]^=1;return;
+    }
     if(p!=firmware_fixture){
         assert(n==FIXTURE_CLM_BYTES);memset(digest,0,32);
         if(firmware_clm_bytes&&p==firmware_clm_at()&&firmware_fault!=11)memcpy(digest,clm,32);

@@ -12,13 +12,17 @@
 /* S10 port: Wi-Fi mode 19 loads the board's CLM (regulatory) blob the way DHD
  * does ("clmload"); it follows the NVRAM in the same attachment (B2LFW003). */
 #define B2L_WIFI_CLM_MAX_BYTES 65536U
+/* S10 port: Wi-Fi mode 23 joins the network a fixed 128-byte record after
+ * the CLM blob names (B2LFW004): its name and passphrase, which only the
+ * kernel reads; /chosen still carries only the attachment's range. */
+#define B2L_WIFI_JOIN_BYTES 128U
 /* The attachment is the firmware alone or followed by 4-byte-multiple NVRAM,
- * and then perhaps a 4-byte-multiple CLM blob. */
+ * and then perhaps a 4-byte-multiple CLM blob and the join record. */
 static inline int b2l_wifi_attachment_valid(unsigned long long size)
 {
     if(size<B2L_WIFI_FIRMWARE_BYTES)return 0;
     size-=B2L_WIFI_FIRMWARE_BYTES;
-    return size<=B2L_WIFI_NVRAM_MAX_BYTES+B2L_WIFI_CLM_MAX_BYTES&&!(size&3U);
+    return size<=B2L_WIFI_NVRAM_MAX_BYTES+B2L_WIFI_CLM_MAX_BYTES+B2L_WIFI_JOIN_BYTES&&!(size&3U);
 }
 /* Optional private firmware follows the Mach-O exactly. Explicit metadata
  * prevents stale bytes beyond a shorter BOOT image from becoming an input.
@@ -27,6 +31,8 @@ static inline int b2l_wifi_attachment_valid(unsigned long long size)
  * complement, field[30..31] zero, so any single flipped bit is rejected.
  * B2LFW003: B2LFW002's fields, then field[30..31] the CLM blob's size in
  * words (nonzero); the kernel checks the blob against its pinned SHA-256.
+ * B2LFW004: B2LFW003's fields; the join record (B2L_WIFI_JOIN_BYTES) follows
+ * the CLM blob, and the kernel checks its own digest.
  * Returns the attachment's total size, 0 when absent, -1 when malformed. */
 static inline int b2l_boot_wifi_firmware(const unsigned char field[32])
 {
@@ -42,13 +48,13 @@ static inline int b2l_boot_wifi_firmware(const unsigned char field[32])
         for(unsigned i=26;i<32;i++)if(field[i])return -1;
         return (int)size;
     }
-    if(field[21]!='2'&&field[21]!='3')return -1;
+    if(field[21]!='2'&&field[21]!='3'&&field[21]!='4')return -1;
     unsigned clm=((unsigned)field[30]|(unsigned)field[31]<<8)*4U;
     if(field[21]=='2'?clm!=0:(clm==0||clm>B2L_WIFI_CLM_MAX_BYTES))return -1;
     unsigned nvram=(unsigned)field[26]|(unsigned)field[27]<<8;
     unsigned check=(unsigned)field[28]|(unsigned)field[29]<<8;
     if(!nvram||(nvram^check)!=0xffffU||nvram>B2L_WIFI_NVRAM_MAX_BYTES||(nvram&3U))return -1;
-    return (int)(size+nvram+clm);
+    return (int)(size+nvram+clm+(field[21]=='4'?B2L_WIFI_JOIN_BYTES:0U));
 }
 static inline int b2l_wifi_mac_valid(const unsigned char mac[6])
 {

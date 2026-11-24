@@ -34,7 +34,7 @@ package_boot = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(package_boot)
 
 
-def attach(boot, firmware, mac, nvram=None, clm=None):
+def attach(boot, firmware, mac, nvram=None, clm=None, join=None):
     info = package_boot.check_boot(boot)
     if info["wifi_firmware_bytes"]:
         raise ValueError("the BOOT image already carries firmware")
@@ -55,8 +55,11 @@ def attach(boot, firmware, mac, nvram=None, clm=None):
     if clm and (len(regulatory) != package_boot.WIFI_CLM_SIZE or
                 hashlib.sha256(regulatory).hexdigest() != package_boot.WIFI_CLM_SHA256):
         raise ValueError("not the pinned board CLM blob")
-    field = package_boot.wifi_metadata(mac, len(blob), len(board), len(regulatory))
-    return data[:trailer + 288] + field + data[trailer + 320:end] + blob + board + regulatory
+    record = package_boot.wifi_join_record(*package_boot.read_wifi_join(join)) if join else b""
+    if join and not clm:
+        raise ValueError("the join record needs the CLM blob before it")
+    field = package_boot.wifi_metadata(mac, len(blob), len(board), len(regulatory), len(record))
+    return data[:trailer + 288] + field + data[trailer + 320:end] + blob + board + regulatory + record
 
 
 def main():
@@ -66,12 +69,14 @@ def main():
     p.add_argument("--mac-file", type=Path, required=True, help="private file: six colon-separated octets")
     p.add_argument("--nvram", type=Path, help="private board nvram.txt, for b2l_wifi_diag=11")
     p.add_argument("--clm", type=Path, help="private bcmdhd_clm.blob (after --nvram), for b2l_wifi_diag=19")
+    p.add_argument("--join", type=Path, help="private two-line file, network name then password (after --clm), "
+                   "for b2l_wifi_diag=23; never printed")
     p.add_argument("--output", type=Path, required=True, help="private output image (must not exist)")
     a = p.parse_args()
     if a.output.exists():
         p.error("output exists; refusing to overwrite")
     try:
-        image = attach(a.boot, a.firmware, package_boot.read_wifi_mac(a.mac_file), a.nvram, a.clm)
+        image = attach(a.boot, a.firmware, package_boot.read_wifi_mac(a.mac_file), a.nvram, a.clm, a.join)
         a.output.write_bytes(image)
         info = package_boot.check_boot(a.output)
     except ValueError as error:
@@ -81,6 +86,7 @@ def main():
         return 2
     print(f"boot_bytes={info['boot_bytes']} firmware_offset={info['wifi_firmware_file_offset']} "
           f"nvram_bytes={info['wifi_nvram_bytes']} clm_bytes={info['wifi_clm_bytes']} "
+          f"join={'attached' if info['wifi_join_present'] else 'none'} "
           f"sha256={hashlib.sha256(a.output.read_bytes()).hexdigest()}")
     return 0
 

@@ -219,6 +219,10 @@ static void b2l_pcs_report(void)
     uint64_t samples = b2l_pcs_samples[set][0], user = b2l_pcs_user[set][0], lost = b2l_pcs_lost[set];
     uint64_t app_samples = b2l_pcs_samples[set][1], app_user = b2l_pcs_user[set][1];
     for (unsigned i = 0; i < shown; i++) kept += b2l_pcs_top[i].count;
+    /* Boot 92: a 9-hour session at rest left 48 lines of PCs every 30 s and
+     * no room for the session itself. At rest (under 5 % of samples in user
+     * code and under 30 of the app's) only the first line is written. */
+    if (user * 20 < samples && app_samples < 30) shown = 0;
     if (samples || app_samples) {
         b2l_early_trace("B2L PCS: samples=%llu user=%llu kernel=%llu app=%s app_samples=%llu app_user=%llu lost=%llu buckets=%u shown=%u kept=%llu anchor=0x%llx\n",
             samples, user, samples - user, b2l_pcs_app, app_samples, app_user, lost, buckets, shown, kept,

@@ -37,9 +37,16 @@ int main(void){
  field[26]=4;field[27]=0x80;field[28]=0xfb;field[29]=0x7f;assert(b2l_boot_wifi_firmware(field)==-1); /* NVRAM > 32 KiB */
  field[21]='2';field[26]=0x40;field[27]=0x2f;field[28]=0xbf;field[29]=0xd0;field[30]=0xc6;field[31]=0x1c;
  assert(b2l_boot_wifi_firmware(field)==-1);                                     /* B2LFW002 with a CLM size */
+ /* S10 port: B2LFW004, the 128-byte join record after the CLM blob. */
+ field[21]='4';
+ assert(b2l_boot_wifi_decode(field,mac)==1&&b2l_boot_wifi_firmware(field)==(int)fw+0x2f40+29464+128);
+ field[30]=0;field[31]=0;assert(b2l_boot_wifi_firmware(field)==-1);              /* a join record needs the CLM */
+ field[30]=0xc6;field[31]=0x1c;field[21]='5';assert(b2l_boot_wifi_firmware(field)==-1);
+ field[21]='2';field[30]=0;field[31]=0;
  assert(b2l_wifi_attachment_valid(fw)&&b2l_wifi_attachment_valid(fw+4)&&!b2l_wifi_attachment_valid(fw-4)&&
   !b2l_wifi_attachment_valid(fw+2)&&b2l_wifi_attachment_valid(fw+32768ULL+65536ULL)&&
-  !b2l_wifi_attachment_valid(fw+32768ULL+65540ULL)&&!b2l_wifi_attachment_valid(0));
+  !b2l_wifi_attachment_valid(fw+32768ULL+65540ULL+128ULL)&&!b2l_wifi_attachment_valid(0)&&
+  b2l_wifi_attachment_valid(fw+32768ULL+65536ULL+128ULL));
  memset(field+14,0,18);
  field[8]=1;assert(b2l_boot_wifi_decode(field,mac)==-1);
  field[8]=0;field[13]=0;assert(b2l_boot_wifi_decode(field,mac)==-1);

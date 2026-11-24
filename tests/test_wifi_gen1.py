@@ -33,6 +33,7 @@ pre = r'''
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include "b2l_wifi_crypto.h"
 #include "b2l_wifi_phy_data.h"
 #include "wifi_firmware_fixture.h"
 typedef uintptr_t vm_offset_t;
@@ -75,6 +76,7 @@ static int PE_parse_boot_argn(const char *name, void *value, unsigned size) {
     assert(!strcmp(name, "b2l_wifi_diag") && size == 4); *(uint32_t *)value = mode; return 1;
 }
 static uint64_t mach_absolute_time(void) { return now_us; }
+static void absolutetime_to_nanoseconds(uint64_t t, uint64_t *ns) { *ns = t * 1000; }
 static void clock_interval_to_deadline(unsigned n, unsigned unit, uint64_t *at) {
     assert((n == 500 || (mode >= 5 && n == 100) || (mode >= 10 && n == 5000) || (mode >= 11 && n == 2000)) &&
         unit == NSEC_PER_MSEC); *at = now_us + n * 1000;
@@ -105,7 +107,7 @@ static kern_return_t kernel_thread_start(thread_continue_t fn, void *arg, thread
 }
 static void thread_deallocate(thread_t thread) { assert(thread == (thread_t)&thread_starts); threads_released++; }
 void read_frandom(void *p, unsigned n) {
-    assert(mode >= 11 && n == 128);
+    assert(mode >= 11 && (n == 128 || (mode >= 23 && (n == 32 || n == 4))));   /* mode 23: SNonce, xid */
     for (unsigned i = 0; i < n; i++) ((uint8_t *)p)[i] = (uint8_t)(0xa5u ^ i);
 }
 /* S10 port, mode 13: phone memory as the CPU sees it (host_cpu) and as the
@@ -223,12 +225,21 @@ static void start_firmware(void) {
     }
     tcm11_put(0x2f0720, 1);                 /* the firmware wrote one control completion */
 }
+static unsigned rx22_db, rx22_take;     /* mode 22: rx post doorbells; how many the chip takes */
+/* Mode 23: the access point. */
+static unsigned j23_link, j23_flow, j23_tx_r, j23_msg, j23_keys, j23_offers, j23_left, j23_fault, j23_rx_w, j23_tx_cw;
+static unsigned rx23_free[64], nrx23_free;
+static uint8_t j23_aa[6], j23_spa[6], j23_anonce[32], j23_snonce[32], j23_pmk[32], j23_ptk[48];
+static const uint8_t j23_rsn[22] = { 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0 };
+static const uint8_t j23_gtk[16] = { 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6a, 0x6b, 0x6c, 0x6d, 0x6e, 0x6f };
+static void flowcreate23(const uint8_t *b);
+static void ev23(unsigned type, unsigned status, unsigned reason, unsigned flags);
 /* Mode 13 writes into the running firmware's RAM only what dhd_prot_init
  * writes, all before bus mastering except the control submission write index. */
 static uint32_t tcm13(uint32_t address) { return tcm11[(address - 0x170000) / 4]; }
 static void tcm13_write(uint32_t address, uint32_t value) {
     int ring_mem = address >= 0x2f0600 && address < 0x2f0650 && (address & 15) >= 4;
-    int index = (address >= 0x2f0700 && address < 0x2f0708) || (address >= 0x2f0710 && address < 0x2f0718) ||
+    int index = (address >= 0x2f0700 && address < 0x2f070c) || (address >= 0x2f0710 && address < 0x2f071c) ||
         (address >= 0x2f0720 && address < 0x2f072c) || (address >= 0x2f0730 && address < 0x2f073c);
     int shared = address == 0x2f0034 || address == 0x2f0038 || address == 0x2f003c || address == 0x2f0054;
     assert(mode >= 13 && host_allocs == 1 && (ring_mem || index || shared));
@@ -237,8 +248,13 @@ static void tcm13_write(uint32_t address, uint32_t value) {
             (mode >= 15 && db0_13 >= 2 && value != tcm13(0x2f0700) && value < 64)));
     else if (address == 0x2f0730 && hostready13)     /* the read index given back */
         assert(mode >= 15 && master13_on() && db0_13 >= 2 && value == tcm13(0x2f0720));
-    else if (address == 0x2f0704 && hostready13)     /* mode 22: the rx post ring, once */
-        assert(mode >= 22 && master13_on() && value == 32 && !tcm13(0x2f0704) && !tcm13(0x2f0714));
+    else if (address == 0x2f0704 && hostready13)     /* mode 22: the rx post ring; mode 23 posts again */
+        assert(mode >= 22 && master13_on() && (!rx22_db ? value == 32 && !tcm13(0x2f0704) && !tcm13(0x2f0714) :
+            mode >= 23 && value < 512));
+    else if ((address == 0x2f0708 || address == 0x2f0718) && hostready13)     /* mode 23: flow ring 2 */
+        assert(mode >= 23 && master13_on() && (value == 0 ? !j23_flow : address == 0x2f0708 && j23_flow && value < 64));
+    else if ((address == 0x2f0734 || address == 0x2f0738) && hostready13)     /* mode 23: tx, rx completions read */
+        assert(mode >= 23 && master13_on() && value < (address == 0x2f0734 ? 1024u : 512u));
     else assert(!bme_ever && !hostready13 && (index ? !value : 1));
     tcm11[(address - 0x170000) / 4] = value;
 }
@@ -294,7 +310,6 @@ static void console18(const char *line) {
     tcm11_put(0x2f0110, at + (unsigned)strlen(line));
 }
 static uint8_t mask18[16];
-static unsigned rx22_db, rx22_take;     /* mode 22: rx post doorbells; how many the chip takes */
 static const struct { uint8_t bssid[6]; uint16_t chanspec; int16_t rssi; } scan18[5] = {
     { { 0x00, 0x11, 0x22, 0xaa, 0xbb, 0x01 }, 0x1001, -40 },
     { { 0x00, 0x11, 0x22, 0xaa, 0xbb, 0x02 }, 0x1006, -67 },
@@ -322,8 +337,8 @@ static void d2h13(const uint32_t words[6]) {
 static void scan18_deliver(void) {
     while (escan18 && scan18_next <= 5 && nev18) {
         if (scan18_next == 5 && host13_fault == 15) return;
-        const unsigned id = ev18[--nev18], last = scan18_next == 5, datalen = last ? 12 : 140;
-        uint8_t packet[212] = { 0 };
+        const unsigned id = ev18[--nev18], last = scan18_next == 5, datalen = last ? 12 : mode >= 23 ? 162 : 140;
+        uint8_t packet[256] = { 0 };
         memcpy(packet, firmware_chip_mac, 6); memcpy(packet + 6, firmware_chip_mac, 6);
         uint8_t *m = packet + 24;          /* wl_event_msg_t, big-endian */
         m[7] = 69; m[11] = last ? 0 : 8; m[23] = (uint8_t)datalen;
@@ -336,6 +351,7 @@ static void scan18_deliver(void) {
             bi[18] = 8; memcpy(bi + 19, "ModelNet", 8);
             bi[72] = (uint8_t)scan18[scan18_next].chanspec; bi[73] = (uint8_t)(scan18[scan18_next].chanspec >> 8);
             bi[78] = (uint8_t)scan18[scan18_next].rssi; bi[79] = (uint8_t)((uint16_t)scan18[scan18_next].rssi >> 8);
+            if (mode >= 23) { bi[4] = 150; bi[116] = 128; bi[120] = 22; memcpy(bi + 128, j23_rsn, 22); }
         }
         const unsigned length = 72 + datalen;
         memcpy(host_dram + buffer13(id), packet, length); memset(host_dev + buffer13(id), 1, length);
@@ -355,6 +371,11 @@ static void iovar15(uint32_t value) {
         const uint8_t *b = host_dram + 40 * (item % 64);
         uint32_t request, low, high;
         memcpy(&request, b + 4, 4); memcpy(&low, b + 16, 4); memcpy(&high, b + 20, 4);
+        if (b[0] == 0x03) {         /* mode 23: flow ring 2 */
+            assert((unsigned)b[3] == (254 + item) % 253);
+            flowcreate23(b);
+            continue;
+        }
         if (b[0] == 0x0d) {         /* mode 18: an event buffer given back */
             assert(mode >= 18 && (unsigned)b[3] == (254 + item) % 253 && request >= 3 && request <= 6);
             assert((unsigned)(b[8] | b[9] << 8) == 0x800u && low == HOST13_PA + buffer13(request) && !high);
@@ -474,6 +495,37 @@ static void iovar15(uint32_t value) {
             (uint8_t)input[13] == 0x01 && (uint8_t)input[16] == 0x40));
         for (unsigned b = 0; b < 16; b++) assert(b == 8 || !input[11 + b] || (assoc && (b <= 2 || b == 5)));
         memcpy(mask18, input + 11, 16);
+    } else if (cmd == 20 || cmd == 22) {             /* mode 23: WLC_SET_INFRA 1, WLC_SET_AUTH 0 */
+        uint32_t v; memcpy(&v, input, 4);
+        assert(mode >= 23 && length == 4 && v == (cmd == 20 ? 1u : 0u) && !j23_link);
+    } else if (cmd == 263 && (!strcmp(input, "wsec") || !strcmp(input, "wpa_auth") || !strcmp(input, "mfp"))) {
+        uint32_t v; const unsigned n = (unsigned)strlen(input) + 1; memcpy(&v, input + n, 4);
+        assert(mode >= 23 && length == n + 4 && !j23_link &&
+            v == (!strcmp(input, "wsec") ? 4u : !strcmp(input, "wpa_auth") ? 0x80u : 0u));
+    } else if (cmd == 263 && !strcmp(input, "wpaie")) {
+        assert(mode >= 23 && length == 28 && !memcmp(input + 6, j23_rsn, 22));
+    } else if (cmd == 26) {                          /* mode 23: WLC_SET_SSID, the join */
+        uint32_t n, count; memcpy(&n, input, 4); memcpy(&count, input + 44, 4);
+        assert(mode >= 23 && length == 52 && n == 8 && !memcmp(input + 4, "ModelNet", 8) && count == 1);
+        unsigned best = 0;
+        for (unsigned k = 1; k < 5; k++) if (scan18[k].rssi > scan18[best].rssi) best = k;
+        assert(!memcmp(input + 36, scan18[best].bssid, 6) && (unsigned)((uint8_t)input[48] | (uint8_t)input[49] << 8) ==
+            scan18[best].chanspec);
+        memcpy(j23_aa, scan18[best].bssid, 6);
+        j23_link = 2;                                  /* events after the completion */
+    } else if (cmd == 263 && !strcmp(input, "wsec_key")) {
+        const uint8_t *k = (const uint8_t *)input + 9;
+        uint32_t index, len, algo, flags, init, hi; uint16_t lo;
+        memcpy(&index, k, 4); memcpy(&len, k + 4, 4); memcpy(&algo, k + 112, 4); memcpy(&flags, k + 116, 4);
+        memcpy(&init, k + 132, 4); memcpy(&hi, k + 140, 4); memcpy(&lo, k + 144, 2);
+        assert(mode >= 23 && length == 173 && j23_msg == 4 && len == 16 && algo == 4);
+        if (j23_keys == 0) assert(index == 0 && flags == 2 && !memcmp(k + 8, j23_ptk + 32, 16) && !memcmp(k + 156, j23_aa, 6));
+        else assert(j23_keys == 1 && index == 1 && !flags && !memcmp(k + 8, j23_gtk, 16) && init == 1 && lo == 5 && !hi);
+        j23_keys++;
+    } else if (cmd == 52) {                          /* mode 23: WLC_DISASSOC, reason 3 */
+        uint32_t v; memcpy(&v, input, 4);
+        assert(mode >= 23 && length == 12 && v == 3 && !memcmp(input + 4, j23_aa, 6) && j23_link == 1);
+        j23_link = 3;
     } else if (cmd == 262 && (!strcmp(input, "wsec") || !strcmp(input, "wpa_auth"))) {
         static const uint32_t none = 0;
         assert(mode >= 22 && length == 32); data = &none; resp = 4;
@@ -534,6 +586,155 @@ static void iovar15(uint32_t value) {
         scan18_next = 0;
         scan18_deliver();
     }
+    if (j23_link == 2) { j23_link = 1; ev23(0, 0, 0, 0); ev23(16, 0, 0, 1); }    /* SET_SSID, LINK up */
+    if (j23_link == 3) { j23_link = 4; j23_left = 1; ev23(16, 0, 0, 0); }       /* LINK down */
+}
+/* ---- mode 23: the access point ---- */
+static void ev23(unsigned type, unsigned status, unsigned reason, unsigned flags) {
+    uint8_t packet[72] = { 0 };
+    memcpy(packet, firmware_chip_mac, 6); memcpy(packet + 6, firmware_chip_mac, 6);
+    uint8_t *m = packet + 24;
+    m[2] = (uint8_t)(flags >> 8); m[3] = (uint8_t)flags; m[7] = (uint8_t)type; m[11] = (uint8_t)status;
+    m[15] = (uint8_t)reason;
+    assert(nev18);
+    const unsigned eid = ev18[--nev18];
+    memcpy(host_dram + buffer13(eid), packet, sizeof(packet)); memset(host_dev + buffer13(eid), 1, sizeof(packet));
+    const uint32_t event[6] = { 0x0eu, eid, 0x00020000u, sizeof(packet), 0, 0 };
+    d2h13(event);
+}
+static void rx23(const uint8_t *frame, unsigned len) {
+    assert(nrx23_free && len <= 2048);
+    const unsigned id = rx23_free[0];
+    memmove(rx23_free, rx23_free + 1, --nrx23_free * sizeof(rx23_free[0]));
+    const unsigned k = id - 0x100;
+    memcpy(host_dram + 0x30000 + 2048 * k, frame, len); memset(host_dev + 0x30000 + 2048 * k, 1, len);
+    uint8_t c[40] = { 0 };
+    c[0] = 0x12; memcpy(c + 4, &id, 4); c[14] = (uint8_t)len; c[15] = (uint8_t)(len >> 8);
+    memcpy(host_dram + 0xc000 + 40 * j23_rx_w, c, 40); memset(host_dev + 0xc000 + 40 * j23_rx_w, 1, 40);
+    j23_rx_w = (j23_rx_w + 1) % 512;
+    tcm11[(0x2f0728 - 0x170000) / 4] = j23_rx_w;
+}
+static void tx23_status(uint32_t pktid) {
+    uint8_t c[24] = { 0 };
+    c[0] = 0x10; memcpy(c + 4, &pktid, 4);
+    memcpy(host_dram + 0x6000 + 24 * j23_tx_cw, c, 24); memset(host_dev + 0x6000 + 24 * j23_tx_cw, 1, 24);
+    j23_tx_cw = (j23_tx_cw + 1) % 1024;
+    tcm11[(0x2f0724 - 0x170000) / 4] = j23_tx_cw;
+}
+static void ptk23(void) {
+    uint8_t data[76];
+    const int a = memcmp(j23_aa, j23_spa, 6) < 0, n = memcmp(j23_anonce, j23_snonce, 32) < 0;
+    memcpy(data, a ? j23_aa : j23_spa, 6); memcpy(data + 6, a ? j23_spa : j23_aa, 6);
+    memcpy(data + 12, n ? j23_anonce : j23_snonce, 32); memcpy(data + 44, n ? j23_snonce : j23_anonce, 32);
+    b2l_prf_sha1(j23_pmk, 32, "Pairwise key expansion", data, 76, j23_ptk, 48);
+}
+static void mic23(uint8_t *frame, unsigned len, uint8_t out[16]) {
+    uint8_t copy[256], mac[20];
+    assert(len <= sizeof(copy));
+    memcpy(copy, frame, len); memset(copy + 81, 0, 16);
+    const uint8_t *parts[1] = { copy }; const size_t lens[1] = { len };
+    b2l_hmac_sha1(j23_ptk, 16, parts, lens, 1, mac); memcpy(out, mac, 16);
+}
+/* An EAPOL-Key frame from the access point to the station. */
+static void eapol23(unsigned info, unsigned replay, const uint8_t *data, unsigned data_len, int with_mic) {
+    uint8_t f[14 + 4 + 95 + 64] = { 0 };
+    memcpy(f, j23_spa, 6); memcpy(f + 6, j23_aa, 6); f[12] = 0x88; f[13] = 0x8e;
+    uint8_t *e = f + 14;
+    e[0] = 2; e[1] = 3; e[3] = (uint8_t)(95 + data_len); e[4] = 2; e[5] = (uint8_t)(info >> 8); e[6] = (uint8_t)info;
+    e[8] = 16; e[16] = (uint8_t)replay; memcpy(e + 17, j23_anonce, 32); e[65] = 5;      /* the group key's RSC */
+    e[98] = (uint8_t)data_len; memcpy(e + 99, data, data_len);
+    if (with_mic) { mic23(e, 4 + 95 + data_len, e + 81); if (j23_fault == 1) e[81] ^= 1; }
+    rx23(f, 14 + 4 + 95 + data_len);
+}
+static void flowcreate23(const uint8_t *b) {
+    uint32_t request, low, high;
+    memcpy(&request, b + 4, 4); memcpy(&low, b + 32, 4); memcpy(&high, b + 36, 4);
+    assert(mode >= 23 && j23_link == 1 && !j23_flow && request == 0x300 && !memcmp(b + 8, j23_aa, 6));
+    assert(b[20] == 7 && !b[21] && (b[22] | b[23] << 8) == 2 && (b[28] | b[29] << 8) == 64 && (b[30] | b[31] << 8) == 48);
+    assert(low == HOST13_PA + 0x28000 && !high && !tcm13(0x2f0708) && !tcm13(0x2f0718));
+    memcpy(j23_spa, b + 14, 6);
+    j23_flow = 1;
+    const uint32_t done[6] = { 0x04u, 0x300u, 0x00020000u, 0, 0, 0 };
+    d2h13(done);
+    for (unsigned i = 0; i < 32; i++) j23_anonce[i] = (uint8_t)(0x30 + 7 * i);
+    eapol23(0x008a, 1, NULL, 0, 0);                         /* message 1 */
+}
+static void tx23(uint32_t value) {
+    const unsigned w = tcm13(0x2f0708);
+    assert(mode >= 23 && j23_flow && value == (0xff000000u | w) && w != j23_tx_r);
+    for (; j23_tx_r != w; j23_tx_r = (j23_tx_r + 1) % 64) {
+        const uint8_t *t = host_dram + 0x28000 + 48 * j23_tx_r;
+        uint32_t pktid, low, high;
+        memcpy(&pktid, t + 4, 4); memcpy(&low, t + 32, 4); memcpy(&high, t + 36, 4);
+        const unsigned len = t[42] | t[43] << 8, type = (unsigned)(t[20] << 8 | t[21]);
+        assert(t[0] == 0x0f && pktid >= 0x400 && t[22] == 0xe1 && t[23] == 1 && !high && !memcmp(t + 14, j23_spa, 6));
+        assert(low >= HOST13_PA + 0x29000 && low + len <= HOST13_PA + 0x2a000 && len <= 1024);
+        const uint8_t *p = host_dram + (low - HOST13_PA);
+        tx23_status(pktid);
+        if (type == 0x888e) {
+            assert(!memcmp(t + 8, j23_aa, 6) && p[1] == 3 && p[4] == 2);
+            const unsigned info = (unsigned)(p[5] << 8 | p[6]);
+            uint8_t frame[256], mic[16];
+            memcpy(frame, p, len);
+            if (info == 0x010a) {                           /* message 2 */
+                assert(j23_msg == 0 && len == 121 && p[16] == 1 && p[98] == 22 && !memcmp(p + 99, j23_rsn, 22));
+                memcpy(j23_snonce, p + 17, 32);
+                ptk23();
+                mic23(frame, len, mic);
+                assert(!memcmp(mic, p + 81, 16));           /* the station knows the passphrase */
+                j23_msg = 2;
+                uint8_t plain[48] = { 0 }, wrapped[56];
+                memcpy(plain, j23_rsn, 22);
+                static const uint8_t kde[8] = { 0xdd, 22, 0x00, 0x0f, 0xac, 0x01, 0x01, 0x00 };
+                memcpy(plain + 22, kde, 8); memcpy(plain + 30, j23_gtk, 16); plain[46] = 0xdd;
+                b2l_aes_wrap(j23_ptk + 16, plain, 6, wrapped);
+                eapol23(0x13ca, 2, wrapped, sizeof(wrapped), 1);   /* message 3 */
+            } else if (info == 0x030a) {                    /* message 4 */
+                assert(j23_msg == 2 && len == 99 && p[16] == 2);
+                mic23(frame, len, mic);
+                assert(!memcmp(mic, p + 81, 16));
+                j23_msg = 4;
+            } else {
+                assert(0);
+            }
+            continue;
+        }
+        /* A DHCP discover once the keys are in: answered with an offer. */
+        assert(type == 0x0800 && j23_keys == 2 && len == 277);
+        for (unsigned i = 0; i < 6; i++) assert(t[8 + i] == 0xff);
+        const uint8_t *b = p + 28;
+        assert(p[0] == 0x45 && p[9] == 17 && p[16] == 0xff && p[19] == 0xff && p[21] == 68 && p[23] == 67);
+        assert(b[0] == 1 && b[1] == 1 && b[2] == 6 && b[10] == 0x80 && !memcmp(b + 28, j23_spa, 6));
+        assert(b[236] == 0x63 && b[237] == 0x82 && b[238] == 0x53 && b[239] == 0x63 && b[240] == 53 && b[242] == 1);
+        uint8_t o[14 + 20 + 8 + 248] = { 0 };
+        memset(o, 0xff, 6); memcpy(o + 6, j23_aa, 6); o[12] = 0x08;
+        uint8_t *ip = o + 14, *udp = ip + 20, *r = udp + 8;
+        ip[0] = 0x45; ip[2] = (20 + 8 + 248) >> 8; ip[3] = (20 + 8 + 248) & 0xff; ip[8] = 64; ip[9] = 17; ip[12] = 192; ip[13] = 168; ip[15] = 1;
+        memset(ip + 16, 0xff, 4);
+        udp[1] = 67; udp[3] = 68; udp[4] = (8 + 248) >> 8; udp[5] = (8 + 248) & 0xff;
+        r[0] = 2; r[1] = 1; r[2] = 6; memcpy(r + 4, b + 4, 4); r[16] = 192; r[17] = 168; r[19] = 50;
+        memcpy(r + 28, j23_spa, 6); r[236] = 0x63; r[237] = 0x82; r[238] = 0x53; r[239] = 0x63;
+        static const uint8_t options[8] = { 53, 1, 2, 54, 4, 192, 168, 0 };
+        memcpy(r + 240, options, 8);    /* the server option runs past: the parser stops at the frame's end */
+        rx23(o, sizeof(o));
+        j23_offers++;
+    }
+    tcm11[(0x2f0718 - 0x170000) / 4] = w;
+}
+/* The station's receive buffers, posted again after each frame. */
+static void rxrepost23(uint32_t value) {
+    const unsigned w = tcm13(0x2f0704), r = tcm13(0x2f0714);
+    assert(mode >= 23 && value == (0xff000000u | w));
+    for (unsigned i = r; i != w; i = (i + 1) % 512) {
+        const uint8_t *b = host_dram + 0x1000 + 32 * i;
+        uint32_t request, low, high;
+        memcpy(&request, b + 4, 4); memcpy(&low, b + 24, 4); memcpy(&high, b + 28, 4);
+        assert(b[0] == 0x11 && b[3] == (1 + i) % 253 && request >= 0x100 && request < 0x120);
+        assert((b[10] | b[11] << 8) == 2048 && low == HOST13_PA + 0x30000 + 2048 * (request - 0x100) && !high);
+        for (unsigned k = 0; k < nrx23_free; k++) assert(rx23_free[k] != request);
+        assert(nrx23_free < 64); rx23_free[nrx23_free++] = request;
+    }
+    tcm11[(0x2f0714 - 0x170000) / 4] = w;
 }
 static void rxpost22(uint32_t value) {
     assert(mode >= 22 && value == 0xff000020u && tcm13(0x2f0704) == 32 && !tcm13(0x2f0714) && !rx22_db++);
@@ -548,6 +749,7 @@ static void rxpost22(uint32_t value) {
         for (unsigned k = 0; k < 2048; k++) assert(!host_dram[0x30000 + 2048 * i + k] && host_dev[0x30000 + 2048 * i + k] == 0);
     }
     tcm11[(0x2f0714 - 0x170000) / 4] = rx22_take;
+    for (unsigned i = 0; i < rx22_take; i++) rx23_free[nrx23_free++] = 0x100 + i;
 }
 static void pcie13_write(unsigned off, uint32_t value) {
     static const uint32_t rings[5][3] = { { 0x00000, 64, 40 }, { 0x01000, 512, 32 }, { 0x05000, 64, 24 },
@@ -568,6 +770,8 @@ static void pcie13_write(unsigned off, uint32_t value) {
     }
     assert(off == 0x140 && hostready13);
     if (mode >= 22 && tcm13(0x2f0704) != tcm13(0x2f0714) && !rx22_db) { rxpost22(value); return; }
+    if (mode >= 23 && rx22_db && tcm13(0x2f0704) != tcm13(0x2f0714)) { rxrepost23(value); return; }
+    if (mode >= 23 && j23_flow && tcm13(0x2f0708) != j23_tx_r) { tx23(value); return; }
     if (db0_13 == 1) { ioctl14(value); return; }
     if (db0_13 >= 2) { iovar15(value); return; }
     assert(value == 0xff000006 && !db0_13++ && tcm13(0x2f0700) == 6);
@@ -1026,6 +1230,8 @@ static void reset(unsigned which, unsigned failure) {
     d2h_total13 = h2d_seen13 = clm19_got = clm19_chunks = clm19_loaded = country19 = 0;
     memset(mask18, 0, 16);
     rx22_db = 0; rx22_take = 32;
+    j23_link = j23_flow = j23_tx_r = j23_msg = j23_keys = j23_offers = j23_left = j23_fault = j23_rx_w = j23_tx_cw = 0;
+    nrx23_free = 0; memset(j23_spa, 0, 6);
     memset(host_cpu, 0, sizeof(host_cpu)); memset(host_dram, 0, sizeof(host_dram)); memset(host_dev, 0, sizeof(host_dev));
     wifi_host = NULL; wifi_host_pa = 0; wifi_master = 0;
     memset(tcm11, 0, sizeof(tcm11)); vector0 = 0; r4_io = 0x21; r4_reset = 0;
@@ -1086,7 +1292,7 @@ static void verify_quiet(void) {
     if (strstr(logs, "Gen1 probe begin:"))
         assert(!(memory[4][0xc/4] | memory[4][0x10/4] | memory[4][0x14/4]));
     assert(unmaps == (mode >= 6 ? 11u : mode + 5) && link_polls <= 500 &&
-        now_us < (mode >= 22 ? 70000000u : mode >= 18 ? 60000000u : mode >= 16 ? 40000000u : mode >= 11 ? 20000000u : mode == 10 ? 7000000u :
+        now_us < (mode >= 23 ? 90000000u : mode >= 22 ? 70000000u : mode >= 18 ? 60000000u : mode >= 16 ? 40000000u : mode >= 11 ? 20000000u : mode == 10 ? 7000000u :
                   1000000u));
     if (mode >= 11) assert(!r4_running && !r4_reset && r4_io == 0x21); /* Halted before power-off. */
     if (mode >= 5) {
@@ -1873,6 +2079,50 @@ int main(void) {
         assert(rx22_db == 1 && mask18[0] == 0xeb && mask18[8] == 0x20 && mask18[5] == 0x40);
     }
     puts("Firmware data path, mode 22: association events on, wsec/wpa_auth read, receive buffers posted passed");
+    /* S10 port, mode 23: the join, the 4-way handshake, the keys, a DHCP offer, leaving. Fault 1: message 3's
+     * MIC is wrong; no keys. Then no record, and a record whose digest is wrong. */
+    for (unsigned fault = 0; fault <= 3; fault++) {
+        mode = 23;
+        reset(8, 0); firmware_fixture_nvram(good, sizeof(good)); nvram_fixture_bytes = sizeof(good);
+        firmware_fixture_clm();
+        if (fault != 2) firmware_fixture_join("ModelNet", "model passphrase");
+        if (fault == 3) firmware_fault = 12;
+        host13_fault = 0; firmware_mac_mode = 2; j23_fault = fault;
+        b2l_pbkdf2_sha1((const uint8_t *)"model passphrase", 16, (const uint8_t *)"ModelNet", 8, 4096, j23_pmk, 32);
+        b2l_wifi_diag_start();
+        if (fault != 3) verify_quiet();     /* fault 3: the whole private input refused, before any MMIO */
+        assert(!strstr(logs, "ModelNet") && !strstr(logs, "model passphrase") && !strstr(logs, "aa:bb"));
+        if (fault == 3) {
+            assert(!strstr(logs, "private join record verified") && !strstr(logs, "mode 2"));
+            continue;
+        }
+        assert(strstr(logs, "cleanup=verified") && strstr(logs, "mode 22: the firmware took 32 of the 32"));
+        if (fault == 2) {
+            assert(strstr(logs, "mode 23: no join record in the private attachment; no join\n") && !j23_link);
+            continue;
+        }
+        assert(strstr(logs, "private join record verified (a network to join; its name and password are never logged)\n"));
+        assert(strstr(logs, "RSN present: group cipher 4, pairwise CCMP yes, AKM PSK yes, PSK-SHA256 no, SAE no; "
+            "protected management frames off\n"));
+        assert(strstr(logs, "mode 23: PMK derived from the passphrase (PBKDF2-HMAC-SHA1, 4096 rounds)"));
+        assert(strstr(logs, "mode 23: wsec 0x4: status 0\n") && strstr(logs, "mode 23: wpa_auth 0x80: status 0\n"));
+        assert(strstr(logs, "mode 23: wpaie (our RSN element, 22 bytes): status 0\n"));
+        assert(strstr(logs, "mode 23: WLC_SET_SSID (the name, address and channel; none logged): status 0\n"));
+        assert(strstr(logs, "mode 23: flow ring 2 created: status 0\n"));
+        assert(strstr(logs, "mode 23: 4-way message 1 received, message 2 sent\n"));
+        if (fault == 1) {
+            assert(strstr(logs, "message 3's MIC does not verify: the password in the private record is not this "
+                "network's\n") && j23_msg == 2 && !j23_keys && !strstr(logs, "DHCP"));
+        } else {
+            assert(strstr(logs, "mode 23: 4-way message 3 received, its MIC verified (the password is right); group key "
+                "of 16 bytes, key id 1; message 4 sent\n") && j23_msg == 4);
+            assert(strstr(logs, "mode 23: pairwise key (CCMP) set: status 0; group key (id 1, 16 bytes) set: status 0\n"));
+            assert(strstr(logs, "DHCP offers 1 (no address logged): the link carries data both ways\n") && j23_offers == 1);
+            assert(j23_keys == 2);
+        }
+        assert(strstr(logs, "mode 23: WLC_DISASSOC: status 0; link down\n") && j23_left);
+    }
+    puts("Firmware join, mode 23: WPA2-PSK 4-way handshake on the host, keys, a DHCP offer, leaving; nothing named passed");
 }
 '''
 
